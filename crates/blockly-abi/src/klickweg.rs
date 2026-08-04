@@ -146,7 +146,23 @@ mod tests {
     use super::*;
     use crate::{FieldValue, LaneShape, lower_script, raise_calls};
 
-    const APP: u16 = 0x1000;
+    /// A stand-in render prefix — deliberately NOT a real allocation.
+    ///
+    /// `blockly-rs` has **no minted app prefix yet** (an operator decision,
+    /// tracked in OGAR `docs/BLOCK-EDITOR-PLAN.md`), so nothing in this crate
+    /// may name one: `app_prefix` is a PARAMETER on every public function
+    /// here, and this constant exists only so the tests have a value to pass.
+    ///
+    /// It was `0x1000` until a codex review on OGAR #238 pointed at the risk
+    /// of a plan that reads "done" teaching someone to hardcode a colliding
+    /// value — and `0x1000` turned out to be exactly that: `ogar-vocab`'s
+    /// `ports.rs` RESERVES it for the V3-adoption monitor marker, with a test
+    /// asserting it "must never be allocatable as a port's `APP_PREFIX`". The
+    /// warning was about a hypothetical; the hypothetical was already here.
+    ///
+    /// `0xFF00` is chosen to be obviously unreal so it cannot be mistaken for
+    /// the answer when the mint lands.
+    const APP: u16 = 0xFF00;
 
     fn five_plus_three() -> BlockRecord {
         BlockRecord::leaf("math_arithmetic", "root")
@@ -241,9 +257,11 @@ mod tests {
     #[test]
     fn the_classid_is_canon_high_under_the_app_prefix() {
         let addr = address_of(&five_plus_three(), "root", APP).unwrap();
-        assert_eq!(addr.class_id, 0x1701_1000);
+        assert_eq!(addr.class_id, 0x1701_FF00);
         assert_eq!(addr.class_id >> 16, 0x1701, "concept must be the HIGH half");
         assert_eq!(addr.class_id & 0xFFFF, u32::from(APP));
+        // …and it is NOT the reserved V3-adoption marker.
+        assert_ne!(addr.class_id & 0xFFFF, 0x1000);
         // A different app renders the same concept differently — proving the
         // prefix is live and not baked.
         let other = address_of(&five_plus_three(), "root", 0x2000).unwrap();
