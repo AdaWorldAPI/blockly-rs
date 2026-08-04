@@ -82,9 +82,11 @@
 use ogar_blockly::{BodyError, Call, FnIndex, FunctionBody, LaneShape};
 
 pub mod codebook;
+pub mod klickweg;
 pub mod pool;
 
 pub use codebook::{OpcodeMapping, resolve_opcode};
+pub use klickweg::{BlockAddress, address_of};
 pub use pool::{Constant, ConstantPool, PoolError};
 
 // ── The semantic record ─────────────────────────────────────────────────────
