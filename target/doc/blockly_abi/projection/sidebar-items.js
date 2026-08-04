@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ProjectionError"],"fn":["arity","parse_text","render_text"]};
