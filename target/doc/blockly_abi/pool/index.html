@@ -1,0 +1,70 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The constant pool — where a wide literal spends its immediate byte."><title>blockly_abi::pool - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-b7b9f40b.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="blockly_abi" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module pool</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../blockly_abi/index.html">blockly_<wbr>abi</a><span class="version">0.1.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module pool</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#why-a-pool-at-all" title="Why a pool at all">Why a pool at all</a></li><li><a href="#the-shape-a-sibling-node-not-a-wider-row" title="The shape: a sibling node, not a wider row">The shape: a sibling node, not a wider row</a></li><li><a href="#index-arithmetic" title="Index arithmetic">Index arithmetic</a></li><li><a href="#capacity-and-where-it-can-actually-bind" title="Capacity, and where it can actually bind">Capacity, and where it can actually bind</a></li><li><a href="#repoint-never-mutate" title="Repoint, never mutate">Repoint, never mutate</a></li><li><a href="#the-classids-are-parameters-and-that-is-deliberate" title="The classids are PARAMETERS, and that is deliberate">The classids are PARAMETERS, and that is deliberate</a></li></ul><h3><a href="#modules">Module Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#constants" title="Constants">Constants</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate blockly_<wbr>abi</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">blockly_abi</a></div><h1>Module <span>pool</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/blockly_abi/pool.rs.html#1-469">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The constant pool — where a wide literal spends its immediate byte.</p>
+<h2 id="why-a-pool-at-all"><a class="doc-anchor" href="#why-a-pool-at-all">§</a>Why a pool at all</h2>
+<p>A <a href="ogar_blockly::Call"><code>Call</code></a>’s immediate is one byte under
+<a href="ogar_blockly::LaneShape"><code>LaneShape::Pairs</code></a>. A <code>math_number</code> field is a
+JavaScript double; a <code>text</code> field is arbitrary UTF-8. Neither fits. So the
+byte becomes an <strong>index</strong>, and the only real design question is where the
+indexed bytes live and what classid governs their reading.</p>
+<h2 id="the-shape-a-sibling-node-not-a-wider-row"><a class="doc-anchor" href="#the-shape-a-sibling-node-not-a-wider-row">§</a>The shape: a sibling node, not a wider row</h2>
+<p>A pool is a second 512-byte V3 node whose identity IS the owning function’s
+— same 30 content slots, same 16-byte stride, same <code>classid(4) + 12</code> facet.
+Each facet carries its own classid naming the constant’s <strong>type</strong>, because
+“your classid defines the schema, period”: an <code>f64</code> and a UTF-8 string are
+different readings of 12 bytes, so they are different classids, and the
+per-facet classid is exactly where the substrate lets a slot say so.</p>
+<p>Three alternatives were considered and rejected, each by a specific
+constraint rather than by taste:</p>
+<ul>
+<li><strong>Encode the literal as a run of calls</strong> (no pool). Killed by the W1
+falsifier, not by aesthetics: the call count would depend on the
+literal’s width, so editing <code>255</code> to <code>1000000</code> would shift every
+subsequent call and rewrite the tail of the body. An operand edit must
+produce ONE write.</li>
+<li><strong>Steal content slots from the body node.</strong> Killed by the call-index
+arithmetic: <code>BODY_BYTES</code> and the capacity asserts all assume 30 call
+lanes, so the budget would become per-function, and “add one string”
+could make a program that fit stop fitting — with the overflow blaming
+the calls rather than the literals.</li>
+<li><strong>Hold the pool in the Inventory SoA.</strong> Killed by ownership: Inventory is
+shared by every function, so a per-function pool living there is a
+shared-mutable sink with N writers. Inventory indexes <em>functions</em>, which
+are shared by definition; constants are <em>per-function data</em>, which are
+owned by definition. Same one-byte index shape, opposite ownership.</li>
+</ul>
+<h2 id="index-arithmetic"><a class="doc-anchor" href="#index-arithmetic">§</a>Index arithmetic</h2><div class="example-wrap"><pre class="language-text"><code>  idx ∈ 1..=255                       (0 = zero-fallback: NO constant)
+  node_ordinal = (idx - 1) / 30
+  slot_j       = (idx - 1) % 30
+  payload      = slot_j * 16 + 4      (classid at slot_j * 16)</code></pre></div>
+<p><code>idx = 0</code> is the zero-fallback rung and is never reclaimed as a real index,
+so a zeroed value byte reads as “no constant” rather than as constant zero.</p>
+<h2 id="capacity-and-where-it-can-actually-bind"><a class="doc-anchor" href="#capacity-and-where-it-can-actually-bind">§</a>Capacity, and where it can actually bind</h2><div><table><thead><tr><th>shape</th><th>calls</th><th>value bytes/call</th><th>distinct indices a body can name</th></tr></thead><tbody>
+<tr><td><code>Pairs</code></td><td>180</td><td>1</td><td>180 — under 255, pool can never overflow first</td></tr>
+<tr><td><code>Triples</code></td><td>120</td><td>2</td><td>240 — still under</td></tr>
+<tr><td><code>Quads</code></td><td>90</td><td>3</td><td>270 — <strong>can</strong> exhaust the pool</td></tr>
+</tbody></table>
+</div>
+<p>So <a href="enum.PoolError.html#variant.Full" title="variant blockly_abi::pool::PoolError::Full"><code>PoolError::Full</code></a> is reachable only under <code>Quads</code>, only with ≥256
+distinct constants, and only without dedup. It is implemented and tested
+anyway, because “unreachable” is a measurement and not a guarantee. The
+remedy at 255 is the same as at <code>BodyError::Overflow</code> — <strong>split the
+function</strong>. A <code>u16</code> index is not the remedy; it would re-open field-widening
+at the one place the ABI is least defended.</p>
+<h2 id="repoint-never-mutate"><a class="doc-anchor" href="#repoint-never-mutate">§</a>Repoint, never mutate</h2>
+<p>Interning is content-addressed, so one <code>3.14</code> referenced by two calls is one
+entry. Editing ONE of those call sites therefore must not move the other:
+an edit <strong>interns the new value and repoints that call’s index byte</strong>. It
+never rewrites a pool entry in place. Mutating in place would be the
+shared-mutable-sink defect one layer down, and would make a local edit
+change a program elsewhere in the same function.</p>
+<p>Repointing leaves orphans. They are <strong>not</strong> compacted implicitly:
+compaction renumbers, renumbering rewrites every referencing body byte, and
+that turns a one-byte edit into a whole-program write. Reserve, don’t
+reclaim — an orphan holds its index until an explicit, versioned pass.</p>
+<h2 id="the-classids-are-parameters-and-that-is-deliberate"><a class="doc-anchor" href="#the-classids-are-parameters-and-that-is-deliberate">§</a>The classids are PARAMETERS, and that is deliberate</h2>
+<p><code>ConstantPool</code> never names a concept id. The caller supplies the facet
+classid, because minting <code>0x1703..</code> is an operator decision with a ledger
+entry, and this crate does not get to assume one. The arithmetic and the
+dedup — which is where the defects live — are testable today against
+<a href="placeholder/index.html" title="mod blockly_abi::pool::placeholder"><code>placeholder</code></a> classids; the mint changes two constants, not the logic.</p>
+</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="placeholder/index.html" title="mod blockly_abi::pool::placeholder">placeholder</a></dt><dd>Placeholder facet classids, for use until the concepts are minted.</dd></dl><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.Constant.html" title="struct blockly_abi::pool::Constant">Constant</a></dt><dd>One interned constant: its type classid and its 12 payload bytes.</dd><dt><a class="struct" href="struct.ConstantPool.html" title="struct blockly_abi::pool::ConstantPool">Constant<wbr>Pool</a></dt><dd>A function’s constant pool.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.PoolError.html" title="enum blockly_abi::pool::PoolError">Pool<wbr>Error</a></dt><dd>Why a constant could not be interned.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.CONSTANTS_PER_NODE.html" title="constant blockly_abi::pool::CONSTANTS_PER_NODE">CONSTANTS_<wbr>PER_<wbr>NODE</a></dt><dd>Constants per pool node — one per content slot.</dd><dt><a class="constant" href="constant.CONSTANT_BYTES.html" title="constant blockly_abi::pool::CONSTANT_BYTES">CONSTANT_<wbr>BYTES</a></dt><dd>Payload bytes one constant facet carries.</dd><dt><a class="constant" href="constant.MAX_CONSTANTS.html" title="constant blockly_abi::pool::MAX_CONSTANTS">MAX_<wbr>CONSTANTS</a></dt><dd>The largest index a value byte can name. <code>0</code> is the zero-fallback, so the
+usable domain is <code>1..=255</code>.</dd></dl></section></div></main></body></html>

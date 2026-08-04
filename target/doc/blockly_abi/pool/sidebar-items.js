@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CONSTANTS_PER_NODE","CONSTANT_BYTES","MAX_CONSTANTS"],"enum":["PoolError"],"mod":["placeholder"],"struct":["Constant","ConstantPool"]};

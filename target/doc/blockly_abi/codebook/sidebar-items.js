@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CodeRole"],"fn":["decode_value_param","encode_value_param","resolve","resolve_opcode","value_param_codes"],"struct":["OpcodeMapping"]};

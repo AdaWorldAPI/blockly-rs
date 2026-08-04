@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CONST_F64","CONST_UTF8_INLINE"]};
