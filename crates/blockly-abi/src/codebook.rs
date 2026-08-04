@@ -192,6 +192,103 @@ pub fn resolve_opcode(ty: &str, code: Option<&str>) -> Option<FnIndex> {
     resolve(ty, code).map(|m| m.function)
 }
 
+// ── ValueParam encoding ─────────────────────────────────────────────────────
+
+/// The ordered parameter codes for one `(block type, field name)` dropdown
+/// whose role is [`CodeRole::ValueParam`].
+///
+/// # The encoding, and why the ordinal is OURS
+///
+/// A `ValueParam` byte is the code's **ordinal in this table** — `PI` is `0`,
+/// `E` is `1`, and so on. The block type is already named by the call's
+/// [`FnIndex`], so the ordinal need only be unique *within* the block: no
+/// global parameter namespace is minted, and no palette slot is spent.
+///
+/// The ordinal is deliberately anchored **here** rather than to "whatever
+/// order Blockly's array has today". Blockly reordering an options array is a
+/// cosmetic upstream change; if the encoding tracked it, that cosmetic change
+/// would silently reinterpret every stored program — `math_constant` `0` would
+/// stop meaning π. Anchoring the ordinal in this table converts that hazard
+/// into a **loud** one: upstream reordering then breaks the drift test
+/// (`the_value_param_option_sets_are_pinned`) and nothing else. Permanence lives with the codebook, which is the same reason
+/// the three gaps are refused rather than minted.
+///
+/// Widths, measured against the Apache-2.0 definitions (largest set is 8):
+/// every set fits a byte with three orders of magnitude to spare, so the
+/// `u8` is not a squeeze.
+///
+/// Returns `None` for any pair this codebook does not name — never a guess.
+#[must_use]
+pub fn value_param_codes(ty: &str, field: &str) -> Option<&'static [&'static str]> {
+    Some(match (ty, field) {
+        ("math_constant", "CONSTANT") => {
+            &["PI", "E", "GOLDEN_RATIO", "SQRT2", "SQRT1_2", "INFINITY"]
+        }
+        ("math_number_property", "PROPERTY") => &[
+            "EVEN",
+            "ODD",
+            "PRIME",
+            "WHOLE",
+            "POSITIVE",
+            "NEGATIVE",
+            "DIVISIBLE_BY",
+        ],
+        // RANDOM is absent BY CONSTRUCTION: it is one of the three gaps, and
+        // `resolve` already refuses it. Listing it here would hand a byte to a
+        // block the palette cannot name.
+        ("math_on_list", "OP") => &["SUM", "MIN", "MAX", "AVERAGE", "MEDIAN", "MODE", "STD_DEV"],
+        ("text_indexOf" | "lists_indexOf", "END") => &["FIRST", "LAST"],
+        ("text_charAt", "WHERE") => &["FROM_START", "FROM_END", "FIRST", "LAST", "RANDOM"],
+        // Two dropdowns, and their sets genuinely DIFFER in the third slot
+        // (FIRST vs LAST) — which is why the table keys on the field name and
+        // not the block type alone.
+        ("text_getSubstring" | "lists_getSublist", "WHERE1") => {
+            &["FROM_START", "FROM_END", "FIRST"]
+        }
+        ("text_getSubstring" | "lists_getSublist", "WHERE2") => &["FROM_START", "FROM_END", "LAST"],
+        ("text_changeCase", "CASE") => &["UPPERCASE", "LOWERCASE", "TITLECASE"],
+        ("text_trim", "MODE") => &["BOTH", "LEFT", "RIGHT"],
+        ("text_prompt" | "text_prompt_ext", "TYPE") => &["TEXT", "NUMBER"],
+        ("lists_sort", "TYPE") => &["NUMERIC", "TEXT", "IGNORE_CASE"],
+        // The codes really are the strings "1" and "-1" in the source. They
+        // are NOT read as numbers: `-1` would not survive a `u8`, and the
+        // ordinal encoding sidesteps the question entirely.
+        ("lists_sort", "DIRECTION") => &["1", "-1"],
+        // JUDGMENT, recorded rather than silently taken: SPLIT (string → list)
+        // and JOIN (list → string) are arguably different *operations*, which
+        // would make this a Selector. The palette mints ONE slot
+        // (`LIST_SPLIT`), so treating the code as a parameter is what that
+        // slot actually supports, and it is lossless — the byte survives.
+        // Promoting it to two slots is a mint, i.e. an operator decision.
+        ("lists_split", "MODE") => &["SPLIT", "JOIN"],
+        _ => return None,
+    })
+}
+
+/// Encode a `ValueParam` dropdown code as its immediate byte.
+///
+/// Returns `None` if the codebook does not name this `(type, field)` pair, or
+/// names it but not this code — the caller refuses rather than substituting a
+/// default, because a wrong parameter byte is a program that runs and computes
+/// the wrong thing.
+#[must_use]
+pub fn encode_value_param(ty: &str, field: &str, code: &str) -> Option<u8> {
+    let codes = value_param_codes(ty, field)?;
+    let idx = codes.iter().position(|c| *c == code)?;
+    // The largest set is 8; the pin below makes this unreachable in practice,
+    // and the fallible conversion means a future oversized set refuses rather
+    // than wrapping to a valid-looking byte.
+    u8::try_from(idx).ok()
+}
+
+/// The inverse of [`encode_value_param`] — the code a stored byte denotes.
+#[must_use]
+pub fn decode_value_param(ty: &str, field: &str, byte: u8) -> Option<&'static str> {
+    value_param_codes(ty, field)?
+        .get(usize::from(byte))
+        .copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +478,217 @@ mod tests {
             assert_eq!(mapped.role, CodeRole::ValueParam, "{ty}");
         }
         assert_eq!(value_params.len(), 14, "value-param census moved");
+    }
+
+    /// Every `(type, field)` dropdown set, pinned verbatim in source order.
+    ///
+    /// This is the D3 drift anchor for the parameter half. The ordinal IS the
+    /// stored byte, so a reorder here silently reinterprets stored programs —
+    /// which is exactly why the order is asserted rather than derived.
+    #[test]
+    fn the_value_param_option_sets_are_pinned() {
+        let expected: &[(&str, &str, &[&str])] = &[
+            (
+                "math_constant",
+                "CONSTANT",
+                &["PI", "E", "GOLDEN_RATIO", "SQRT2", "SQRT1_2", "INFINITY"],
+            ),
+            (
+                "math_number_property",
+                "PROPERTY",
+                &[
+                    "EVEN",
+                    "ODD",
+                    "PRIME",
+                    "WHOLE",
+                    "POSITIVE",
+                    "NEGATIVE",
+                    "DIVISIBLE_BY",
+                ],
+            ),
+            (
+                "math_on_list",
+                "OP",
+                &["SUM", "MIN", "MAX", "AVERAGE", "MEDIAN", "MODE", "STD_DEV"],
+            ),
+            ("text_indexOf", "END", &["FIRST", "LAST"]),
+            ("lists_indexOf", "END", &["FIRST", "LAST"]),
+            (
+                "text_charAt",
+                "WHERE",
+                &["FROM_START", "FROM_END", "FIRST", "LAST", "RANDOM"],
+            ),
+            (
+                "text_getSubstring",
+                "WHERE1",
+                &["FROM_START", "FROM_END", "FIRST"],
+            ),
+            (
+                "text_getSubstring",
+                "WHERE2",
+                &["FROM_START", "FROM_END", "LAST"],
+            ),
+            (
+                "lists_getSublist",
+                "WHERE1",
+                &["FROM_START", "FROM_END", "FIRST"],
+            ),
+            (
+                "lists_getSublist",
+                "WHERE2",
+                &["FROM_START", "FROM_END", "LAST"],
+            ),
+            (
+                "text_changeCase",
+                "CASE",
+                &["UPPERCASE", "LOWERCASE", "TITLECASE"],
+            ),
+            ("text_trim", "MODE", &["BOTH", "LEFT", "RIGHT"]),
+            ("text_prompt", "TYPE", &["TEXT", "NUMBER"]),
+            ("text_prompt_ext", "TYPE", &["TEXT", "NUMBER"]),
+            ("lists_sort", "TYPE", &["NUMERIC", "TEXT", "IGNORE_CASE"]),
+            ("lists_sort", "DIRECTION", &["1", "-1"]),
+            ("lists_split", "MODE", &["SPLIT", "JOIN"]),
+        ];
+        for (ty, field, codes) in expected {
+            let got = value_param_codes(ty, field)
+                .unwrap_or_else(|| panic!("{ty}.{field} lost its option set"));
+            assert_eq!(&got, codes, "{ty}.{field} option set drifted");
+        }
+        assert_eq!(expected.len(), 17, "value-param dropdown census moved");
+    }
+
+    #[test]
+    fn a_value_param_code_encodes_to_its_ordinal_and_back() {
+        // Can-fire: distinct codes must reach DISTINCT bytes, or the whole
+        // encoding is decoration and math_constant[PI] == math_constant[E].
+        let pi = encode_value_param("math_constant", "CONSTANT", "PI").unwrap();
+        let e = encode_value_param("math_constant", "CONSTANT", "E").unwrap();
+        assert_eq!(pi, 0);
+        assert_eq!(e, 1);
+        assert_ne!(pi, e);
+        // Round-trip every code of every set, so a table edit that breaks the
+        // inverse is caught here and not in a stored program.
+        for (ty, field) in [
+            ("math_constant", "CONSTANT"),
+            ("math_number_property", "PROPERTY"),
+            ("math_on_list", "OP"),
+            ("text_charAt", "WHERE"),
+            ("lists_sort", "DIRECTION"),
+            ("lists_split", "MODE"),
+        ] {
+            for code in value_param_codes(ty, field).unwrap() {
+                let byte = encode_value_param(ty, field, code).unwrap();
+                assert_eq!(decode_value_param(ty, field, byte), Some(*code));
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_dropdowns_of_one_block_do_not_share_a_table() {
+        // WHERE1 ends FIRST, WHERE2 ends LAST. Keying on the block type alone
+        // would make ordinal 2 mean two different things on one block — and
+        // would pass a same-table test vacuously, since the first two entries
+        // ARE identical.
+        assert_eq!(
+            encode_value_param("text_getSubstring", "WHERE1", "FROM_END"),
+            encode_value_param("text_getSubstring", "WHERE2", "FROM_END")
+        );
+        assert_eq!(
+            decode_value_param("text_getSubstring", "WHERE1", 2),
+            Some("FIRST")
+        );
+        assert_eq!(
+            decode_value_param("text_getSubstring", "WHERE2", 2),
+            Some("LAST")
+        );
+        // FIRST is not reachable at all on WHERE2, and LAST not on WHERE1.
+        assert_eq!(
+            encode_value_param("text_getSubstring", "WHERE2", "FIRST"),
+            None
+        );
+        assert_eq!(
+            encode_value_param("text_getSubstring", "WHERE1", "LAST"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_value_param_is_refused_not_defaulted() {
+        // Silence twin for the encoding test: a code the codebook does not
+        // name must yield None, NOT ordinal 0 — a defaulted parameter is a
+        // program that runs and computes the wrong thing.
+        assert_eq!(encode_value_param("math_constant", "CONSTANT", "TAU"), None);
+        assert_eq!(
+            encode_value_param("math_constant", "WRONG_FIELD", "PI"),
+            None
+        );
+        assert_eq!(encode_value_param("not_a_block", "CONSTANT", "PI"), None);
+        // The gap stays a gap on this surface too: RANDOM has no ordinal.
+        assert_eq!(encode_value_param("math_on_list", "OP", "RANDOM"), None);
+        assert!(encode_value_param("math_on_list", "OP", "SUM").is_some());
+        // And decoding past the end of a set is refused rather than wrapping.
+        assert_eq!(decode_value_param("math_constant", "CONSTANT", 6), None);
+        assert!(decode_value_param("math_constant", "CONSTANT", 5).is_some());
+    }
+
+    /// The D3 palette drift anchor for the FUNCTION half.
+    ///
+    /// The census test above compares against `FnIndex::LT` — the *symbol*. If
+    /// `ogar-blockly` renumbered `LT` from `0x32` to `0x33`, every symbolic
+    /// assertion in this file would still pass while every stored program
+    /// silently changed meaning. This pins the BYTES.
+    #[test]
+    fn the_palette_byte_values_are_pinned() {
+        let pinned: &[(&str, Option<&str>, u8)] = &[
+            ("controls_if", None, 0x01),
+            ("controls_repeat", None, 0x03),
+            ("controls_whileUntil", Some("WHILE"), 0x05),
+            ("logic_negate", None, 0x22),
+            ("logic_compare", Some("EQ"), 0x30),
+            ("logic_compare", Some("LT"), 0x32),
+            ("logic_compare", Some("GT"), 0x34),
+            ("math_arithmetic", Some("ADD"), 0x40),
+            ("math_number", None, 0x46),
+            ("math_single", Some("ABS"), 0x47),
+            ("math_trig", Some("SIN"), 0x51),
+            ("math_constant", Some("PI"), 0x5C),
+            ("text", None, 0x60),
+            ("lists_getIndex", Some("GET"), 0x76),
+            ("variables_get", None, 0x80),
+            ("procedures_callnoreturn", None, 0x84),
+        ];
+        for (ty, code, byte) in pinned {
+            let got = resolve_opcode(ty, *code)
+                .unwrap_or_else(|| panic!("{ty} lost its mapping"))
+                .0;
+            assert_eq!(got, *byte, "{ty} moved off palette byte {byte:#04x}");
+        }
+        // Anti-vacuity: the pins must be DISTINCT bytes. A palette that
+        // collapsed every entry onto one slot would satisfy a per-row check
+        // only if the expected bytes were also collapsed — this catches the
+        // case where the table itself is edited to match a broken palette.
+        let mut bytes: Vec<u8> = pinned.iter().map(|(_, _, b)| *b).collect();
+        bytes.sort_unstable();
+        let before = bytes.len();
+        bytes.dedup();
+        assert_eq!(bytes.len(), before, "two pins share a palette byte");
+
+        // Nothing the Blockly frontend reaches may land in the DEVICE family
+        // (`0x90..`), which is reserved for hardware/robotics blocks that have
+        // no Blockly-core counterpart.
+        for (ty, _, byte) in pinned {
+            assert!(
+                *byte < ogar_blockly::DEVICE_FAMILY_FLOOR,
+                "{ty} reached the reserved device family"
+            );
+        }
+        // …and the floor is a real boundary, not a vacuous one: it must sit
+        // ABOVE every pin (or the loop above would be impossible) and BELOW
+        // the top of the byte range (or "below the floor" would exclude
+        // nothing and the loop would be free).
+        const { assert!(ogar_blockly::DEVICE_FAMILY_FLOOR < u8::MAX) };
+        let highest_pin = pinned.iter().map(|(_, _, b)| *b).max().unwrap();
+        assert!(highest_pin < ogar_blockly::DEVICE_FAMILY_FLOOR);
     }
 }

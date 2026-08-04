@@ -82,8 +82,10 @@
 use ogar_blockly::{BodyError, Call, FnIndex, FunctionBody, LaneShape};
 
 pub mod codebook;
+pub mod pool;
 
 pub use codebook::{OpcodeMapping, resolve_opcode};
+pub use pool::{Constant, ConstantPool, PoolError};
 
 // ── The semantic record ─────────────────────────────────────────────────────
 
@@ -101,9 +103,14 @@ pub enum FieldValue {
     /// type, never stored as an immediate.
     Code(String),
     /// A value too wide for one byte (a large number, a string, a float).
-    /// Spends the call's value byte as a constant-pool index — the pool is a
-    /// named follow-up (OGAR `BLOCK-EDITOR-PLAN.md` D4), so this currently
-    /// lowers to [`CastError::WideLiteral`] rather than guessing an index.
+    /// Spends the call's value byte as a [`ConstantPool`] index.
+    ///
+    /// Which cast is used decides what happens: [`lower_script`] still
+    /// **refuses** it ([`CastError::WideLiteral`]), because the pool's facet
+    /// concepts are an operator mint that has not landed;
+    /// [`lower_script_with_pool`] interns it under caller-supplied classids.
+    /// The refusal stays the default so a placeholder classid cannot reach
+    /// stored data by accident.
     Wide(String),
     /// A **reference**, not a value — a variable field serializes to an object
     /// (`{id}`, or `{id, name, type}` under full serialization), never a bare
@@ -286,16 +293,37 @@ pub enum CastError {
         /// The block carrying the payload.
         ty: String,
     },
-    /// A dropdown code that is an ARGUMENT rather than a function selector
-    /// ([`CodeRole::ValueParam`](codebook::CodeRole::ValueParam)), whose byte
-    /// encoding is not yet defined. Refused rather than dropped — dropping it
-    /// would lower `math_constant[PI]` and `math_constant[E]` to identical
-    /// calls.
+    /// A dropdown code the codebook cannot turn into a byte — either an
+    /// [argument](codebook::CodeRole::ValueParam) whose option set does not
+    /// name it, or a code on a block whose resolution takes no code at all.
+    /// Refused rather than dropped: dropping it would lower
+    /// `math_constant[PI]` and `math_constant[E]` to identical calls.
     UnencodedValueParam {
         /// The block type.
         ty: String,
-        /// The dropdown code that has no byte encoding yet.
+        /// The dropdown code with no encoding.
         code: String,
+    },
+    /// A wide literal could not be interned — wider than a facet, or the pool
+    /// is full. The remedy for a full pool is a function split, never a wider
+    /// index; the remedy for an oversized literal is the continuation
+    /// encoding, which is a named follow-up.
+    ConstantPool {
+        /// The block carrying the literal.
+        ty: String,
+        /// The literal text.
+        value: String,
+        /// What the pool said.
+        source: PoolError,
+    },
+    /// The block carries more immediates than one call can hold. The remedy is
+    /// a wider [`LaneShape`], or a block shape the palette models with a
+    /// dedicated slot — never a silently truncated call.
+    TooManyValues {
+        /// The block type.
+        ty: String,
+        /// How many fields it offered.
+        offered: usize,
     },
     /// The program did not fit the node's call budget, or a call carried an
     /// immediate the lane shape cannot store. The remedy is a split into two
@@ -327,9 +355,17 @@ impl core::fmt::Display for CastError {
             ),
             CastError::UnencodedValueParam { ty, code } => write!(
                 f,
-                "block `{ty}` dropdown `{code}` is an argument, not a function \
-                 selector, and has no byte encoding yet; dropping it would make \
-                 distinct programs identical"
+                "block `{ty}` dropdown `{code}` has no byte encoding in the \
+                 codebook; dropping it would make distinct programs identical"
+            ),
+            CastError::ConstantPool { ty, value, source } => write!(
+                f,
+                "block `{ty}` literal `{value}` could not be interned: {source}"
+            ),
+            CastError::TooManyValues { ty, offered } => write!(
+                f,
+                "block `{ty}` offers {offered} fields, more immediates than one \
+                 call can hold; truncating would emit a call that looks complete"
             ),
             CastError::Body(e) => write!(f, "{e}"),
         }
@@ -359,32 +395,93 @@ impl From<BodyError> for CastError {
 /// [`CastError::Body`] if the program overruns the shape's call budget.
 pub fn lower_script(shape: LaneShape, top: &BlockRecord) -> Result<FunctionBody, CastError> {
     let mut body = FunctionBody::new(shape);
-    lower_chain(top, &mut body)?;
+    lower_chain(top, &mut body, None)?;
+    Ok(body)
+}
+
+/// The classids under which wide literals are interned, plus the pool itself.
+///
+/// The classids are **parameters** rather than constants because minting them
+/// is an operator decision with a ledger entry (OGAR `BLOCK-EDITOR-PLAN.md`
+/// D4). Until that mint lands, [`pool::placeholder`] supplies deliberately
+/// invalid ids so a placeholder escaping into stored data is loud rather than
+/// plausible.
+#[derive(Debug, Clone)]
+pub struct LoweringContext {
+    /// The pool wide literals intern into.
+    pub pool: ConstantPool,
+    /// Facet classid for an `f64` constant.
+    pub f64_classid: u32,
+    /// Facet classid for an inline UTF-8 constant.
+    pub utf8_classid: u32,
+}
+
+impl LoweringContext {
+    /// A context using the placeholder classids — for tests and for callers
+    /// that have not yet been handed minted ids.
+    #[must_use]
+    pub fn placeholder() -> Self {
+        Self {
+            pool: ConstantPool::new(),
+            f64_classid: pool::placeholder::CONST_F64,
+            utf8_classid: pool::placeholder::CONST_UTF8_INLINE,
+        }
+    }
+}
+
+/// Cast a script, interning wide literals into a constant pool.
+///
+/// The difference from [`lower_script`] is exactly one: a
+/// [`FieldValue::Wide`] spends its immediate byte as a pool index instead of
+/// being refused. Everything else — post-order, selector spending, ValueParam
+/// ordinals — is identical, and a script with no wide literals produces a
+/// **byte-identical** body and an **empty** pool.
+///
+/// # Errors
+///
+/// As [`lower_script`], plus [`CastError::ConstantPool`] when a literal is
+/// wider than a facet or the pool is full.
+pub fn lower_script_with_pool(
+    shape: LaneShape,
+    top: &BlockRecord,
+    ctx: &mut LoweringContext,
+) -> Result<FunctionBody, CastError> {
+    let mut body = FunctionBody::new(shape);
+    lower_chain(top, &mut body, Some(ctx))?;
     Ok(body)
 }
 
 /// Walk a statement chain: each block's operands, then the block, then `next`.
-fn lower_chain(block: &BlockRecord, body: &mut FunctionBody) -> Result<(), CastError> {
-    lower_block(block, body)?;
+fn lower_chain(
+    block: &BlockRecord,
+    body: &mut FunctionBody,
+    mut ctx: Option<&mut LoweringContext>,
+) -> Result<(), CastError> {
+    lower_block(block, body, ctx.as_deref_mut())?;
     if let Some(next) = &block.next {
-        lower_chain(next, body)?;
+        lower_chain(next, body, ctx)?;
     }
     Ok(())
 }
 
 /// Emit one block: operands first (post-order), then the block's own call.
-fn lower_block(block: &BlockRecord, body: &mut FunctionBody) -> Result<(), CastError> {
+fn lower_block(
+    block: &BlockRecord,
+    body: &mut FunctionBody,
+    mut ctx: Option<&mut LoweringContext>,
+) -> Result<(), CastError> {
     // Operands first — this IS the stack discipline, and it is Blockly's own
     // nesting rather than a convention imposed on it.
     for (_, operand) in &block.inputs {
-        lower_block(operand, body)?;
+        lower_block(operand, body, ctx.as_deref_mut())?;
     }
-    body.push(call_for(block)?)?;
+    let call = call_for(block, ctx)?;
+    body.push(call)?;
     Ok(())
 }
 
 /// The single call one block lowers to — its function index plus its immediate.
-fn call_for(block: &BlockRecord) -> Result<Call, CastError> {
+fn call_for(block: &BlockRecord, mut ctx: Option<&mut LoweringContext>) -> Result<Call, CastError> {
     // A mutator payload decides the block's SHAPE. Lowering without it would
     // emit a call that looks complete and is not.
     if block.extra_state.is_some() {
@@ -399,43 +496,84 @@ fn call_for(block: &BlockRecord) -> Result<Call, CastError> {
         code: code.map(str::to_owned),
     })?;
 
-    // A ValueParam dropdown is an ARGUMENT, not a selector. Its byte encoding
-    // is not yet defined, and dropping it would lower math_constant[PI] and
-    // math_constant[E] to identical calls.
-    if mapping.role == codebook::CodeRole::ValueParam
-        && let Some(c) = code
-    {
-        return Err(CastError::UnencodedValueParam {
-            ty: block.ty.clone(),
-            code: c.to_owned(),
-        });
-    }
-
-    // The immediate: the non-dropdown field values, in the block's field order.
-    // A Selector dropdown chose WHICH function and is already spent.
+    // The immediates, in the block's own field order. A Selector dropdown
+    // chose WHICH function and is already spent; a ValueParam dropdown is an
+    // ARGUMENT and becomes a byte, or the cast refuses.
     let mut values = [0u8; ogar_blockly::MAX_VALUES_PER_CALL];
     let mut n = 0usize;
-    for (_, v) in &block.fields {
+    let mut push = |b: u8| -> Result<(), CastError> {
+        // Silently dropping the overflow would emit a call that looks complete
+        // and is not — the same failure the mutator guard above exists to stop.
+        if n >= ogar_blockly::MAX_VALUES_PER_CALL {
+            return Err(CastError::TooManyValues {
+                ty: block.ty.clone(),
+                offered: block.fields.len(),
+            });
+        }
+        values[n] = b;
+        n += 1;
+        Ok(())
+    };
+
+    for (name, v) in &block.fields {
         match v {
-            FieldValue::Byte(b) => {
-                if n < ogar_blockly::MAX_VALUES_PER_CALL {
-                    values[n] = *b;
-                    n += 1;
+            FieldValue::Byte(b) => push(*b)?,
+            FieldValue::Wide(text) => match ctx.as_deref_mut() {
+                // No pool: the historical refusal. A guessed index is worse
+                // than no answer.
+                None => {
+                    return Err(CastError::WideLiteral {
+                        ty: block.ty.clone(),
+                        value: text.clone(),
+                    });
                 }
-            }
-            FieldValue::Wide(text) => {
-                return Err(CastError::WideLiteral {
-                    ty: block.ty.clone(),
-                    value: text.clone(),
-                });
-            }
+                Some(cx) => {
+                    // A Blockly field is a string even when it denotes a
+                    // number, so the reading is decided HERE and named by the
+                    // facet classid — never by a tag byte inside the payload,
+                    // which would be a second schema under one classid.
+                    let idx = match text.parse::<f64>() {
+                        Ok(n) => cx.pool.intern_f64(cx.f64_classid, n),
+                        Err(_) => cx.pool.intern_str(cx.utf8_classid, text),
+                    }
+                    .map_err(|e| CastError::ConstantPool {
+                        ty: block.ty.clone(),
+                        value: text.clone(),
+                        source: e,
+                    })?;
+                    push(idx)?;
+                }
+            },
             FieldValue::Ref { id } => {
                 return Err(CastError::UnresolvedRef {
                     ty: block.ty.clone(),
                     id: id.clone(),
                 });
             }
-            FieldValue::Code(_) => {}
+            FieldValue::Code(c) => match mapping.role {
+                // Spent by resolution — `logic_compare[LT]` IS `FnIndex::LT`.
+                codebook::CodeRole::Selector => {}
+                // An argument: its ordinal in the codebook's pinned option set.
+                codebook::CodeRole::ValueParam => {
+                    let byte =
+                        codebook::encode_value_param(&block.ty, name, c).ok_or_else(|| {
+                            CastError::UnencodedValueParam {
+                                ty: block.ty.clone(),
+                                code: c.clone(),
+                            }
+                        })?;
+                    push(byte)?;
+                }
+                // A code on a block whose resolution ignores codes. Refused
+                // rather than dropped: it means the record and the codebook
+                // disagree about the block's shape.
+                codebook::CodeRole::None => {
+                    return Err(CastError::UnencodedValueParam {
+                        ty: block.ty.clone(),
+                        code: c.clone(),
+                    });
+                }
+            },
         }
     }
     Ok(Call::with_values(mapping.function, values))
@@ -905,24 +1043,46 @@ mod tests {
     }
 
     #[test]
-    fn a_value_param_dropdown_is_refused_rather_than_conflated() {
-        // math_constant[PI] and math_constant[E] are DIFFERENT programs. If the
-        // ValueParam code were dropped they would lower to identical calls —
-        // so the refusal is what keeps them distinguishable until the encoding
-        // lands. Two-sided: a Selector dropdown on a comparable block is fine.
-        let pi = BlockRecord::leaf("math_constant", "c")
-            .with_field("CONSTANT", FieldValue::Code("PI".into()));
-        match lower_script(LaneShape::Pairs, &pi) {
-            Err(CastError::UnencodedValueParam { ty, code }) => {
-                assert_eq!(ty, "math_constant");
-                assert_eq!(code, "PI");
-            }
-            other => panic!("a value-param dropdown must be refused, got {other:?}"),
-        }
-        // The selector case still works — the refusal is targeted, not blanket.
+    fn a_value_param_dropdown_encodes_rather_than_conflating() {
+        // RE-PINNED, deliberately. This test previously asserted the dropdown
+        // was REFUSED (`UnencodedValueParam`), because no byte encoding
+        // existed. The encoding now exists, so that assertion became wrong —
+        // but the PROPERTY it stood in for did not change, and is asserted
+        // here directly instead of through the refusal that proxied it:
+        // math_constant[PI] and math_constant[E] are different programs.
+        let of = |code: &str| {
+            let b = BlockRecord::leaf("math_constant", "c")
+                .with_field("CONSTANT", FieldValue::Code(code.into()));
+            raise_calls(&lower_script(LaneShape::Pairs, &b).unwrap())
+        };
+        let pi = of("PI");
+        let e = of("E");
+        assert_eq!(pi.len(), 1);
+        // Same function — a ValueParam must NOT fan the palette out…
+        assert_eq!(pi[0].function, e[0].function);
+        assert_eq!(pi[0].function, ogar_blockly::FnIndex::CONSTANT);
+        // …and the two programs stay distinguishable anyway, which is the
+        // whole point. Drop the code and these become equal.
+        assert_ne!(pi[0].values[0], e[0].values[0]);
+        assert_eq!(pi[0].values[0], 0);
+        assert_eq!(e[0].values[0], 1);
+
+        // Silence twin: a code the option set does not name is still refused,
+        // not defaulted to ordinal 0.
+        let tau = BlockRecord::leaf("math_constant", "c")
+            .with_field("CONSTANT", FieldValue::Code("TAU".into()));
+        assert!(matches!(
+            lower_script(LaneShape::Pairs, &tau),
+            Err(CastError::UnencodedValueParam { .. })
+        ));
+
+        // The Selector case is untouched: its code is spent by resolution and
+        // never becomes an immediate.
         let lt =
             BlockRecord::leaf("logic_compare", "c").with_field("OP", FieldValue::Code("LT".into()));
-        assert!(lower_script(LaneShape::Pairs, &lt).is_ok());
+        let calls = raise_calls(&lower_script(LaneShape::Pairs, &lt).unwrap());
+        assert_eq!(calls[0].function, ogar_blockly::FnIndex::LT);
+        assert_eq!(calls[0].values[0], 0);
     }
 
     #[test]
@@ -953,5 +1113,157 @@ mod tests {
         assert_eq!(script.block_count(), 3);
         let body = lower_script(LaneShape::Pairs, &script).unwrap();
         assert_eq!(body.len(), script.block_count());
+    }
+
+    // ── the constant pool, end to end ───────────────────────────────────────
+
+    #[test]
+    fn a_narrow_program_produces_an_empty_pool_and_an_identical_body() {
+        // The SILENCE half, and the reason it uses `five_plus_three()` rather
+        // than an empty script: an empty program trivially has an empty pool
+        // and proves only that nothing crashed. This input really does carry
+        // literals — they are just narrow enough to stay immediates.
+        let script = five_plus_three();
+        let plain = lower_script(LaneShape::Pairs, &script).unwrap();
+
+        let mut ctx = LoweringContext::placeholder();
+        let pooled = lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx).unwrap();
+
+        assert!(
+            ctx.pool.is_empty(),
+            "a narrow literal must not reach the pool"
+        );
+        assert_eq!(
+            plain.as_body_bytes(),
+            pooled.as_body_bytes(),
+            "enabling the pool changed a program that has no wide literals"
+        );
+        // And the body really is the pinned one, so "identical" is not two
+        // identically-broken results.
+        assert_eq!(&pooled.as_body_bytes()[..6], &[0x46, 5, 0x46, 3, 0x40, 0]);
+    }
+
+    #[test]
+    fn a_wide_literal_interns_and_the_call_carries_its_index() {
+        // The FIRE half. Two DISTINCT wide literals, because with only one an
+        // "index was assigned" assertion is free — there is nothing it could
+        // be confused with.
+        let script = BlockRecord::leaf("math_arithmetic", "root")
+            .with_field("OP", FieldValue::Code("ADD".into()))
+            .with_input(
+                "A",
+                BlockRecord::leaf("math_number", "a")
+                    .with_field("NUM", FieldValue::Wide("7.25".into())),
+            )
+            .with_input(
+                "B",
+                BlockRecord::leaf("math_number", "b")
+                    .with_field("NUM", FieldValue::Wide("1000000".into())),
+            );
+
+        // Without a pool this is still refused — the default did not move.
+        assert!(matches!(
+            lower_script(LaneShape::Pairs, &script),
+            Err(CastError::WideLiteral { .. })
+        ));
+
+        let mut ctx = LoweringContext::placeholder();
+        let body = lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx).unwrap();
+        let calls = raise_calls(&body);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(ctx.pool.len(), 2);
+
+        // The two index bytes must DIFFER — a pool returning a fixed index
+        // would lower both literals identically and still "succeed".
+        let (a, b) = (calls[0].values[0], calls[1].values[0]);
+        assert_ne!(a, b, "two distinct literals collapsed onto one index");
+        // Neither is the zero-fallback.
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+
+        // …and they read back BIT-EXACT under the right classid. Asserting
+        // only `is_ok()` would be truncation wearing a pool costume.
+        let f = |idx: u8| {
+            let c = ctx.pool.resolve(idx).unwrap();
+            assert_eq!(c.classid, pool::placeholder::CONST_F64);
+            f64::from_le_bytes(c.bytes[..8].try_into().unwrap())
+        };
+        assert_eq!(f(a), 7.25);
+        assert_eq!(f(b), 1_000_000.0);
+    }
+
+    #[test]
+    fn a_string_literal_takes_the_utf8_classid_not_the_f64_one() {
+        // The reading is decided at the cast and NAMED by the facet classid.
+        // A tag byte inside the payload would be a second schema under one
+        // classid, which is what "your classid defines the schema" forbids.
+        let script =
+            BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide("hello".into()));
+        let mut ctx = LoweringContext::placeholder();
+        let body = lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx).unwrap();
+        let idx = raise_calls(&body)[0].values[0];
+        let c = ctx.pool.resolve(idx).unwrap();
+        assert_eq!(c.classid, pool::placeholder::CONST_UTF8_INLINE);
+        assert_eq!(&c.bytes[..5], b"hello");
+
+        // Two-sided: a numeric-looking string still goes to the f64 side, so
+        // the classid is chosen by the VALUE and not by the block type.
+        let n = BlockRecord::leaf("text", "t2").with_field("TEXT", FieldValue::Wide("42".into()));
+        let body2 = lower_script_with_pool(LaneShape::Pairs, &n, &mut ctx).unwrap();
+        let idx2 = raise_calls(&body2)[0].values[0];
+        assert_eq!(
+            ctx.pool.resolve(idx2).unwrap().classid,
+            pool::placeholder::CONST_F64
+        );
+    }
+
+    #[test]
+    fn the_same_wide_literal_used_twice_interns_once() {
+        // Content-addressing end to end — and the reason the repoint-never-
+        // mutate rule exists: one entry may have several referents, so an
+        // in-place edit would change a call site the user did not touch.
+        let script = BlockRecord::leaf("math_arithmetic", "root")
+            .with_field("OP", FieldValue::Code("ADD".into()))
+            .with_input(
+                "A",
+                BlockRecord::leaf("math_number", "a")
+                    .with_field("NUM", FieldValue::Wide("7.25".into())),
+            )
+            .with_input(
+                "B",
+                BlockRecord::leaf("math_number", "b")
+                    .with_field("NUM", FieldValue::Wide("7.25".into())),
+            );
+        let mut ctx = LoweringContext::placeholder();
+        let body = lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx).unwrap();
+        let calls = raise_calls(&body);
+        assert_eq!(ctx.pool.len(), 1, "one value must occupy one slot");
+        assert_eq!(calls[0].values[0], calls[1].values[0]);
+    }
+
+    #[test]
+    fn an_oversized_literal_is_refused_by_the_cast_too() {
+        // The refusal survives the pool: a literal wider than a facet does not
+        // silently truncate, which would be worse than today's WideLiteral
+        // error because it would look like success.
+        let long = "x".repeat(13);
+        let script = BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide(long));
+        let mut ctx = LoweringContext::placeholder();
+        assert!(matches!(
+            lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx),
+            Err(CastError::ConstantPool {
+                source: PoolError::TooWide { needed: 13 },
+                ..
+            })
+        ));
+        assert!(
+            ctx.pool.is_empty(),
+            "the refused literal must not have landed"
+        );
+        // Twelve still fits, so the guard discriminates rather than refusing
+        // every string.
+        let ok =
+            BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide("x".repeat(12)));
+        assert!(lower_script_with_pool(LaneShape::Pairs, &ok, &mut ctx).is_ok());
     }
 }
