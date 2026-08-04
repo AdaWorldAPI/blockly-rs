@@ -1,0 +1,12 @@
+[package]
+name = "blockly-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "The cast between a Blockly workspace block record and the V3 ABI-shaped SoA function body — semantics only, presentation held separately, zero serialization. Post-order lowering (a block's nested inputs are its operands) and the inverse raise."
+
+[dependencies]
+ogar-blockly = { workspace = true }

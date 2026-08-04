@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/blockly-abi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/AdaWorldAPI/blockly-rs"
+authors = ["AdaWorldAPI"]
+rust-version = "1.95"
+
+[workspace.dependencies]
+# The block vocabulary + the V3 function-body ABI (OGAR #234/#235/#236).
+# Deliberately the ONLY substrate dependency: this half of the arc stays
+# permissive, and never links the GPL `rash` JIT (that boundary lives in
+# scratch-rs). See OGAR docs/BLOCK-EDITOR-PLAN.md § "Where the seam falls".
+ogar-blockly = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }
