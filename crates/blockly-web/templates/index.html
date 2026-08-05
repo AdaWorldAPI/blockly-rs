@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blockly-rs — blocks are a projection of V3 rows</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  header { padding: .5rem .9rem; border-bottom: 1px solid #8884; display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 1rem; margin: 0; }
+  header .sub { opacity: .7; font-size: .85rem; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #blocklyDiv { flex: 1.2; min-width: 380px; }
+  #panels { flex: 1; overflow: auto; padding: .8rem; border-left: 1px solid #8884; }
+  section { margin-bottom: 1rem; }
+  section h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; opacity: .75; margin: 0 0 .3rem; }
+  pre { background: #80808018; padding: .5rem .6rem; border-radius: 6px; overflow-x: auto; margin: .25rem 0; font-size: .78rem; }
+  .err { color: #c0392b; font-weight: 600; }
+  .ok { color: #27ae60; font-weight: 600; }
+  .muted { opacity: .65; }
+  .fn { border-left: 3px solid #8886; padding-left: .6rem; margin: .5rem 0; }
+  select { font: inherit; }
+  .badge { display: inline-block; padding: 0 .45em; border-radius: 4px; background: #80808022; }
+</style>
+</head>
+<body>
+<header>
+  <h1>blockly-rs</h1>
+  <span class="sub">drag blocks → V3 SoA rows. The blocks are a projection; the 512-byte node is the program.</span>
+  <label>lane shape
+    <select id="shape">
+      <option value="pairs" selected>Pairs — 6×(fn:val), 180 calls</option>
+      <option value="triples">Triples — 4×(fn:val:val), 120 calls</option>
+      <option value="quads">Quads — 3×(fn:val×3), 90 calls</option>
+    </select>
+  </label>
+</header>
+<main>
+  <div id="blocklyDiv"></div>
+  <div id="panels">
+    <section><h2>refusals</h2><div id="errors" class="muted">none — the cast accepted everything on the canvas</div></section>
+    <section><h2>scripts</h2><div id="scripts" class="muted">drag a block to begin</div></section>
+    <p class="muted">Key prefix 0xFF00 is a placeholder — the real app prefix is an unminted operator decision (M1).
+    Wide literals (strings, floats) refuse until the constant-pool concepts mint (M3). Refusing loudly is the feature.</p>
+  </div>
+</main>
+
+<script src="https://unpkg.com/blockly@11.2.1/blockly_compressed.js"></script>
+<script src="https://unpkg.com/blockly@11.2.1/blocks_compressed.js"></script>
+<script src="https://unpkg.com/blockly@11.2.1/msg/en.js"></script>
+<script>
+const toolbox = {
+  kind: "categoryToolbox",
+  contents: [
+    { kind: "category", name: "Math", contents: [
+      { kind: "block", type: "math_number" },
+      { kind: "block", type: "math_arithmetic" },
+      { kind: "block", type: "math_single" },
+      { kind: "block", type: "math_trig" },
+      { kind: "block", type: "math_round" },
+      { kind: "block", type: "math_modulo" },
+      { kind: "block", type: "math_constrain" },
+    ]},
+    { kind: "category", name: "Logic", contents: [
+      { kind: "block", type: "logic_compare" },
+      { kind: "block", type: "logic_operation" },
+      { kind: "block", type: "logic_negate" },
+      { kind: "block", type: "logic_boolean" },
+    ]},
+    { kind: "category", name: "Control", contents: [
+      { kind: "block", type: "controls_if" },
+      { kind: "block", type: "controls_ifelse" },
+      { kind: "block", type: "controls_repeat_ext" },
+      { kind: "block", type: "controls_whileUntil" },
+    ]},
+    { kind: "category", name: "Text", contents: [
+      { kind: "block", type: "text" },
+      { kind: "block", type: "text_print" },
+      { kind: "block", type: "text_join" },
+    ]},
+  ],
+};
+const workspace = Blockly.inject("blocklyDiv", { toolbox, trashcan: true });
+
+let timer = null;
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+}
+async function recast() {
+  const save = Blockly.serialization.workspaces.save(workspace);
+  const shape = document.getElementById("shape").value;
+  const res = await fetch("/api/cast?shape=" + shape, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(save),
+  });
+  render(await res.json());
+}
+function render(out) {
+  const errs = document.getElementById("errors");
+  if (out.errors.length === 0) {
+    errs.className = "muted";
+    errs.textContent = "none — the cast accepted everything on the canvas";
+  } else {
+    errs.className = "";
+    errs.innerHTML = out.errors.map(e => `<pre class="err">${esc(e)}</pre>`).join("");
+  }
+  const scripts = document.getElementById("scripts");
+  if (out.scripts.length === 0) {
+    scripts.className = "muted";
+    scripts.textContent = "no stored scripts (empty canvas, or everything refused)";
+    return;
+  }
+  scripts.className = "";
+  scripts.innerHTML = out.scripts.map((s, si) => {
+    const fns = s.functions.map(f => `
+      <div class="fn">
+        <div><span class="badge">fn ${f.index}</span> ${f.len} call(s)</div>
+        <pre>${esc(f.calls.join("  "))}</pre>
+        ${f.text !== null
+          ? `<div>text: <code>${esc(f.text)}</code></div>`
+          : `<div class="muted">no text projection (statement body): ${esc(f.text_error || "")}</div>`}
+      </div>`).join("");
+    const rt = s.roundtrip === null
+      ? `<span class="muted">round-trip: n/a (no text projection)</span>`
+      : (s.roundtrip
+          ? `<span class="ok">round-trip: byte-identical ✓</span>`
+          : `<span class="err">round-trip: MISMATCH</span>`);
+    return `
+      <div>
+        <div><b>script ${si}</b> — shape ${esc(out.shape)} ·
+          ${s.resolvable ? '<span class="ok">references resolve ✓</span>' : '<span class="err">dangling reference</span>'} ·
+          ${s.reserved_zeroed ? '<span class="ok">reserved slot zeroed ✓</span>' : '<span class="err">reserved slot dirty</span>'} ·
+          ${rt}</div>
+        ${fns}
+        <details><summary>entry node — 512 bytes (key · reserved · 30 interleaved lanes)</summary>
+          <pre>${s.node_hex.map((row, i) => {
+            const label = i === 0 ? "key " : (i === 1 ? "rsvd" : "lane");
+            return `${label} ${String(i).padStart(2)} │ ${esc(row)}`;
+          }).join("\n")}</pre>
+        </details>
+      </div>`;
+  }).join("<hr>");
+}
+workspace.addChangeListener(e => {
+  if (e.isUiEvent) return;
+  clearTimeout(timer);
+  timer = setTimeout(recast, 250);
+});
+document.getElementById("shape").addEventListener("change", recast);
+recast();
+</script>
+</body>
+</html>
