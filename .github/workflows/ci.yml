@@ -40,4 +40,4 @@ jobs:
       - name: rustdoc broken intra-doc links
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
-        run: cargo doc -p blockly-abi --no-deps
+        run: cargo doc -p blockly-abi -p blockly-shim --no-deps
