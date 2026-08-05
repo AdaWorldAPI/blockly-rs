@@ -1,95 +1,45 @@
-//! A **program** — the several functions a script with control flow becomes.
+//! Lowering a script — including its control flow — into an
+//! [`ogar_loco::Program`].
+//!
+//! # Post-flip shape (ruling R1/Q6)
+//!
+//! During the float this module carried its own `Program`, reference checker,
+//! and branch reporter, typed on the palette. Those now live ONCE in
+//! `ogar-loco` — [`Program`], [`Program::references_are_resolvable`],
+//! [`crate::branches_of`] — and this module keeps only what is genuinely
+//! Blockly's: **the lowering** from a [`BlockRecord`] tree into bodies. The
+//! flow tables it consults are the shared core's
+//! ([`ogar_loco::vocabulary::shared_core`]), which is exactly where the
+//! palette's control range lives.
 //!
 //! # Why one script is not one function
 //!
-//! [`lower_script`](crate::lower_script) casts a block chain into a single
-//! [`FunctionBody`]. That is exact for straight-line expressions and wrong the
-//! moment a loop appears, because W0 locked nesting **by reference**: a loop
-//! body is another function's node, named by index. No `END` marker, no jump
-//! offset.
-//!
-//! So `repeat 10 [ move ]` is **two** functions — the caller and the body —
-//! and the caller spends one value byte naming the second.
-//!
-//! That is what keeps a node fixed-size: a body of any length costs its parent
-//! exactly one byte. Splicing the body inline with a terminator would make a
-//! call's width depend on its contents, so editing inside a loop would shift
-//! every later call in the enclosing function. It is the same defect that ruled
-//! out literal-as-call-run for the constant pool, and it would break the W1
-//! one-write gate for exactly the same reason.
+//! Nesting is by reference: a loop body is another function's node, named by
+//! index. No `END` marker, no jump offset. So `repeat 10 [ move ]` is **two**
+//! functions — the caller and the body — and the caller spends one value byte
+//! naming the second. That is what keeps a node fixed-size: a body of any
+//! length costs its parent exactly one byte.
 //!
 //! # Function 0 is the entry, and indices are stable
 //!
-//! [`Program::functions`] is indexed by the byte a caller stores. Function `0`
-//! is the script's own body. Bodies are appended in the order the walk reaches
-//! them, so an index, once assigned, does not move — which is what makes it
-//! safe to store.
-//!
-//! Index `0` is therefore a **real** function rather than a zero-fallback, and
-//! that is deliberate: nothing references function 0 (the entry is entered, not
-//! branched to), so `0` in a body-reference byte would be a bug rather than a
-//! sentinel — [`Program::references_are_resolvable`] is what says so.
+//! Function `0` is the script's own body; bodies are appended in the order
+//! the walk reaches them, so an index, once assigned, does not move. Nothing
+//! references function 0 (the entry is entered, not branched to), so `0` in a
+//! body-reference byte would be a bug rather than a sentinel —
+//! [`Program::references_are_resolvable`] is what says so.
 //!
 //! # What this does not do
 //!
 //! It does not mint keys. A stored program is N [`FunctionNode`](crate::FunctionNode)s
 //! and each needs a GUID; minting is OGAR's and the `blockly-rs` app prefix is
 //! an unminted operator decision. So a `Program` carries bodies and the caller
-//! supplies keys — the same boundary [`crate::node`] draws.
+//! supplies keys.
 
-use ogar_blockly::{Call, FunctionBody, LaneShape};
+use ogar_blockly::FunctionBody;
+use ogar_loco::Program;
+use ogar_loco::vocabulary::shared_core;
 
-use crate::{BlockRecord, CastError, call_for, flow};
-
-/// One script's functions. Index `0` is the entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Program {
-    /// The bodies, indexed by the byte a body-reference stores.
-    pub functions: Vec<FunctionBody>,
-}
-
-impl Program {
-    /// The entry body.
-    #[must_use]
-    pub fn entry(&self) -> &FunctionBody {
-        &self.functions[0]
-    }
-
-    /// How many functions the script became.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.functions.len()
-    }
-
-    /// Whether the program holds no functions. Never true for a lowered
-    /// script — the entry always exists.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.functions.is_empty()
-    }
-
-    /// Every body-reference names a function that exists, and none names the
-    /// entry.
-    ///
-    /// Both halves matter. An out-of-range index is a dangling branch; a
-    /// reference to function `0` is a loop back into the entry, which the cast
-    /// never emits and which would be an unbounded recursion if honoured.
-    #[must_use]
-    pub fn references_are_resolvable(&self) -> bool {
-        for body in &self.functions {
-            for call in body.calls() {
-                let n = flow::body_refs(call.function);
-                for slot in 0..usize::from(n) {
-                    let idx = usize::from(call.values[slot]);
-                    if idx == 0 || idx >= self.functions.len() {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    }
-}
+use crate::{BlockRecord, CastError, call_for};
 
 /// Cast a script — including its control flow — into a program.
 ///
@@ -97,12 +47,21 @@ impl Program {
 /// [`lower_script`](crate::lower_script) emits, so this is a strict widening
 /// rather than a second cast.
 ///
+/// The index of a body is reserved BEFORE the body is lowered, so a parent's
+/// index is always LOWER than its children's and every stored reference
+/// points **forward**. (Both orders are bijective; the reservation buys the
+/// readable invariant, not collision-freedom — verified by injection when
+/// this was first built.)
+///
 /// # Errors
 ///
 /// As [`lower_script`](crate::lower_script), plus
 /// [`CastError::ShapeTooNarrow`] when a call's body references cannot fit the
 /// shape's immediate width, and [`CastError::TooManyFunctions`] past 255.
-pub fn lower_program(shape: LaneShape, top: &BlockRecord) -> Result<Program, CastError> {
+pub fn lower_program(
+    shape: ogar_blockly::LaneShape,
+    top: &BlockRecord,
+) -> Result<Program, CastError> {
     // The entry is reserved before the walk so that bodies discovered inside it
     // get indices 1.., and the entry keeps 0 no matter what order they appear.
     let mut functions: Vec<Option<FunctionBody>> = vec![None];
@@ -118,7 +77,7 @@ pub fn lower_program(shape: LaneShape, top: &BlockRecord) -> Result<Program, Cas
 
 /// Walk a statement chain into one body, appending any referenced bodies.
 fn lower_chain_into(
-    shape: LaneShape,
+    shape: ogar_blockly::LaneShape,
     block: &BlockRecord,
     functions: &mut Vec<Option<FunctionBody>>,
 ) -> Result<FunctionBody, CastError> {
@@ -135,7 +94,7 @@ fn lower_chain_into(
 /// with its statement inputs lowered into separate functions first, so their
 /// indices exist by the time the call that names them is built.
 fn lower_block_into(
-    shape: LaneShape,
+    shape: ogar_blockly::LaneShape,
     block: &BlockRecord,
     body: &mut FunctionBody,
     functions: &mut Vec<Option<FunctionBody>>,
@@ -147,7 +106,7 @@ fn lower_block_into(
     let mut call = call_for(block, None)?;
 
     if !block.statements.is_empty() {
-        let refs = flow::body_refs(call.function);
+        let refs = shared_core::body_refs(call.function);
         if refs == 0 {
             return Err(CastError::UnexpectedStatements {
                 ty: block.ty.clone(),
@@ -173,17 +132,6 @@ fn lower_block_into(
                 // treating as a branch to the entry.
                 continue;
             };
-            // Reserve the index BEFORE lowering, so a parent's index is always
-            // LOWER than its children's.
-            //
-            // Correcting an earlier claim here: this does not prevent a
-            // collision. Lowering first and pushing after is also bijective —
-            // it just numbers depth-first, so an inner body takes 1 and its
-            // parent 2. Verified by injection: swapping the order left every
-            // test passing, which is how the overstatement was caught. What
-            // the reservation actually buys is a readable invariant — a
-            // reference always points FORWARD — and that is what
-            // `a_parents_index_precedes_its_childrens` pins.
             let idx = functions.len();
             if idx > 255 {
                 return Err(CastError::TooManyFunctions { count: idx });
@@ -199,27 +147,14 @@ fn lower_block_into(
     Ok(())
 }
 
-/// Read a body's calls back as `(index, call)` pairs, resolving which value
-/// bytes are branches.
-///
-/// Useful to a consumer walking a program: it says *which* bytes are function
-/// indices without re-deriving [`flow::body_refs`].
-#[must_use]
-pub fn branches_of(body: &FunctionBody) -> Vec<(usize, Call, Vec<u8>)> {
-    body.calls()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            let n = usize::from(flow::body_refs(c.function));
-            (n > 0).then(|| (i, c, c.values[..n].to_vec()))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldValue, lower_script, raise_calls};
-    use ogar_blockly::FnIndex;
+    use crate::{
+        FieldValue, FunctionNode, branches_of, checked_vocabulary, lower_script, raise_calls,
+        render_text,
+    };
+    use ogar_blockly::{Call, FnIndex, LaneShape};
 
     const S: LaneShape = LaneShape::Pairs;
 
@@ -302,7 +237,7 @@ mod tests {
 
         let prog = lower_program(S, &outer).unwrap();
         assert_eq!(prog.len(), 3, "entry + outer body + inner body");
-        assert!(prog.references_are_resolvable());
+        assert!(prog.references_are_resolvable(checked_vocabulary()));
 
         let entry = raise_calls(prog.entry());
         let outer_ref = entry.last().unwrap().values[0];
@@ -322,8 +257,9 @@ mod tests {
 
     #[test]
     fn every_reference_resolves_and_none_points_at_the_entry() {
+        let v = checked_vocabulary();
         let prog = lower_program(S, &repeat_ten()).unwrap();
-        assert!(prog.references_are_resolvable());
+        assert!(prog.references_are_resolvable(v));
 
         // Two-sided, and both halves are real failure modes. A dangling index:
         let mut dangling = prog.clone();
@@ -334,7 +270,7 @@ mod tests {
         calls.last_mut().unwrap().values[0] = 9;
         dangling.functions[0] = FunctionBody::from_calls(S, &calls).unwrap();
         assert!(
-            !dangling.references_are_resolvable(),
+            !dangling.references_are_resolvable(v),
             "a dangling branch must be caught"
         );
 
@@ -342,7 +278,7 @@ mod tests {
         calls.last_mut().unwrap().values[0] = 0;
         dangling.functions[0] = FunctionBody::from_calls(S, &calls).unwrap();
         assert!(
-            !dangling.references_are_resolvable(),
+            !dangling.references_are_resolvable(v),
             "a branch to the entry must be caught"
         );
     }
@@ -372,7 +308,7 @@ mod tests {
         // distinct functions.
         let prog = lower_program(LaneShape::Triples, &ite).unwrap();
         assert_eq!(prog.len(), 3);
-        assert!(prog.references_are_resolvable());
+        assert!(prog.references_are_resolvable(checked_vocabulary()));
         let call = raise_calls(prog.entry()).pop().unwrap();
         assert_ne!(call.values[0], call.values[1], "then and else must differ");
     }
@@ -393,8 +329,9 @@ mod tests {
 
     #[test]
     fn branches_of_reports_which_bytes_are_function_indices() {
+        let v = checked_vocabulary();
         let prog = lower_program(S, &repeat_ten()).unwrap();
-        let b = branches_of(prog.entry());
+        let b = branches_of(v, prog.entry());
         assert_eq!(b.len(), 1, "one branching call in the entry");
         let (idx, call, targets) = &b[0];
         assert_eq!(*idx, 1, "it is the second call");
@@ -402,6 +339,30 @@ mod tests {
         assert_eq!(targets, &vec![1u8]);
         // Silence twin: a straight-line body reports NO branches, so this is
         // not a function that always finds something.
-        assert!(branches_of(&prog.functions[1]).is_empty());
+        assert!(branches_of(v, &prog.functions[1]).is_empty());
+    }
+
+    #[test]
+    fn the_blocks_a_user_dragged_survive_the_stored_node_round_trip() {
+        // Kept from the deleted local node module — the consumer-level
+        // integration the hoisted core cannot test (it has no BlockRecord):
+        // Blockly record → cast → STORED BYTES → cast back → same program.
+        let blocks = BlockRecord::leaf("math_arithmetic", "root")
+            .with_field("OP", FieldValue::Code("ADD".into()))
+            .with_input("A", number("a", 5))
+            .with_input("B", number("b", 3));
+        let body = lower_script(S, &blocks).unwrap();
+        let mut key = [0u8; 16];
+        key[0..4].copy_from_slice(&0x1701_FF00_u32.to_le_bytes());
+        let stored = FunctionNode::new(key, body).to_le_bytes();
+        assert!(FunctionNode::reserved_is_zeroed(&stored));
+        let back = FunctionNode::from_le_bytes(&stored, S);
+        assert_eq!(
+            &back.body.as_body_bytes()[..6],
+            &[0x46, 5, 0x46, 3, 0x40, 0]
+        );
+        // The text projection of the RECOVERED body is the same program —
+        // meaning survived storage, not just bytes.
+        assert_eq!(render_text(&back.body).unwrap(), "5 + 3");
     }
 }

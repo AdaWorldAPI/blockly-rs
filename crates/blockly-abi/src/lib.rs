@@ -82,19 +82,44 @@
 use ogar_blockly::{BodyError, Call, FnIndex, FunctionBody, LaneShape};
 
 pub mod codebook;
-pub mod flow;
 pub mod klickweg;
-pub mod node;
-pub mod pool;
 pub mod program;
 pub mod projection;
 
 pub use codebook::{OpcodeMapping, resolve_opcode};
 pub use klickweg::{BlockAddress, address_of};
-pub use node::{FunctionNode, NODE_BYTES};
-pub use pool::{Constant, ConstantPool, PoolError};
-pub use program::{Program, lower_program};
+pub use program::lower_program;
 pub use projection::{ProjectionError, parse_text, render_text};
+
+// ── The shared ABI, consumed rather than copied (the flip, ruling R1/Q6) ────
+// The generic machinery this crate carried during the float — the stored
+// node, the constant pool, the program/reference rules, the flow tables —
+// now lives ONCE in `ogar-loco`, and this crate's local copies are DELETED.
+// The re-exports keep the old paths compiling; the flow tables are reached
+// through `ogar_loco::vocabulary::shared_core` (the Blockly palette is
+// entirely shared-core today) and, where a proof is required, through
+// [`checked_vocabulary`]. CI forbids the deleted definitions from returning.
+pub use ogar_loco::node::NODE_BYTES;
+pub use ogar_loco::{
+    CheckedVocabulary, Constant, ConstantPool, FunctionNode, PoolError, Program, branches_of,
+};
+
+/// The Blockly palette, validated — the proof-carrying token
+/// [`Program::references_are_resolvable`] and [`branches_of`] require.
+///
+/// Validation is a 256-byte sweep done once (lazily) per process;
+/// `BlocklyVocabulary`'s conformance is additionally pinned by its own
+/// crate's tests, so the `expect` here is a compile-time-adjacent fact,
+/// not a runtime hope.
+#[must_use]
+pub fn checked_vocabulary() -> &'static CheckedVocabulary<ogar_blockly::BlocklyVocabulary> {
+    static CHECKED: std::sync::LazyLock<CheckedVocabulary<ogar_blockly::BlocklyVocabulary>> =
+        std::sync::LazyLock::new(|| {
+            ogar_loco::vocabulary::conformance::validate(ogar_blockly::BlocklyVocabulary)
+                .expect("BlocklyVocabulary conforms; pinned by ogar-blockly's own tests")
+        });
+    &CHECKED
+}
 
 // ── The semantic record ─────────────────────────────────────────────────────
 
@@ -482,7 +507,7 @@ pub fn lower_script(shape: LaneShape, top: &BlockRecord) -> Result<FunctionBody,
 ///
 /// The classids are **parameters** rather than constants because minting them
 /// is an operator decision with a ledger entry (OGAR `BLOCK-EDITOR-PLAN.md`
-/// D4). Until that mint lands, [`pool::placeholder`] supplies deliberately
+/// D4). Until that mint lands, [`ogar_loco::pool::placeholder`] supplies deliberately
 /// invalid ids so a placeholder escaping into stored data is loud rather than
 /// plausible.
 #[derive(Debug, Clone)]
@@ -502,8 +527,8 @@ impl LoweringContext {
     pub fn placeholder() -> Self {
         Self {
             pool: ConstantPool::new(),
-            f64_classid: pool::placeholder::CONST_F64,
-            utf8_classid: pool::placeholder::CONST_UTF8_INLINE,
+            f64_classid: ogar_loco::pool::placeholder::CONST_F64,
+            utf8_classid: ogar_loco::pool::placeholder::CONST_UTF8_INLINE,
         }
     }
 }
@@ -1267,7 +1292,7 @@ mod tests {
         // only `is_ok()` would be truncation wearing a pool costume.
         let f = |idx: u8| {
             let c = ctx.pool.resolve(idx).unwrap();
-            assert_eq!(c.classid, pool::placeholder::CONST_F64);
+            assert_eq!(c.classid, ogar_loco::pool::placeholder::CONST_F64);
             f64::from_le_bytes(c.bytes[..8].try_into().unwrap())
         };
         assert_eq!(f(a), 7.25);
@@ -1285,7 +1310,7 @@ mod tests {
         let body = lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx).unwrap();
         let idx = raise_calls(&body)[0].values[0];
         let c = ctx.pool.resolve(idx).unwrap();
-        assert_eq!(c.classid, pool::placeholder::CONST_UTF8_INLINE);
+        assert_eq!(c.classid, ogar_loco::pool::placeholder::CONST_UTF8_INLINE);
         assert_eq!(&c.bytes[..5], b"hello");
 
         // Two-sided: a numeric-looking string still goes to the f64 side, so
@@ -1295,7 +1320,7 @@ mod tests {
         let idx2 = raise_calls(&body2)[0].values[0];
         assert_eq!(
             ctx.pool.resolve(idx2).unwrap().classid,
-            pool::placeholder::CONST_F64
+            ogar_loco::pool::placeholder::CONST_F64
         );
     }
 
