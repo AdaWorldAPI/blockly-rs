@@ -41,3 +41,16 @@ jobs:
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
         run: cargo doc -p blockly-abi -p blockly-shim --no-deps
+      # The executable no-second-vocabulary trap (ruling R1/Q6): after the
+      # flip onto ogar-loco, consumer-local definitions of the generic ABI
+      # symbols must NOT exist in this repo. Re-exports (`use`) are fine —
+      # a local `struct FunctionNode`/`fn stack_arity` is a second
+      # vocabulary starting, and this step fails loudly the day one returns.
+      - name: consumer-local generic ABI symbols must not exist (post-flip trap)
+        run: |
+          set -e
+          if grep -rnE "(pub )?(struct (FunctionNode|ConstantPool|Program)\b|fn (stack_arity|body_refs)\b)" crates/*/src; then
+            echo "::error::consumer-local generic ABI definition found — the shared surface lives in ogar-loco (ruling R1/Q6)"
+            exit 1
+          fi
+          echo "trap silent: no consumer-local generic ABI definitions"

@@ -44,63 +44,18 @@ use crate::raise_calls;
 
 /// How many operands a function consumes from the stack.
 ///
-/// `None` means the projection does not cover this function — it is refused
+/// `None` means the shared core does not cover this function — it is refused
 /// rather than assigned a plausible number, because a wrong arity
 /// desynchronizes the stack and silently reattributes every later operand.
+///
+/// Post-flip this is a pure delegation: the table that used to live here
+/// (and its control-flow half, which lived in the deleted local `flow`
+/// module) is defined ONCE in [`ogar_loco::vocabulary::shared_core`], where
+/// every sibling vocabulary reads the same bytes. Keeping a local copy would
+/// be the drift the shared core exists to make impossible.
 #[must_use]
 pub fn arity(f: FnIndex) -> Option<u8> {
-    // Control flow answers for itself: its operand count and its body-reference
-    // count are independent quantities, and only the first belongs here. See
-    // [`crate::flow`] for why conflating them reattributes operands.
-    if let Some(n) = crate::flow::stack_arity(f) {
-        return Some(n);
-    }
-    Some(match f {
-        // Leaves — they push, they do not consume.
-        FnIndex::NUMBER
-        | FnIndex::TEXT
-        | FnIndex::TRUE
-        | FnIndex::FALSE
-        | FnIndex::NULL
-        | FnIndex::CONSTANT
-        | FnIndex::VAR_GET => 0,
-        // Unary.
-        FnIndex::NOT
-        | FnIndex::NEG
-        | FnIndex::ABS
-        | FnIndex::SQRT
-        | FnIndex::LN
-        | FnIndex::LOG10
-        | FnIndex::EXP_E
-        | FnIndex::EXP_10
-        | FnIndex::SIN
-        | FnIndex::COS
-        | FnIndex::TAN
-        | FnIndex::ASIN
-        | FnIndex::ACOS
-        | FnIndex::ATAN
-        | FnIndex::ROUND
-        | FnIndex::FLOOR
-        | FnIndex::CEIL
-        | FnIndex::LENGTH => 1,
-        // Binary.
-        FnIndex::ADD
-        | FnIndex::SUB
-        | FnIndex::MUL
-        | FnIndex::DIV
-        | FnIndex::POW
-        | FnIndex::MOD
-        | FnIndex::EQ
-        | FnIndex::NEQ
-        | FnIndex::LT
-        | FnIndex::LTE
-        | FnIndex::GT
-        | FnIndex::GTE
-        | FnIndex::AND
-        | FnIndex::OR
-        | FnIndex::JOIN => 2,
-        _ => return None,
-    })
+    ogar_loco::vocabulary::shared_core::stack_arity(f)
 }
 
 /// The infix spelling and binding power of a binary operator, if it has one.
@@ -652,11 +607,11 @@ mod tests {
         // A wrong arity does not produce a wrong-looking render — it
         // desynchronizes the stack and silently reattributes every later
         // operand. So the table refuses.
-        // RE-PINNED. This used to name `IF`, which is now covered by
-        // [`crate::flow`] — control flow gained a stack arity, so asserting it
-        // is uncovered became wrong. The PROPERTY did not change, so it is
-        // re-pinned against functions that are still genuinely outside the
-        // table rather than weakened.
+        // RE-PINNED. This used to name `IF`, which gained a stack arity when
+        // control flow was covered (now in the shared core's tables) — so
+        // asserting it is uncovered became wrong. The PROPERTY did not
+        // change, so it is re-pinned against functions that are still
+        // genuinely outside the table rather than weakened.
         assert_eq!(arity(FnIndex::PROC_DEF), None);
         assert_eq!(arity(FnIndex::WAIT), None);
         let body = FunctionBody::from_calls(S, &[Call::new(FnIndex::PROC_DEF)]).unwrap();

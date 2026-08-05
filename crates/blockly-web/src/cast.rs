@@ -140,7 +140,7 @@ fn script_out(prog: &Program) -> ScriptOut {
             .collect(),
         node_hex,
         reserved_zeroed: FunctionNode::reserved_is_zeroed(&bytes),
-        resolvable: prog.references_are_resolvable(),
+        resolvable: prog.references_are_resolvable(blockly_abi::checked_vocabulary()),
         roundtrip,
     }
 }

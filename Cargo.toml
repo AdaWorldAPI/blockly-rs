@@ -16,3 +16,8 @@ rust-version = "1.95"
 # permissive, and never links the GPL `rash` JIT (that boundary lives in
 # scratch-rs). See OGAR docs/BLOCK-EDITOR-PLAN.md § "Where the seam falls".
 ogar-blockly = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }
+# The vocabulary-agnostic call ABI the palette rides on (hoisted in OGAR
+# #239/#241). Post-flip, blockly-abi consumes these types directly; its own
+# local copies are DELETED and CI forbids their return (the executable
+# no-second-vocabulary trap, ruling R1/Q6).
+ogar-loco = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }

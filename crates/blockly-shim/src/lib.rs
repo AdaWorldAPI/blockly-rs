@@ -373,7 +373,7 @@ mod tests {
 
         let prog = lower_program(LaneShape::Pairs, rec).unwrap();
         assert_eq!(prog.len(), 2, "caller + body");
-        assert!(prog.references_are_resolvable());
+        assert!(prog.references_are_resolvable(blockly_abi::checked_vocabulary()));
         let entry = raise_calls(prog.entry());
         assert_eq!(entry[0].values[0], 10, "the count is evaluated");
         assert_eq!(entry[1].function, FnIndex::REPEAT);

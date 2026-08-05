@@ -10,3 +10,4 @@ description = "The cast between a Blockly workspace block record and the V3 ABI-
 
 [dependencies]
 ogar-blockly = { workspace = true }
+ogar-loco = { workspace = true }
