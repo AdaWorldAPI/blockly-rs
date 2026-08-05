@@ -49,7 +49,7 @@
 //! plausible, reads back correctly through the same wrong function, and is
 //! wrong on the wire. `ogar-blockly` owns that arithmetic
 //! ([`FunctionBody::write_into_value_slab`]); this module composes it and
-//! [tests the composition against the layout constants](tests) rather than
+//! tests the composition against the layout constants rather than
 //! against its own idea of them.
 
 use ogar_blockly::{FunctionBody, LaneShape, SLOT_STRIDE, VALUE_SLAB_LEN};
