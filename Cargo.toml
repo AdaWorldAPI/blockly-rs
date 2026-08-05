@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/blockly-abi"]
+members = ["crates/blockly-abi", "crates/blockly-shim"]
 
 [workspace.package]
 version = "0.1.0"

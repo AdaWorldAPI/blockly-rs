@@ -1,0 +1,19 @@
+[package]
+name = "blockly-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "The membrane: Blockly's own save JSON in, BlockRecord out. serde lives HERE and nowhere else — blockly-abi stays serialization-free, and this crate is the one place a foreign format is allowed to touch the arc."
+
+[dependencies]
+blockly-abi = { path = "../blockly-abi" }
+ogar-blockly = { workspace = true }
+# The ONLY serde in this workspace, and the reason this crate exists as a
+# separate one. Charter T3: "serde/JSON/proto exist ONLY at a membrane, behind
+# a feature, never on the hot path." A membrane is a crate boundary here, so
+# the dependency cannot leak into `blockly-abi` by accident — it would take a
+# manifest edit, not an import.
+serde_json = "1"

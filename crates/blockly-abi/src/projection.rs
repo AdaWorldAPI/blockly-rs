@@ -49,6 +49,12 @@ use crate::raise_calls;
 /// desynchronizes the stack and silently reattributes every later operand.
 #[must_use]
 pub fn arity(f: FnIndex) -> Option<u8> {
+    // Control flow answers for itself: its operand count and its body-reference
+    // count are independent quantities, and only the first belongs here. See
+    // [`crate::flow`] for why conflating them reattributes operands.
+    if let Some(n) = crate::flow::stack_arity(f) {
+        return Some(n);
+    }
     Some(match f {
         // Leaves — they push, they do not consume.
         FnIndex::NUMBER
@@ -646,15 +652,23 @@ mod tests {
         // A wrong arity does not produce a wrong-looking render — it
         // desynchronizes the stack and silently reattributes every later
         // operand. So the table refuses.
-        assert_eq!(arity(FnIndex::IF), None);
+        // RE-PINNED. This used to name `IF`, which is now covered by
+        // [`crate::flow`] — control flow gained a stack arity, so asserting it
+        // is uncovered became wrong. The PROPERTY did not change, so it is
+        // re-pinned against functions that are still genuinely outside the
+        // table rather than weakened.
         assert_eq!(arity(FnIndex::PROC_DEF), None);
-        let body = FunctionBody::from_calls(S, &[Call::new(FnIndex::IF)]).unwrap();
+        assert_eq!(arity(FnIndex::WAIT), None);
+        let body = FunctionBody::from_calls(S, &[Call::new(FnIndex::PROC_DEF)]).unwrap();
         assert_eq!(
             render_text(&body),
             Err(ProjectionError::Uncovered {
-                function: FnIndex::IF.0
+                function: FnIndex::PROC_DEF.0
             })
         );
+        // …and `IF` really is covered now, so this test cannot quietly become
+        // a claim about a function that no longer exists in the gap.
+        assert_eq!(arity(FnIndex::IF), Some(1));
         // Two-sided: the covered core still renders, so the refusal is targeted
         // rather than a blanket failure.
         assert!(arity(FnIndex::ADD).is_some());

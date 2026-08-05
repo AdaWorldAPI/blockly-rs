@@ -82,13 +82,18 @@
 use ogar_blockly::{BodyError, Call, FnIndex, FunctionBody, LaneShape};
 
 pub mod codebook;
+pub mod flow;
 pub mod klickweg;
+pub mod node;
 pub mod pool;
+pub mod program;
 pub mod projection;
 
 pub use codebook::{OpcodeMapping, resolve_opcode};
 pub use klickweg::{BlockAddress, address_of};
+pub use node::{FunctionNode, NODE_BYTES};
 pub use pool::{Constant, ConstantPool, PoolError};
+pub use program::{Program, lower_program};
 pub use projection::{ProjectionError, parse_text, render_text};
 
 // ── The semantic record ─────────────────────────────────────────────────────
@@ -152,6 +157,19 @@ pub struct BlockRecord {
     /// remembered-underneath shadow is editor state and belongs with
     /// [`BlockView`], not here.
     pub inputs: Vec<(String, BlockRecord)>,
+    /// **Statement** inputs — a `controls_repeat`'s `DO`, a `controls_if`'s
+    /// `SUBSTACK`. Held separately from [`inputs`](Self::inputs) because
+    /// Blockly's own model separates them: a value input carries a reporter
+    /// whose result is consumed, a statement input carries a stack of
+    /// statements that is BRANCHED TO.
+    ///
+    /// The distinction is load-bearing rather than tidy. A statement input
+    /// lowered as an operand would be evaluated before its parent and pushed
+    /// onto the stack — so `repeat 10 [move]` would run the body once,
+    /// unconditionally, and then hand the loop a count it never computed.
+    /// Each statement input becomes its **own function**, referenced by index
+    /// (the W0 nesting-by-reference ruling), never spliced inline.
+    pub statements: Vec<(String, BlockRecord)>,
     /// The next statement in the chain, if any.
     pub next: Option<Box<BlockRecord>>,
     /// The block's mutator payload, verbatim, if it has one.
@@ -179,6 +197,7 @@ impl BlockRecord {
             id: id.into(),
             fields: Vec::new(),
             inputs: Vec::new(),
+            statements: Vec::new(),
             next: None,
             extra_state: None,
             disabled: false,
@@ -213,6 +232,16 @@ impl BlockRecord {
         self
     }
 
+    /// Builder: attach a STATEMENT input (a loop or branch body).
+    ///
+    /// Distinct from [`with_input`](Self::with_input): that attaches an
+    /// operand, this attaches a body that becomes its own function.
+    #[must_use]
+    pub fn with_statement(mut self, name: impl Into<String>, block: BlockRecord) -> Self {
+        self.statements.push((name.into(), block));
+        self
+    }
+
     /// Look up a field value by name.
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&FieldValue> {
@@ -238,6 +267,11 @@ impl BlockRecord {
             .iter()
             .map(|(_, b)| b.block_count())
             .sum::<usize>()
+            + self
+                .statements
+                .iter()
+                .map(|(_, b)| b.block_count())
+                .sum::<usize>()
             + self.next.as_ref().map_or(0, |n| n.block_count())
     }
 }
@@ -320,6 +354,32 @@ pub enum CastError {
         /// What the pool said.
         source: PoolError,
     },
+    /// The block carries statement inputs but its function branches to
+    /// nothing — the record and the codebook disagree about its shape.
+    /// Refused rather than dropped, since dropping discards a whole body.
+    UnexpectedStatements {
+        /// The block type.
+        ty: String,
+        /// How many statement inputs it carried.
+        found: usize,
+    },
+    /// The call needs more body-reference immediates than the shape holds.
+    /// `IF_ELSE` under `Pairs` would truncate the else arm into nothing, and
+    /// the program would run the then branch and silently skip the else.
+    ShapeTooNarrow {
+        /// The block type.
+        ty: String,
+        /// Body references the call needs.
+        needed: usize,
+        /// The shape that cannot hold them.
+        shape: LaneShape,
+    },
+    /// More than 255 functions — a body index is one byte. The remedy is the
+    /// same as everywhere else in this ABI: split, never widen.
+    TooManyFunctions {
+        /// How many the script reached.
+        count: usize,
+    },
     /// The block carries more immediates than one call can hold. The remedy is
     /// a wider [`LaneShape`], or a block shape the palette models with a
     /// dedicated slot — never a silently truncated call.
@@ -365,6 +425,21 @@ impl core::fmt::Display for CastError {
             CastError::ConstantPool { ty, value, source } => write!(
                 f,
                 "block `{ty}` literal `{value}` could not be interned: {source}"
+            ),
+            CastError::UnexpectedStatements { ty, found } => write!(
+                f,
+                "block `{ty}` carries {found} statement input(s) but its function \
+                 branches to nothing"
+            ),
+            CastError::ShapeTooNarrow { ty, needed, shape } => write!(
+                f,
+                "block `{ty}` needs {needed} body references, more than {shape:?} \
+                 can hold; a narrower shape would truncate a branch away"
+            ),
+            CastError::TooManyFunctions { count } => write!(
+                f,
+                "the script reached {count} functions; a body index is one byte, \
+                 so split rather than widen"
             ),
             CastError::TooManyValues { ty, offered } => write!(
                 f,
@@ -485,7 +560,10 @@ fn lower_block(
 }
 
 /// The single call one block lowers to — its function index plus its immediate.
-fn call_for(block: &BlockRecord, mut ctx: Option<&mut LoweringContext>) -> Result<Call, CastError> {
+pub(crate) fn call_for(
+    block: &BlockRecord,
+    mut ctx: Option<&mut LoweringContext>,
+) -> Result<Call, CastError> {
     // A mutator payload decides the block's SHAPE. Lowering without it would
     // emit a call that looks complete and is not.
     if block.extra_state.is_some() {
