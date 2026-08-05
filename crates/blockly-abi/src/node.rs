@@ -52,7 +52,7 @@
 //! [tests the composition against the layout constants](tests) rather than
 //! against its own idea of them.
 
-use ogar_blockly::{CLASSID_BYTES, FunctionBody, LaneShape, SLOT_STRIDE, VALUE_SLAB_LEN};
+use ogar_blockly::{FunctionBody, LaneShape, SLOT_STRIDE, VALUE_SLAB_LEN};
 
 /// Bytes in one stored node.
 pub const NODE_BYTES: usize = 512;
@@ -139,6 +139,7 @@ impl FunctionNode {
 mod tests {
     use super::*;
     use crate::{BlockRecord, FieldValue, lower_script, parse_text, raise_calls};
+    use ogar_blockly::CLASSID_BYTES;
 
     fn key() -> [u8; 16] {
         // An arbitrary opaque key — this crate does not mint, so the test must
