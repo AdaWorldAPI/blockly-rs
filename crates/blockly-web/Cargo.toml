@@ -1,0 +1,20 @@
+[package]
+name = "blockly-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "The showcase: real Blockly drags blocks in the browser; every change is cast through blockly-shim + blockly-abi into V3 SoA rows, and the page shows the calls, the 512-byte node, the text projection, the round-trip badge — and the refusals, loudly. Single binary, binds 0.0.0.0:$PORT for Railway."
+
+[dependencies]
+blockly-abi = { path = "../blockly-abi" }
+blockly-shim = { path = "../blockly-shim" }
+ogar-blockly = { workspace = true }
+
+askama = "0.12"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
