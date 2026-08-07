@@ -41,9 +41,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: blockly-rs
-      - name: cargo fmt --check
+      # SCOPED with -p, never `--all`. Now that the OGAR deps are PATH deps,
+      # `cargo fmt --all` follows the path OUT of this repo and formats
+      # OGAR's crates — it failed here on `ogar-render-askama`, a file this
+      # repo does not own. Same trap tesseract-rs documents ("NEVER
+      # cargo --all from this repo: it follows the path INTO the sibling
+      # workspace"). Each new member is added here explicitly.
+      - name: cargo fmt --check (scoped — never --all across path deps)
         working-directory: blockly-rs
-        run: cargo fmt --all --check
+        run: cargo fmt -p blockly-abi -p blockly-shim -p blockly-web --check
       - name: cargo clippy -D warnings
         working-directory: blockly-rs
         run: cargo clippy --workspace --all-targets -- -D warnings
