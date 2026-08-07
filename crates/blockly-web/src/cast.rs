@@ -26,13 +26,15 @@ use serde::Serialize;
 
 /// The demo key the entry node is stored under.
 ///
-/// The classid half is real (`BlockConcept::Content` canon-high over an app
-/// prefix); the prefix `0xFF00` is a PLACEHOLDER — the real `blockly-rs`
-/// prefix is the unminted operator decision M1, and the page labels it so.
+/// The classid half is real (`BlockConcept::Palette` = `0x1717`, canon-high
+/// over an app prefix — the concept naming WHICH vocabulary reads the call
+/// bytes, not the node's shape, which is `ogar-loco`'s `0x1701`). The prefix
+/// `0xFF00` is a PLACEHOLDER — the real `blockly-rs` prefix is the unminted
+/// operator decision M1, and the page labels it so.
 #[must_use]
 pub fn demo_key() -> [u8; 16] {
     let mut k = [0u8; 16];
-    k[0..4].copy_from_slice(&0x1701_FF00_u32.to_le_bytes());
+    k[0..4].copy_from_slice(&0x1717_FF00_u32.to_le_bytes());
     k[10..16].copy_from_slice(&[0, 0, 0, 0, 0, 1]);
     k
 }

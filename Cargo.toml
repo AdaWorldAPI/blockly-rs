@@ -10,23 +10,32 @@ repository = "https://github.com/AdaWorldAPI/blockly-rs"
 authors = ["AdaWorldAPI"]
 rust-version = "1.95"
 
+# ─────────────────────────────────────────────────────────────────────
+# OGAR deps are PATH deps to the sibling checkout. PINS ARE FORBIDDEN.
+#
+# A `git = "...", branch = "main"` dep looks unpinned and is not: cargo
+# writes the resolved rev into Cargo.lock, so the consumer silently
+# freezes at whatever OGAR commit it last resolved. That is the pin the
+# whole hot-plug design exists to avoid — "wenn's knallt, dann einmal —
+# nicht 200 Pins monitoren". It also HIDES upstream breakage instead of
+# surfacing it: this repo kept compiling against a stale `ogar-blockly`
+# after 0x17 moved to the substrate, because the lock pinned the old rev.
+#
+# Sibling layout (same as tesseract-rs): OGAR is checked out beside this
+# repo, so `../OGAR` resolves both locally and in CI (see ci.yml, which
+# checks this repo out into a `blockly-rs/` subdir for exactly that).
+# ─────────────────────────────────────────────────────────────────────
 [workspace.dependencies]
-# The block vocabulary + the V3 function-body ABI (OGAR #234/#235/#236).
-# Deliberately the ONLY substrate dependency: this half of the arc stays
-# permissive, and never links the GPL `rash` JIT (that boundary lives in
-# scratch-rs). See OGAR docs/BLOCK-EDITOR-PLAN.md § "Where the seam falls".
-ogar-blockly = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }
-# The vocabulary-agnostic call ABI the palette rides on (hoisted in OGAR
-# #239/#241). Post-flip, blockly-abi consumes these types directly; its own
-# local copies are DELETED and CI forbids their return (the executable
+
+# The block PALETTE vocabulary — `BlockConcept::Palette` (0x1717), the
+# consumer slot seated above the substrate's own 0x1701/0x1702 (OGAR
+# #255). Deliberately the only frontend dependency: this half of the arc
+# stays permissive and never links the GPL `rash` JIT (that boundary
+# lives in scratch-rs). See OGAR docs/BLOCK-EDITOR-PLAN.md.
+ogar-blockly = { path = "../OGAR/crates/ogar-blockly" }
+# The vocabulary-agnostic call ABI the palette rides on, and the owner of
+# the node shapes themselves (`LocoConcept::{FunctionBody, Inventory}`).
+# Post-flip, blockly-abi consumes these types directly; its own local
+# copies are DELETED and CI forbids their return (the executable
 # no-second-vocabulary trap, ruling R1/Q6).
-ogar-loco = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }
-# The hot-plug AUTHORITY (OGAR #174/#175, lance-graph #658): the domain action
-# tables + `capability_registry::resolve_hotplug`, which joins this consumer's
-# plugged classids against `class_ids::ALL` and returns the concepts + every
-# capability whose subject is one of them.
-ogar-vocab = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }
-# The hot-plug SOCKET (zero-dep): `HotPlug` / `Activation` / `ActivationDrift`
-# / `CapabilityAuthority`. The agnostic shape this consumer's ONE registration
-# const is written in, so the plug is authority-agnostic at the type level.
-lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
+ogar-loco = { path = "../OGAR/crates/ogar-loco" }

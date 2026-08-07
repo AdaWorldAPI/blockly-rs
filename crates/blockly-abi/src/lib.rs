@@ -82,16 +82,16 @@
 use ogar_blockly::{BodyError, Call, FnIndex, FunctionBody, LaneShape};
 
 pub mod codebook;
-pub mod hotplug;
 pub mod klickweg;
 pub mod program;
 pub mod projection;
+pub mod registry;
 
 pub use codebook::{OpcodeMapping, resolve_opcode};
-pub use hotplug::{COVERED_CAPABILITIES, HOT_PLUG};
 pub use klickweg::{BlockAddress, address_of};
 pub use program::lower_program;
 pub use projection::{ProjectionError, parse_text, render_text};
+pub use registry::registry;
 
 // ── The shared ABI, consumed rather than copied (the flip, ruling R1/Q6) ────
 // The generic machinery this crate carried during the float — the stored
