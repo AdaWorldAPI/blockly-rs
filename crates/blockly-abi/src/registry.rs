@@ -54,7 +54,7 @@ use ogar_loco::registry::{RegistryError, VocabularyRegistry};
 /// content concept — refused loudly rather than silently overwritten.
 pub fn registry() -> Result<VocabularyRegistry, RegistryError> {
     let mut registry = VocabularyRegistry::new();
-    ogar_blockly::plug_into(&mut registry)?;
+    crate::palette::plug_into(&mut registry)?;
     Ok(registry)
 }
 
@@ -69,7 +69,7 @@ mod tests {
 
         // The render classid a stored node actually carries — canon-high
         // concept over an app prefix — resolves to this palette's table.
-        let stored = ogar_blockly::BlockConcept::Palette.render_classid(0x1000);
+        let stored = crate::palette::render_classid(0x1000);
         let table = registry
             .resolve_classid(stored)
             .expect("a stored Blockly node resolves to the plugged palette");
@@ -96,7 +96,7 @@ mod tests {
         // registry must bang rather than let the second silently win.
         let mut registry = registry().unwrap();
         assert!(matches!(
-            ogar_blockly::plug_into(&mut registry),
+            crate::palette::plug_into(&mut registry),
             Err(RegistryError::ConceptTaken { .. })
         ));
     }

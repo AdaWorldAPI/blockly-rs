@@ -21,12 +21,12 @@
 use blockly_abi::{FunctionNode, Program};
 use blockly_abi::{lower_program, parse_text, raise_calls, render_text};
 use blockly_shim::from_workspace_json;
-use ogar_blockly::{FunctionBody, LaneShape};
+use ogar_loco::{FunctionBody, LaneShape};
 use serde::Serialize;
 
 /// The demo key the entry node is stored under.
 ///
-/// The classid half is real (`BlockConcept::Palette` = `0x1717`, canon-high
+/// The classid half is real (`palette::PALETTE_CONCEPT` = `0x1717`, canon-high
 /// over an app prefix — the concept naming WHICH vocabulary reads the call
 /// bytes, not the node's shape, which is `ogar-loco`'s `0x1701`). The prefix
 /// `0xFF00` is a PLACEHOLDER — the real `blockly-rs` prefix is the unminted

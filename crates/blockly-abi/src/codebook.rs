@@ -44,7 +44,7 @@
 //! `PROC_ARG` has no dedicated block: argument reads go through an ordinary
 //! `variables_get` bound to the argument's variable model.
 
-use ogar_blockly::FnIndex;
+use ogar_loco::FnIndex;
 
 /// What a block's dropdown code does during resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,7 +679,7 @@ mod tests {
         // no Blockly-core counterpart.
         for (ty, _, byte) in pinned {
             assert!(
-                *byte < ogar_blockly::DEVICE_FAMILY_FLOOR,
+                *byte < crate::palette::DEVICE_FAMILY_FLOOR,
                 "{ty} reached the reserved device family"
             );
         }
@@ -687,8 +687,8 @@ mod tests {
         // ABOVE every pin (or the loop above would be impossible) and BELOW
         // the top of the byte range (or "below the floor" would exclude
         // nothing and the loop would be free).
-        const { assert!(ogar_blockly::DEVICE_FAMILY_FLOOR < u8::MAX) };
+        const { assert!(crate::palette::DEVICE_FAMILY_FLOOR < u8::MAX) };
         let highest_pin = pinned.iter().map(|(_, _, b)| *b).max().unwrap();
-        assert!(highest_pin < ogar_blockly::DEVICE_FAMILY_FLOOR);
+        assert!(highest_pin < crate::palette::DEVICE_FAMILY_FLOOR);
     }
 }

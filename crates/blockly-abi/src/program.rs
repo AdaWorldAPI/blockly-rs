@@ -35,7 +35,7 @@
 //! an unminted operator decision. So a `Program` carries bodies and the caller
 //! supplies keys.
 
-use ogar_blockly::FunctionBody;
+use ogar_loco::FunctionBody;
 use ogar_loco::Program;
 use ogar_loco::vocabulary::shared_core;
 
@@ -58,10 +58,7 @@ use crate::{BlockRecord, CastError, call_for};
 /// As [`lower_script`](crate::lower_script), plus
 /// [`CastError::ShapeTooNarrow`] when a call's body references cannot fit the
 /// shape's immediate width, and [`CastError::TooManyFunctions`] past 255.
-pub fn lower_program(
-    shape: ogar_blockly::LaneShape,
-    top: &BlockRecord,
-) -> Result<Program, CastError> {
+pub fn lower_program(shape: ogar_loco::LaneShape, top: &BlockRecord) -> Result<Program, CastError> {
     // The entry is reserved before the walk so that bodies discovered inside it
     // get indices 1.., and the entry keeps 0 no matter what order they appear.
     let mut functions: Vec<Option<FunctionBody>> = vec![None];
@@ -77,7 +74,7 @@ pub fn lower_program(
 
 /// Walk a statement chain into one body, appending any referenced bodies.
 fn lower_chain_into(
-    shape: ogar_blockly::LaneShape,
+    shape: ogar_loco::LaneShape,
     block: &BlockRecord,
     functions: &mut Vec<Option<FunctionBody>>,
 ) -> Result<FunctionBody, CastError> {
@@ -94,7 +91,7 @@ fn lower_chain_into(
 /// with its statement inputs lowered into separate functions first, so their
 /// indices exist by the time the call that names them is built.
 fn lower_block_into(
-    shape: ogar_blockly::LaneShape,
+    shape: ogar_loco::LaneShape,
     block: &BlockRecord,
     body: &mut FunctionBody,
     functions: &mut Vec<Option<FunctionBody>>,
@@ -154,7 +151,7 @@ mod tests {
         FieldValue, FunctionNode, branches_of, checked_vocabulary, lower_script, raise_calls,
         render_text,
     };
-    use ogar_blockly::{Call, FnIndex, LaneShape};
+    use ogar_loco::{Call, FnIndex, LaneShape};
 
     const S: LaneShape = LaneShape::Pairs;
 

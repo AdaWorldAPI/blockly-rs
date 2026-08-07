@@ -137,7 +137,6 @@ dependencies = [
 name = "blockly-abi"
 version = "0.1.0"
 dependencies = [
- "ogar-blockly",
  "ogar-loco",
 ]
 
@@ -146,7 +145,7 @@ name = "blockly-shim"
 version = "0.1.0"
 dependencies = [
  "blockly-abi",
- "ogar-blockly",
+ "ogar-loco",
  "serde_json",
 ]
 
@@ -158,7 +157,7 @@ dependencies = [
  "axum",
  "blockly-abi",
  "blockly-shim",
- "ogar-blockly",
+ "ogar-loco",
  "serde",
  "serde_json",
  "tokio",
@@ -390,19 +389,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ogar-blockly"
-version = "0.1.0"
-dependencies = [
- "ogar-loco",
- "ogar-vocab",
-]
-
-[[package]]
 name = "ogar-loco"
-version = "0.1.0"
-
-[[package]]
-name = "ogar-vocab"
 version = "0.1.0"
 
 [[package]]

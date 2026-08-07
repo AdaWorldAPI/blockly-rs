@@ -10,7 +10,10 @@ description = "The membrane: Blockly's own save JSON in, BlockRecord out. serde 
 
 [dependencies]
 blockly-abi = { path = "../blockly-abi" }
-ogar-blockly = { workspace = true }
+# The substrate, direct: the call encoding, lane carvings and node layout.
+# Reached straight rather than through a re-export, so no crate has to be
+# imported for the sole purpose of forwarding another crate's types.
+ogar-loco = { workspace = true }
 # The ONLY serde in this workspace, and the reason this crate exists as a
 # separate one. Charter T3: "serde/JSON/proto exist ONLY at a membrane, behind
 # a feature, never on the hot path." A membrane is a crate boundary here, so

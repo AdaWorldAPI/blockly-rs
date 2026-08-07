@@ -38,7 +38,7 @@
 //! platitude: parsing is many-to-one, so the round-trip that matters is
 //! `body → text → body`, never `text → body → text`.
 
-use ogar_blockly::{Call, FnIndex, FunctionBody, LaneShape};
+use ogar_loco::{Call, FnIndex, FunctionBody, LaneShape};
 
 use crate::raise_calls;
 

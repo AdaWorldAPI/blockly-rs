@@ -22,7 +22,7 @@
 //!
 //! The call index is the one number that is already the program: it is where
 //! [`lower_script`](crate::lower_script) put that block's
-//! [`Call`](ogar_blockly::Call) in the body, so
+//! [`Call`](ogar_loco::Call) in the body, so
 //! `raise_calls(body)[ordinal]` IS the clicked block's function, by
 //! construction rather than by convention. That makes the address checkable
 //! against the ABI instead of merely consistent with itself — and it is
@@ -43,7 +43,8 @@
 //! this crate depends on `a2ui-server`: the block editor produces addresses,
 //! the desktop consumes them, and neither imports the other.
 
-use ogar_blockly::{BlockConcept, LaneShape};
+use crate::palette;
+use ogar_loco::LaneShape;
 
 use crate::{BlockRecord, codebook};
 
@@ -91,7 +92,7 @@ pub fn addresses(top: &BlockRecord, app_prefix: u16) -> Vec<(String, BlockAddres
     // The PALETTE concept (0x1717) — which vocabulary reads the call bytes.
     // Not the node's shape: that is ogar-loco's `LocoConcept::FunctionBody`
     // (0x1701), and a block editor does not own it (OGAR #255).
-    let class_id = BlockConcept::Palette.render_classid(app_prefix);
+    let class_id = palette::render_classid(app_prefix);
     let mut out = Vec::new();
     walk_chain(top, class_id, &mut out);
     out
@@ -193,8 +194,8 @@ mod tests {
         for (id, addr) in addresses(&script, APP) {
             let call = &calls[addr.ordinal as usize];
             let expected = match id.as_str() {
-                "a" | "b" => ogar_blockly::FnIndex::NUMBER,
-                "root" => ogar_blockly::FnIndex::ADD,
+                "a" | "b" => ogar_loco::FnIndex::NUMBER,
+                "root" => ogar_loco::FnIndex::ADD,
                 other => panic!("unexpected block {other}"),
             };
             assert_eq!(
