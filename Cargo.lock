@@ -392,7 +392,6 @@ dependencies = [
 [[package]]
 name = "ogar-blockly"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/OGAR?branch=main#0d39025e69860300b463d8a1283f81aaa09744ea"
 dependencies = [
  "ogar-loco",
  "ogar-vocab",
@@ -401,12 +400,10 @@ dependencies = [
 [[package]]
 name = "ogar-loco"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/OGAR?branch=main#0d39025e69860300b463d8a1283f81aaa09744ea"
 
 [[package]]
 name = "ogar-vocab"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/OGAR?branch=main#0d39025e69860300b463d8a1283f81aaa09744ea"
 
 [[package]]
 name = "once_cell"

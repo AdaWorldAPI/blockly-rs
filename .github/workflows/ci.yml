@@ -19,18 +19,42 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # Sibling layout — PINS ARE FORBIDDEN, so the OGAR deps are PATH deps
+      # (`../OGAR/crates/...`). A `git = ..., branch = "main"` dep writes the
+      # resolved rev into Cargo.lock, which is a pin wearing a branch's
+      # clothes: it silently freezes this repo at an old OGAR commit and HIDES
+      # upstream breakage instead of surfacing it. Checking this repo out into
+      # a subdir makes `path: OGAR` land as a true sibling, so `../OGAR`
+      # resolves and every build sees OGAR main as it actually is.
       - uses: actions/checkout@v4
+        with:
+          path: blockly-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: AdaWorldAPI/OGAR
+          path: OGAR
       - name: Install Rust toolchain (per rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
+        with:
+          workspaces: blockly-rs
+      # SCOPED with -p, never `--all`. Now that the OGAR deps are PATH deps,
+      # `cargo fmt --all` follows the path OUT of this repo and formats
+      # OGAR's crates — it failed here on `ogar-render-askama`, a file this
+      # repo does not own. Same trap tesseract-rs documents ("NEVER
+      # cargo --all from this repo: it follows the path INTO the sibling
+      # workspace"). Each new member is added here explicitly.
+      - name: cargo fmt --check (scoped — never --all across path deps)
+        working-directory: blockly-rs
+        run: cargo fmt -p blockly-abi -p blockly-shim -p blockly-web --check
       - name: cargo clippy -D warnings
+        working-directory: blockly-rs
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
+        working-directory: blockly-rs
         run: cargo test --workspace
       # Broken intra-doc links are NOT caught by clippy, and this crate's
       # docs carry the reasoning (why the ValueParam ordinal is anchored
@@ -38,6 +62,7 @@ jobs:
       # orphans a link degrades the part of the crate that explains it, so
       # the gate is explicit rather than implied by the test run.
       - name: rustdoc broken intra-doc links
+        working-directory: blockly-rs
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
         run: cargo doc -p blockly-abi -p blockly-shim --no-deps
@@ -47,6 +72,7 @@ jobs:
       # a local `struct FunctionNode`/`fn stack_arity` is a second
       # vocabulary starting, and this step fails loudly the day one returns.
       - name: consumer-local generic ABI symbols must not exist (post-flip trap)
+        working-directory: blockly-rs
         run: |
           set -e
           if grep -rnE "(pub )?(struct (FunctionNode|ConstantPool|Program)\b|fn (stack_arity|body_refs)\b)" crates/*/src; then

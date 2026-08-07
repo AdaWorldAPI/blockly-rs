@@ -88,7 +88,10 @@ pub fn predicate_for(block: &BlockRecord) -> String {
 /// operator, then `next` — because that is what the cast emits.
 #[must_use]
 pub fn addresses(top: &BlockRecord, app_prefix: u16) -> Vec<(String, BlockAddress)> {
-    let class_id = BlockConcept::Content.render_classid(app_prefix);
+    // The PALETTE concept (0x1717) — which vocabulary reads the call bytes.
+    // Not the node's shape: that is ogar-loco's `LocoConcept::FunctionBody`
+    // (0x1701), and a block editor does not own it (OGAR #255).
+    let class_id = BlockConcept::Palette.render_classid(app_prefix);
     let mut out = Vec::new();
     walk_chain(top, class_id, &mut out);
     out
@@ -257,8 +260,18 @@ mod tests {
     #[test]
     fn the_classid_is_canon_high_under_the_app_prefix() {
         let addr = address_of(&five_plus_three(), "root", APP).unwrap();
-        assert_eq!(addr.class_id, 0x1701_FF00);
-        assert_eq!(addr.class_id >> 16, 0x1701, "concept must be the HIGH half");
+        // 0x1717 = the PALETTE concept (which vocabulary reads the call
+        // bytes), NOT 0x1701 = ogar-loco's function-body SHAPE. This test
+        // pinned 0x1701 before OGAR #255 put 0x17 back with the substrate;
+        // a block editor addressing by the shape concept was the ownership
+        // inversion that ruling corrected.
+        assert_eq!(addr.class_id, 0x1717_FF00);
+        assert_eq!(addr.class_id >> 16, 0x1717, "concept must be the HIGH half");
+        assert_ne!(
+            addr.class_id >> 16,
+            u32::from(ogar_loco::LocoConcept::FunctionBody.concept_id()),
+            "a palette address must never claim the substrate's shape concept"
+        );
         assert_eq!(addr.class_id & 0xFFFF, u32::from(APP));
         // …and it is NOT the reserved V3-adoption marker.
         assert_ne!(addr.class_id & 0xFFFF, 0x1000);
