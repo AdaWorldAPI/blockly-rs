@@ -21,3 +21,12 @@ ogar-blockly = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }
 # local copies are DELETED and CI forbids their return (the executable
 # no-second-vocabulary trap, ruling R1/Q6).
 ogar-loco = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }
+# The hot-plug AUTHORITY (OGAR #174/#175, lance-graph #658): the domain action
+# tables + `capability_registry::resolve_hotplug`, which joins this consumer's
+# plugged classids against `class_ids::ALL` and returns the concepts + every
+# capability whose subject is one of them.
+ogar-vocab = { git = "https://github.com/AdaWorldAPI/OGAR", branch = "main" }
+# The hot-plug SOCKET (zero-dep): `HotPlug` / `Activation` / `ActivationDrift`
+# / `CapabilityAuthority`. The agnostic shape this consumer's ONE registration
+# const is written in, so the plug is authority-agnostic at the type level.
+lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
