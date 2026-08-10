@@ -23,11 +23,31 @@
 # A deploy that needs a fixed substrate rebuilds from a fixed checkout; it
 # does not get there by adding a rev here.
 #
+# ── Cache-busting the clone (learned the hard way) ─────────────────────
+#
+# "OGAR's HEAD at build time" only holds if the clone actually reruns. A
+# `RUN git clone <fixed url>` line is verbatim-identical on every build, so
+# Docker's (and Railway's) layer cache treats it as immutable and reuses
+# whatever checkout it first produced — silently, forever, with no signal
+# that it happened. A build that ran before an OGAR crate was renamed or
+# removed then keeps failing (or worse, keeps *succeeding* against a stale
+# substrate) on every deploy after the fix has already landed upstream, and
+# nothing in the Dockerfile text changed to explain why.
+#
+# The `ADD <url>` below is the standard bust: BuildKit re-fetches it on every
+# build and conditionally invalidates the layer (and everything after it) the
+# moment OGAR's `main` tip actually moves — a real signal instead of an
+# accidental one. It costs one tiny JSON response, not a second clone.
+#
 # Railway: binds 0.0.0.0:$PORT — PORT is injected by the platform, and 8080
 # below is only the local-run fallback, never a pin.
 
 FROM rust:1.95-bookworm AS builder
 WORKDIR /build
+
+# Cache-buster: re-fetched every build, invalidates the clone layer below
+# exactly when OGAR's main tip has actually moved. See the note above.
+ADD https://api.github.com/repos/AdaWorldAPI/OGAR/commits/main /tmp/ogar-head.json
 
 # The sibling first, so an OGAR-only change does not invalidate the layer
 # holding this repo's sources.
