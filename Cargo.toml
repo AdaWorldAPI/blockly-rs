@@ -32,7 +32,6 @@ rust-version = "1.95"
 # #255). Deliberately the only frontend dependency: this half of the arc
 # stays permissive and never links the GPL `rash` JIT (that boundary
 # lives in scratch-rs). See OGAR docs/BLOCK-EDITOR-PLAN.md.
-ogar-blockly = { path = "../OGAR/crates/ogar-blockly" }
 # The vocabulary-agnostic call ABI the palette rides on, and the owner of
 # the node shapes themselves (`LocoConcept::{FunctionBody, Inventory}`).
 # Post-flip, blockly-abi consumes these types directly; its own local

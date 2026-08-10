@@ -4,7 +4,7 @@
 //! # What this is
 //!
 //! Not a parser, not a serializer, not a renderer. One thing: a Blockly block
-//! record goes in, [`ogar_blockly::FunctionBody`] comes out, and back again.
+//! record goes in, [`ogar_loco::FunctionBody`] comes out, and back again.
 //! `to_le_bytes` / `from_le_bytes` on the far side ARE the wire format — there
 //! is no JSON, no intermediate DTO, no serde anywhere in this crate.
 //!
@@ -79,16 +79,20 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
-use ogar_blockly::{BodyError, Call, FnIndex, FunctionBody, LaneShape};
+use ogar_loco::{BodyError, Call, FnIndex, FunctionBody, LaneShape};
 
 pub mod codebook;
 pub mod klickweg;
+pub mod palette;
 pub mod program;
 pub mod projection;
 pub mod registry;
 
 pub use codebook::{OpcodeMapping, resolve_opcode};
 pub use klickweg::{BlockAddress, address_of};
+pub use palette::{
+    BlocklyPalette, DEVICE_FAMILY_FLOOR, PALETTE_CONCEPT, plug_into, render_classid,
+};
 pub use program::lower_program;
 pub use projection::{ProjectionError, parse_text, render_text};
 pub use registry::registry;
@@ -110,15 +114,15 @@ pub use ogar_loco::{
 /// [`Program::references_are_resolvable`] and [`branches_of`] require.
 ///
 /// Validation is a 256-byte sweep done once (lazily) per process;
-/// `BlocklyVocabulary`'s conformance is additionally pinned by its own
-/// crate's tests, so the `expect` here is a compile-time-adjacent fact,
+/// [`BlocklyPalette`]'s conformance is additionally pinned by
+/// [`palette`]'s own tests, so the `expect` here is a near-static fact,
 /// not a runtime hope.
 #[must_use]
-pub fn checked_vocabulary() -> &'static CheckedVocabulary<ogar_blockly::BlocklyVocabulary> {
-    static CHECKED: std::sync::LazyLock<CheckedVocabulary<ogar_blockly::BlocklyVocabulary>> =
+pub fn checked_vocabulary() -> &'static CheckedVocabulary<crate::palette::BlocklyPalette> {
+    static CHECKED: std::sync::LazyLock<CheckedVocabulary<crate::palette::BlocklyPalette>> =
         std::sync::LazyLock::new(|| {
-            ogar_loco::vocabulary::conformance::validate(ogar_blockly::BlocklyVocabulary)
-                .expect("BlocklyVocabulary conforms; pinned by ogar-blockly's own tests")
+            ogar_loco::vocabulary::conformance::validate(crate::palette::BlocklyPalette)
+                .expect("BlocklyPalette conforms; pinned by palette::tests")
         });
     &CHECKED
 }
@@ -608,12 +612,12 @@ pub(crate) fn call_for(
     // The immediates, in the block's own field order. A Selector dropdown
     // chose WHICH function and is already spent; a ValueParam dropdown is an
     // ARGUMENT and becomes a byte, or the cast refuses.
-    let mut values = [0u8; ogar_blockly::MAX_VALUES_PER_CALL];
+    let mut values = [0u8; ogar_loco::MAX_VALUES_PER_CALL];
     let mut n = 0usize;
     let mut push = |b: u8| -> Result<(), CastError> {
         // Silently dropping the overflow would emit a call that looks complete
         // and is not — the same failure the mutator guard above exists to stop.
-        if n >= ogar_blockly::MAX_VALUES_PER_CALL {
+        if n >= ogar_loco::MAX_VALUES_PER_CALL {
             return Err(CastError::TooManyValues {
                 ty: block.ty.clone(),
                 offered: block.fields.len(),
@@ -1169,7 +1173,7 @@ mod tests {
         assert_eq!(pi.len(), 1);
         // Same function — a ValueParam must NOT fan the palette out…
         assert_eq!(pi[0].function, e[0].function);
-        assert_eq!(pi[0].function, ogar_blockly::FnIndex::CONSTANT);
+        assert_eq!(pi[0].function, ogar_loco::FnIndex::CONSTANT);
         // …and the two programs stay distinguishable anyway, which is the
         // whole point. Drop the code and these become equal.
         assert_ne!(pi[0].values[0], e[0].values[0]);
@@ -1190,7 +1194,7 @@ mod tests {
         let lt =
             BlockRecord::leaf("logic_compare", "c").with_field("OP", FieldValue::Code("LT".into()));
         let calls = raise_calls(&lower_script(LaneShape::Pairs, &lt).unwrap());
-        assert_eq!(calls[0].function, ogar_blockly::FnIndex::LT);
+        assert_eq!(calls[0].function, ogar_loco::FnIndex::LT);
         assert_eq!(calls[0].values[0], 0);
     }
 

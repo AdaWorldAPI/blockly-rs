@@ -301,8 +301,8 @@ fn byte_or_wide(s: String) -> FieldValue {
 mod tests {
     use super::*;
     use blockly_abi::{lower_program, lower_script, raise_calls, render_text};
-    use ogar_blockly::FnIndex;
-    use ogar_blockly::LaneShape;
+    use ogar_loco::FnIndex;
+    use ogar_loco::LaneShape;
 
     /// `5 + 3`, exactly as `Blockly.serialization.workspaces.save` writes it.
     const ADD_JSON: &str = r#"{
