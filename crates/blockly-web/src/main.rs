@@ -14,6 +14,7 @@ mod cast;
 
 use askama::Template;
 use axum::extract::Query;
+use axum::http::StatusCode;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,6 +29,12 @@ struct ToolboxQuery {
     /// `blockly` (default) or `scratch`. Anything else falls back to
     /// `blockly`, the same forgiving-field rule the shape selector uses.
     dialect: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TemplateQuery {
+    /// Which built-in reference program to load.
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -105,16 +112,20 @@ async fn api_scratch_defs() -> Json<serde_json::Value> {
     use blockly_abi::scratch::Shape;
     let defs: Vec<_> = blockly_abi::scratch::SCRATCH_BLOCK_DEFS
         .iter()
-        .map(|&(ty, family, shape, inputs, stmts)| {
+        .map(|&(ty, family, shape, values, stmts)| {
+            // Sockets carry SCRATCH's own names (CONDITION / SUBSTACK / STEPS),
+            // harvested with the opcodes. That is what lets a stored template
+            // and these generated definitions agree without a translation
+            // table between them.
             let mut message = ty.to_string();
             let mut args = Vec::new();
-            for i in 0..inputs {
+            for (i, name) in values.iter().enumerate() {
                 message.push_str(&format!(" %{}", i + 1));
-                args.push(serde_json::json!({"type": "input_value", "name": format!("V{i}")}));
+                args.push(serde_json::json!({"type": "input_value", "name": name}));
             }
-            for s in 0..stmts {
-                message.push_str(&format!(" %{}", inputs + s + 1));
-                args.push(serde_json::json!({"type": "input_statement", "name": format!("S{s}")}));
+            for (i, name) in stmts.iter().enumerate() {
+                message.push_str(&format!(" %{}", values.len() + i + 1));
+                args.push(serde_json::json!({"type": "input_statement", "name": name}));
             }
             let mut d = serde_json::json!({
                 "type": ty,
@@ -149,6 +160,21 @@ async fn api_scratch_defs() -> Json<serde_json::Value> {
         })
         .collect();
     Json(serde_json::Value::Array(defs))
+}
+
+/// A built-in reference program, as a Blockly workspace save.
+///
+/// Served rather than embedded in the page for the same reason the toolbox is:
+/// the template is compiled into `blockly-shim`, where its own tests PARSE and
+/// CAST it on every build. A copy pasted into the HTML would be a second one
+/// nothing checks.
+async fn api_template(Query(q): Query<TemplateQuery>) -> Result<String, StatusCode> {
+    let want = q.name.as_deref().unwrap_or("pong");
+    blockly_shim::templates::ALL
+        .iter()
+        .find(|(n, _)| *n == want)
+        .map(|(_, json)| (*json).to_string())
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 fn blocks(types: &[&str]) -> Vec<serde_json::Value> {
@@ -206,6 +232,7 @@ async fn main() {
         .route("/", get(index))
         .route("/api/toolbox", get(api_toolbox))
         .route("/api/scratch-defs", get(api_scratch_defs))
+        .route("/api/template", get(api_template))
         .route("/api/cast", post(api_cast));
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)

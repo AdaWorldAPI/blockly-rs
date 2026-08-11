@@ -35,6 +35,7 @@
       <option value="scratch">Scratch — 138 tiles, 94 device mints</option>
     </select>
   </label>
+  <button id="loadPong" type="button" title="A built-in reference program, compiled into blockly-shim and cast in its tests">load Pong</button>
   <label>lane shape
     <select id="shape">
       <option value="pairs" selected>Pairs — 6×(fn:val), 180 calls</option>
@@ -172,6 +173,16 @@ document.getElementById("shape").addEventListener("change", recast);
 // different definitions, so a canvas built from one cannot survive the other.
 // The reload is honest about that rather than half-swapping the toolbox.
 document.getElementById("dialect").addEventListener("change", boot);
+// The reference game. Loading it switches to the Scratch palette first —
+// Pong is Scratch blocks, so the definitions must exist before the workspace
+// can be deserialized into them.
+document.getElementById("loadPong").addEventListener("click", async () => {
+  const sel = document.getElementById("dialect");
+  if (sel.value !== "scratch") { sel.value = "scratch"; await boot(); }
+  const ws = await (await fetch("/api/template?name=pong")).json();
+  Blockly.serialization.workspaces.load(ws, workspace);
+  recast();
+});
 boot();
 </script>
 </body>

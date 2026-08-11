@@ -116,7 +116,20 @@ pub fn statement_inputs(ty: &str) -> Option<&'static [&'static str]> {
         // un-mutated shape is listed.
         "controls_if" => &["DO0"],
         "controls_ifelse" => &["DO0", "ELSE"],
-        _ => return None,
+        // Scratch's branching blocks. NOT a second hand-maintained list: the
+        // names are READ from `blockly_abi::scratch::SCRATCH_BLOCK_DEFS`,
+        // which harvested them from the same Apache-2.0 source as the opcodes
+        // (`SUBSTACK`, `SUBSTACK2` — Scratch's own socket names, in Scratch's
+        // own order). A block whose shape changes upstream therefore cannot
+        // leave this function stale, and the order stays load-bearing for the
+        // same reason `controls_ifelse` above says so.
+        _ => {
+            return blockly_abi::scratch::SCRATCH_BLOCK_DEFS
+                .iter()
+                .find(|&&(t, ..)| t == ty)
+                .map(|&(_, _, _, _, stmts)| stmts)
+                .filter(|stmts| !stmts.is_empty());
+        }
     })
 }
 
@@ -473,5 +486,132 @@ mod tests {
         ));
         // Two-sided: a well-formed save still reads, so the guards are targeted.
         assert!(from_workspace_json(ADD_JSON).is_ok());
+    }
+}
+
+/// Built-in reference programs — real workspace saves, compiled in.
+///
+/// A template here is not documentation: it is a Blockly workspace save that
+/// this crate PARSES and `blockly-abi` CASTS in its own tests, so a reference
+/// program cannot rot into something the pipeline no longer accepts. If a
+/// template ever stops casting, the build says so.
+///
+/// They are also the answer to "what does a real program look like on this
+/// substrate?" — a question the demo could previously only answer with
+/// `5 + 3`, which exercises two opcodes and no device family at all.
+pub mod templates {
+    /// **Pong** — the reference arcade game.
+    ///
+    /// Three concurrent scripts, which is what makes it a good reference
+    /// rather than a long one:
+    ///
+    /// | script | shape | what it exercises |
+    /// |---|---|---|
+    /// | ball | hat → `forever` { move · bounce · `if` touching → turn } | device motion + sensing under nested control flow |
+    /// | paddle | hat → `forever` { set y to mouse y } | a device reporter feeding a device setter |
+    /// | score | hat → `forever` { `if` touching goal → change score } | the shared core's `VAR_CHANGE` beside device sensing |
+    ///
+    /// It spans both halves of the palette deliberately: `motion_movesteps`,
+    /// `sensing_mousey` and friends are device mints (`0x90..`), while
+    /// `control_forever`, `control_if` and `data_changevariableby` resolve to
+    /// the shared core — so one small program proves a Scratch game is not a
+    /// separate machine, just a second vocabulary over the same substrate.
+    ///
+    /// The touch targets are plain numbers where real Scratch would use a
+    /// dropdown menu shadow. That is honest rather than lossy: menus are
+    /// values, not operations (they mint no opcode), so a number stands in for
+    /// the sprite id a menu would resolve to.
+    pub const PONG: &str = include_str!("../templates/pong.json");
+
+    /// Every built-in template, as `(name, workspace save)`.
+    pub const ALL: &[(&str, &str)] = &[("pong", PONG)];
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::templates;
+    use blockly_abi::lower_program;
+    use ogar_loco::LaneShape;
+
+    /// Every built-in template parses AND casts — it is a program, not a doc.
+    ///
+    /// This is what stops a reference program rotting. A template that stops
+    /// casting is a template that lies about what the pipeline accepts, and it
+    /// would otherwise fail only when a person clicked "load" in a browser.
+    #[test]
+    fn every_template_parses_and_casts_cleanly() {
+        for (name, json) in templates::ALL {
+            let scripts = super::from_workspace_json(json)
+                .unwrap_or_else(|e| panic!("template `{name}` does not parse: {e}"));
+            assert!(!scripts.is_empty(), "template `{name}` is empty");
+            for script in &scripts {
+                lower_program(LaneShape::Pairs, script).unwrap_or_else(|e| {
+                    panic!(
+                        "template `{name}` script `{}` refuses to cast: {e:?}",
+                        script.ty
+                    )
+                });
+            }
+        }
+    }
+
+    /// Pong spans BOTH halves of the palette — that is the point of it.
+    ///
+    /// A reference game that only touched device mints would prove nothing
+    /// about sharing, and one that only touched the shared core would not be a
+    /// game. Asserting both means the template cannot be quietly simplified
+    /// into something that no longer demonstrates the claim.
+    #[test]
+    fn pong_exercises_device_mints_and_the_shared_core_together() {
+        let scripts = super::from_workspace_json(templates::PONG).unwrap();
+        assert_eq!(scripts.len(), 3, "Pong is three concurrent scripts");
+
+        let mut device = 0usize;
+        let mut core = 0usize;
+        let mut branching = 0usize;
+        for script in &scripts {
+            let prog = lower_program(LaneShape::Pairs, script).unwrap();
+            for body in &prog.functions {
+                for call in blockly_abi::raise_calls(body) {
+                    if call.function.is_domain_specific() {
+                        device += 1;
+                    } else if call.function.is_shared_core() {
+                        core += 1;
+                    }
+                }
+            }
+            // Nested control flow really is nested: a `forever` whose body is
+            // a separate function is what makes this more than a flat list.
+            branching += prog.functions.len() - 1;
+        }
+        assert!(device >= 6, "expected device mints, got {device}");
+        assert!(core >= 4, "expected shared-core calls, got {core}");
+        assert!(branching >= 4, "expected nested bodies, got {branching}");
+    }
+
+    /// The shim learned Scratch's branching blocks from the harvested table.
+    ///
+    /// Two-sided: a Scratch C-block reports its real socket names, and a
+    /// Scratch block that does NOT branch reports none — otherwise
+    /// `branches()` would be true for everything and carry no information.
+    #[test]
+    fn scratch_branching_blocks_report_their_real_socket_names() {
+        assert_eq!(
+            super::statement_inputs("control_forever"),
+            Some(&["SUBSTACK"][..])
+        );
+        assert_eq!(
+            super::statement_inputs("control_if_else"),
+            Some(&["SUBSTACK", "SUBSTACK2"][..])
+        );
+        // Silence twin.
+        assert_eq!(super::statement_inputs("motion_movesteps"), None);
+        assert!(!super::branches("motion_movesteps"));
+        assert!(super::branches("control_forever"));
+        // …and the Blockly half is untouched by the new arm.
+        assert_eq!(
+            super::statement_inputs("controls_ifelse"),
+            Some(&["DO0", "ELSE"][..])
+        );
     }
 }
