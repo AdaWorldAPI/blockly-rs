@@ -524,7 +524,72 @@ pub mod templates {
     pub const PONG: &str = include_str!("../templates/pong.json");
 
     /// Every built-in template, as `(name, workspace save)`.
+    ///
+    /// The JSON is the AUTHORING form, kept so a template stays readable and
+    /// diffable in review. The artefact the demo serves is
+    /// [`PONG_NODES`] — see [`raise_nodes`].
     pub const ALL: &[(&str, &str)] = &[("pong", PONG)];
+
+    /// Pong as its STORED NODES — the program, not the projection.
+    ///
+    /// Layout: one byte of script count, then one byte per script giving its
+    /// function count, then the 512-byte nodes back to back. 4100 bytes for
+    /// Pong's 8 functions across 3 scripts.
+    ///
+    /// Regenerate with
+    /// `cargo run -p blockly-shim --example bake_template`; the round-trip
+    /// test is what proves the bake and the JSON still agree.
+    pub const PONG_NODES: &[u8] = include_bytes!("../templates/pong.nodes");
+
+    /// Every built-in template in stored-node form.
+    pub const ALL_NODES: &[(&str, &[u8])] = &[("pong", PONG_NODES)];
+
+    /// Raise stored nodes back into top-level scripts.
+    ///
+    /// This is what lets the template ship as bytes: the editor asks for
+    /// blocks, and they are RECONSTRUCTED from the program rather than read
+    /// from a parallel JSON copy that could drift from it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`blockly_abi::raise::RaiseError`]; a malformed header
+    /// yields an empty result rather than a panic.
+    pub fn raise_nodes(
+        bytes: &[u8],
+    ) -> Result<Vec<blockly_abi::BlockRecord>, blockly_abi::raise::RaiseError> {
+        use ogar_loco::node::NODE_BYTES;
+        let Some((&count, rest)) = bytes.split_first() else {
+            return Ok(Vec::new());
+        };
+        let n = usize::from(count);
+        if rest.len() < n {
+            return Ok(Vec::new());
+        }
+        let (counts, mut nodes) = rest.split_at(n);
+        let mut out = Vec::new();
+        for &fc in counts {
+            let take = usize::from(fc) * NODE_BYTES;
+            if nodes.len() < take {
+                break;
+            }
+            let (mine, tail) = nodes.split_at(take);
+            nodes = tail;
+            let bodies: Vec<ogar_loco::FunctionBody> = mine
+                .chunks_exact(NODE_BYTES)
+                .map(|c| {
+                    blockly_abi::FunctionNode::from_le_bytes(
+                        c.try_into().expect("chunks_exact yields NODE_BYTES"),
+                        ogar_loco::LaneShape::Pairs,
+                    )
+                    .body
+                })
+                .collect();
+            if let Some(script) = blockly_abi::raise::raise_program(&bodies)? {
+                out.push(script);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -613,5 +678,178 @@ mod template_tests {
             super::statement_inputs("controls_ifelse"),
             Some(&["DO0", "ELSE"][..])
         );
+    }
+}
+
+#[cfg(test)]
+mod raise_round_trip {
+    use super::templates;
+    use blockly_abi::{lower_program, raise::raise_program};
+    use ogar_loco::LaneShape;
+
+    /// Pong survives a full trip through the STORED BYTES and back.
+    ///
+    /// JSON → cast → bytes → raise → cast → bytes, compared byte-for-byte.
+    /// This is what makes a bytes-only template safe to ship: it proves the
+    /// editor's JSON is a *rendering* of the stored program, recoverable from
+    /// the nodes, rather than a second source of truth that merely happens to
+    /// agree.
+    ///
+    /// Pong is the right fixture because it is the hardest one available —
+    /// three scripts, nested `forever`/`if` bodies, device mints and shared
+    /// core mixed, operands under statement bodies.
+    #[test]
+    fn pong_survives_a_round_trip_through_its_stored_bytes() {
+        let scripts = super::from_workspace_json(templates::PONG).unwrap();
+        assert_eq!(scripts.len(), 3);
+
+        for (i, script) in scripts.iter().enumerate() {
+            let original = lower_program(LaneShape::Pairs, script).expect("casts");
+            let raised = raise_program(&original.functions)
+                .expect("raises")
+                .expect("non-empty");
+            let again = lower_program(LaneShape::Pairs, &raised).expect("re-casts");
+
+            assert_eq!(
+                original.functions.len(),
+                again.functions.len(),
+                "script {i}: function count changed"
+            );
+            for (f, (a, b)) in original
+                .functions
+                .iter()
+                .zip(again.functions.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    a.as_body_bytes(),
+                    b.as_body_bytes(),
+                    "script {i} function {f} differs after the round trip"
+                );
+            }
+        }
+    }
+}
+
+/// The membrane's WRITE direction: records back out as Blockly's save JSON.
+///
+/// The read direction alone made JSON the only durable form a program could
+/// take. With this, plus `blockly_abi::raise`, the stored NODES are the
+/// artefact and the editor's JSON is produced on demand — a rendering, exactly
+/// like the askama surface, and for the same reason.
+pub mod emit {
+    use super::Value;
+    use blockly_abi::{BlockRecord, FieldValue};
+
+    fn block_json(b: &BlockRecord) -> Value {
+        let mut o = serde_json::Map::new();
+        o.insert("type".into(), Value::String(b.ty.clone()));
+        o.insert("id".into(), Value::String(b.id.clone()));
+        if !b.fields.is_empty() {
+            let mut f = serde_json::Map::new();
+            for (k, v) in &b.fields {
+                f.insert(
+                    k.clone(),
+                    match v {
+                        FieldValue::Byte(n) => Value::from(*n),
+                        FieldValue::Code(c) => Value::String(c.clone()),
+                        FieldValue::Wide(w) => Value::String(w.clone()),
+                        FieldValue::Ref { id } => {
+                            serde_json::json!({ "id": id })
+                        }
+                    },
+                );
+            }
+            o.insert("fields".into(), Value::Object(f));
+        }
+        // Value inputs and statement inputs share one `inputs` map on the
+        // wire — Blockly's own save does not distinguish them either (that is
+        // the finding this crate exists for). The distinction is recovered on
+        // read via `statement_inputs`, so writing them together is faithful.
+        let mut ins = serde_json::Map::new();
+        for (name, child) in b.inputs.iter().chain(b.statements.iter()) {
+            ins.insert(
+                name.clone(),
+                serde_json::json!({ "block": block_json(child) }),
+            );
+        }
+        if !ins.is_empty() {
+            o.insert("inputs".into(), Value::Object(ins));
+        }
+        if let Some(n) = &b.next {
+            o.insert("next".into(), serde_json::json!({ "block": block_json(n) }));
+        }
+        Value::Object(o)
+    }
+
+    /// Render top-level scripts as a Blockly workspace save.
+    #[must_use]
+    pub fn to_workspace_json(scripts: &[BlockRecord]) -> String {
+        let blocks: Vec<Value> = scripts.iter().map(block_json).collect();
+        serde_json::json!({"blocks": {"languageVersion": 0, "blocks": blocks}}).to_string()
+    }
+}
+
+#[cfg(test)]
+mod baked_nodes {
+    use super::templates;
+    use blockly_abi::lower_program;
+    use ogar_loco::LaneShape;
+
+    /// The BAKED NODES and the authoring JSON describe the same program.
+    ///
+    /// This is the gate that lets the demo serve bytes. If someone edits
+    /// `pong.json` and forgets to re-bake, or the bake drifts from the cast,
+    /// the two stop agreeing and this fails — so the stored artefact can never
+    /// silently diverge from the form a human reviews.
+    #[test]
+    fn the_baked_nodes_reproduce_the_authoring_json_byte_for_byte() {
+        let from_json = super::from_workspace_json(templates::PONG).unwrap();
+        let from_nodes = templates::raise_nodes(templates::PONG_NODES).expect("raises");
+
+        assert_eq!(
+            from_json.len(),
+            from_nodes.len(),
+            "script count differs between the JSON and the baked nodes"
+        );
+
+        for (i, (j, n)) in from_json.iter().zip(from_nodes.iter()).enumerate() {
+            let a = lower_program(LaneShape::Pairs, j).expect("json casts");
+            let b = lower_program(LaneShape::Pairs, n).expect("raised casts");
+            assert_eq!(a.functions.len(), b.functions.len(), "script {i}");
+            for (f, (x, y)) in a.functions.iter().zip(b.functions.iter()).enumerate() {
+                assert_eq!(
+                    x.as_body_bytes(),
+                    y.as_body_bytes(),
+                    "script {i} function {f}: the bake and the JSON disagree — \
+                     re-run `cargo run -p blockly-shim --example bake_template`"
+                );
+            }
+        }
+    }
+
+    /// A workspace rendered FROM the nodes is loadable by the editor.
+    ///
+    /// The round trip that matters for the app: bytes → blocks → JSON → blocks
+    /// → bytes. If the emit half dropped a socket or a `next` link, the final
+    /// bytes diverge.
+    #[test]
+    fn nodes_render_to_json_the_membrane_can_read_back() {
+        let scripts = templates::raise_nodes(templates::PONG_NODES).expect("raises");
+        let json = super::emit::to_workspace_json(&scripts);
+        let reread = super::from_workspace_json(&json).expect("the emitted JSON parses");
+
+        assert_eq!(scripts.len(), reread.len());
+        for (i, (a, b)) in scripts.iter().zip(reread.iter()).enumerate() {
+            let x = lower_program(LaneShape::Pairs, a).expect("casts");
+            let y = lower_program(LaneShape::Pairs, b).expect("casts");
+            for (f, (p, q)) in x.functions.iter().zip(y.functions.iter()).enumerate() {
+                assert_eq!(
+                    p.as_body_bytes(),
+                    q.as_body_bytes(),
+                    "script {i} function {f} lost information through the emit/read cycle"
+                );
+            }
+        }
     }
 }

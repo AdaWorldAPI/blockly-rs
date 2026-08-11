@@ -164,19 +164,27 @@ async fn api_scratch_defs() -> Json<serde_json::Value> {
     Json(serde_json::Value::Array(defs))
 }
 
-/// A built-in reference program, as a Blockly workspace save.
+/// A built-in reference program — RAISED FROM ITS STORED NODES.
 ///
-/// Served rather than embedded in the page for the same reason the toolbox is:
-/// the template is compiled into `blockly-shim`, where its own tests PARSE and
-/// CAST it on every build. A copy pasted into the HTML would be a second one
-/// nothing checks.
+/// The template ships as bytes (`templates/pong.nodes`, 8 nodes x 512 B), and
+/// this endpoint reconstructs the blocks from them and renders the editor's
+/// JSON on demand. That inverts what the demo used to do: the program is the
+/// artefact, and Blockly's save format is a projection produced at the
+/// membrane — the same posture as `/api/surface`, which renders HTML from the
+/// same nodes.
+///
+/// The JSON copy still exists as the AUTHORING form so a template stays
+/// reviewable, and a test asserts the two describe the same program, so the
+/// bytes can never silently drift from the form a human reads.
 async fn api_template(Query(q): Query<TemplateQuery>) -> Result<String, StatusCode> {
     let want = q.name.as_deref().unwrap_or("pong");
-    blockly_shim::templates::ALL
+    let (_, nodes) = blockly_shim::templates::ALL_NODES
         .iter()
         .find(|(n, _)| *n == want)
-        .map(|(_, json)| (*json).to_string())
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let scripts = blockly_shim::templates::raise_nodes(nodes)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(blockly_shim::emit::to_workspace_json(&scripts))
 }
 
 /// The cast program as **bytes** — the canonical surface, no serialization.
