@@ -755,17 +755,16 @@ mod tests {
 
         // ── A MEASURED SUBSTRATE GAP, pinned rather than papered over ──
         //
-        // Some borrowed opcodes are NAMED by the core (the constant exists)
-        // but carry no row in `shared_core::stack_arity`. That is a gap in
-        // `ogar-loco`, not in this mapping, and it PREDATES Scratch: 37
-        // Blockly block types land on the same arity-less bytes
-        // (`cargo run -p blockly-abi --example core_gap`). Per Core-First the
-        // fix belongs upstream — extend the core deliberately, never hack a
-        // local arity table in here.
+        // This pin did its job. It was 21: that many borrowed opcodes were
+        // NAMED by the core but carried no row in `shared_core::stack_arity`
+        // — a gap in `ogar-loco` that predated Scratch (37 Blockly types hit
+        // the same bytes). Per Core-First the fix went upstream rather than
+        // into a local table here, and when it landed this assertion failed
+        // exactly as designed, demanding a deliberate re-pin.
         //
-        // Pinned as an exact count so it cannot grow silently, and so it
-        // fails LOUDLY when upstream fixes it — at which point the number
-        // drops and this demands a deliberate re-pin rather than drifting.
+        // Now 1: `PROC_CALL`, which stays refused upstream because it is
+        // genuinely variadic (a call passes as many arguments as its
+        // procedure declares), not because anyone forgot it.
         let arity_gap = SCRATCH_CORE
             .iter()
             .filter(|&&(_, f)| {
@@ -773,7 +772,7 @@ mod tests {
             })
             .count();
         assert_eq!(
-            arity_gap, 21,
+            arity_gap, 1,
             "the shared core's arity coverage moved; re-measure with the \
              core_gap example and re-pin deliberately"
         );

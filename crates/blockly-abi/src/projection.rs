@@ -607,22 +607,30 @@ mod tests {
         // A wrong arity does not produce a wrong-looking render — it
         // desynchronizes the stack and silently reattributes every later
         // operand. So the table refuses.
-        // RE-PINNED. This used to name `IF`, which gained a stack arity when
-        // control flow was covered (now in the shared core's tables) — so
-        // asserting it is uncovered became wrong. The PROPERTY did not
-        // change, so it is re-pinned against functions that are still
-        // genuinely outside the table rather than weakened.
-        assert_eq!(arity(FnIndex::PROC_DEF), None);
-        assert_eq!(arity(FnIndex::WAIT), None);
-        let body = FunctionBody::from_calls(S, &[Call::new(FnIndex::PROC_DEF)]).unwrap();
+        // RE-PINNED TWICE. It first named `IF`, which gained an arity when
+        // control flow was covered; then `PROC_DEF`/`WAIT`, which gained one
+        // in the upstream coverage sweep. The PROPERTY never changed, so each
+        // time it is re-pinned onto something still genuinely outside the
+        // table rather than weakened. What remains uncovered upstream is the
+        // GENUINELY VARIADIC set — an arity belonging to the call, not the
+        // function — which is a design question, not a missing row.
+        assert_eq!(arity(FnIndex::PROC_CALL), None);
+        assert_eq!(arity(FnIndex::RETURN), None);
+        // …and the can-fire half: the ops this test used to name ARE covered
+        // now, so "uncovered" still discriminates instead of being a label
+        // for whatever happens to be missing.
+        assert_eq!(arity(FnIndex::PROC_DEF), Some(0));
+        assert_eq!(arity(FnIndex::WAIT), Some(1));
+        let body = FunctionBody::from_calls(S, &[Call::new(FnIndex::PROC_CALL)]).unwrap();
         assert_eq!(
             render_text(&body),
             Err(ProjectionError::Uncovered {
-                function: FnIndex::PROC_DEF.0
+                function: FnIndex::PROC_CALL.0
             })
         );
-        // …and `IF` really is covered now, so this test cannot quietly become
-        // a claim about a function that no longer exists in the gap.
+        // …and the previously-named functions really are covered now, so this
+        // test cannot quietly become a claim about a function that no longer
+        // exists in the gap.
         assert_eq!(arity(FnIndex::IF), Some(1));
         // Two-sided: the covered core still renders, so the refusal is targeted
         // rather than a blanket failure.
