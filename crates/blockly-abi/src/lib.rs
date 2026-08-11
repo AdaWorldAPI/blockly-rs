@@ -87,6 +87,7 @@ pub mod palette;
 pub mod program;
 pub mod projection;
 pub mod registry;
+pub mod scratch;
 
 pub use codebook::{OpcodeMapping, resolve_opcode};
 pub use klickweg::{BlockAddress, address_of};
@@ -604,10 +605,19 @@ pub(crate) fn call_for(
     }
 
     let code = block.dropdown_code();
-    let mapping = codebook::resolve(&block.ty, code).ok_or_else(|| CastError::UnknownOpcode {
-        ty: block.ty.clone(),
-        code: code.map(str::to_owned),
-    })?;
+    // Blockly's codebook first, then Scratch's. The two are disjoint by
+    // construction (Blockly types are `math_*`/`logic_*`/`controls_*`/…,
+    // Scratch's are `motion_*`/`looks_*`/`operator_*`/…), so the order is not
+    // a precedence rule — it is just a lookup. Where the two frontends mean
+    // the SAME operation they resolve to the same byte, which is the point of
+    // the shared core and is pinned by
+    // `scratch::tests::blockly_and_scratch_lower_the_same_operation_to_the_same_byte`.
+    let mapping = codebook::resolve(&block.ty, code)
+        .or_else(|| scratch::resolve_scratch(&block.ty, code))
+        .ok_or_else(|| CastError::UnknownOpcode {
+            ty: block.ty.clone(),
+            code: code.map(str::to_owned),
+        })?;
 
     // The immediates, in the block's own field order. A Selector dropdown
     // chose WHICH function and is already spent; a ValueParam dropdown is an

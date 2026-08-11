@@ -29,6 +29,12 @@
 <header>
   <h1>blockly-rs</h1>
   <span class="sub">drag blocks → V3 SoA rows. The blocks are a projection; the 512-byte node is the program.</span>
+  <label>palette
+    <select id="dialect">
+      <option value="blockly" selected>Blockly — 64 types</option>
+      <option value="scratch">Scratch — 138 tiles, 94 device mints</option>
+    </select>
+  </label>
   <label>lane shape
     <select id="shape">
       <option value="pairs" selected>Pairs — 6×(fn:val), 180 calls</option>
@@ -40,6 +46,7 @@
 <main>
   <div id="blocklyDiv"></div>
   <div id="panels">
+    <section><h2>substrate</h2><div id="substrate" class="muted">cast something to read the live plug</div></section>
     <section><h2>refusals</h2><div id="errors" class="muted">none — the cast accepted everything on the canvas</div></section>
     <section><h2>scripts</h2><div id="scripts" class="muted">drag a block to begin</div></section>
     <p class="muted">Key prefix 0xFF00 is a placeholder — the real app prefix is an unminted operator decision (M1).
@@ -51,38 +58,29 @@
 <script src="https://unpkg.com/blockly@11.2.1/blocks_compressed.js"></script>
 <script src="https://unpkg.com/blockly@11.2.1/msg/en.js"></script>
 <script>
-const toolbox = {
-  kind: "categoryToolbox",
-  contents: [
-    { kind: "category", name: "Math", contents: [
-      { kind: "block", type: "math_number" },
-      { kind: "block", type: "math_arithmetic" },
-      { kind: "block", type: "math_single" },
-      { kind: "block", type: "math_trig" },
-      { kind: "block", type: "math_round" },
-      { kind: "block", type: "math_modulo" },
-      { kind: "block", type: "math_constrain" },
-    ]},
-    { kind: "category", name: "Logic", contents: [
-      { kind: "block", type: "logic_compare" },
-      { kind: "block", type: "logic_operation" },
-      { kind: "block", type: "logic_negate" },
-      { kind: "block", type: "logic_boolean" },
-    ]},
-    { kind: "category", name: "Control", contents: [
-      { kind: "block", type: "controls_if" },
-      { kind: "block", type: "controls_ifelse" },
-      { kind: "block", type: "controls_repeat_ext" },
-      { kind: "block", type: "controls_whileUntil" },
-    ]},
-    { kind: "category", name: "Text", contents: [
-      { kind: "block", type: "text" },
-      { kind: "block", type: "text_print" },
-      { kind: "block", type: "text_join" },
-    ]},
-  ],
-};
-const workspace = Blockly.inject("blocklyDiv", { toolbox, trashcan: true });
+// The toolbox is SERVED, from `blockly_abi::codebook::CATEGORIES` — the same
+// list `resolve()` is checked against. A hand-written list here was a second
+// vocabulary beside the codebook: it offered 18 types while the cast already
+// handled 64, hiding every list, variable and procedure block. Fetching it
+// means the page can neither hide a supported block nor offer an unsupported
+// one.
+let workspace = null;
+async function boot() {
+  const dialect = document.getElementById("dialect").value;
+  // Scratch block definitions are generated server-side from the same table
+  // that mints the opcodes — vanilla Blockly has no `motion_movesteps`.
+  if (dialect === "scratch" && !window.__scratchDefined) {
+    const defs = await (await fetch("/api/scratch-defs")).json();
+    Blockly.defineBlocksWithJsonArray(defs);
+    window.__scratchDefined = true;
+  }
+  const toolbox = await (await fetch("/api/toolbox?dialect=" + dialect)).json();
+  if (workspace) { workspace.dispose(); }
+  document.getElementById("blocklyDiv").innerHTML = "";
+  workspace = Blockly.inject("blocklyDiv", { toolbox, trashcan: true });
+  workspace.addChangeListener(onChange);
+  recast();
+}
 
 let timer = null;
 function esc(s) {
@@ -99,6 +97,26 @@ async function recast() {
   render(await res.json());
 }
 function render(out) {
+  // Provenance, read live from the server's registry each cast — the answer
+  // to "is this the substrate or something local?". `resolved` is the plug
+  // firing; a red badge here means the palette did NOT resolve.
+  const sub = out.substrate;
+  const subEl = document.getElementById("substrate");
+  subEl.className = "";
+  subEl.innerHTML = `
+    <div>${sub.resolved
+      ? `<b style="color:#3a3">plug resolved</b>`
+      : `<b class="err">plug did NOT resolve</b>`} —
+      ${sub.plugged} vocabular${sub.plugged === 1 ? "y" : "ies"} in the registry</div>
+    <pre>classid          ${esc(sub.classid)}   (palette concept ${esc(sub.palette_concept)}, canon-high)
+node shape       ${esc(sub.node_shape_concept)}       ogar-loco's, NOT the palette's
+node stride      ${sub.node_bytes} B      ogar_loco::node::NODE_BYTES
+domain floor     ${esc(sub.domain_floor)}         below it = shared core, in the substrate
+core probe       ${esc(sub.core_probe)}</pre>
+    <div class="muted">A classid selects which vocabulary reads the call bytes —
+      never the node's shape. The core probe answers <i>through</i> the plugged
+      palette, so a green line here is the sharing discipline, measured.</div>`;
+
   const errs = document.getElementById("errors");
   if (out.errors.length === 0) {
     errs.className = "muted";
@@ -144,13 +162,17 @@ function render(out) {
       </div>`;
   }).join("<hr>");
 }
-workspace.addChangeListener(e => {
+function onChange(e) {
   if (e.isUiEvent) return;
   clearTimeout(timer);
   timer = setTimeout(recast, 250);
-});
+}
 document.getElementById("shape").addEventListener("change", recast);
-recast();
+// Switching palette rebuilds the workspace: Blockly and Scratch blocks are
+// different definitions, so a canvas built from one cannot survive the other.
+// The reload is honest about that rather than half-swapping the toolbox.
+document.getElementById("dialect").addEventListener("change", boot);
+boot();
 </script>
 </body>
 </html>

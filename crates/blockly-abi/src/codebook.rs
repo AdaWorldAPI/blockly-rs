@@ -66,6 +66,124 @@ pub struct OpcodeMapping {
     pub role: CodeRole,
 }
 
+/// Every Blockly block type [`resolve`] handles, grouped as a palette is
+/// presented — the ONE list a toolbox is built from.
+///
+/// A hand-written toolbox is a second vocabulary beside this one, and it
+/// drifts silently in the direction that hurts: the demo shipped exposing 18
+/// types while the cast already handled 64, so 46 supported types — every
+/// list, variable and procedure block — were simply invisible. Nothing broke;
+/// they were never offered.
+///
+/// Completeness is not promised here, it is checked:
+/// `every_resolvable_type_is_listed` parses this file's own match arms and
+/// fails if a type is handled but missing below (or listed but unhandled).
+/// Adding a `resolve` arm without adding it here turns that test red.
+///
+/// Order within a group is presentation, and is the only editorial choice.
+pub const CATEGORIES: &[(&str, &[&str])] = &[
+    (
+        "Logic",
+        &[
+            "controls_if",
+            "controls_ifelse",
+            "logic_compare",
+            "logic_operation",
+            "logic_negate",
+            "logic_boolean",
+            "logic_null",
+            "logic_ternary",
+        ],
+    ),
+    (
+        "Loops",
+        &[
+            "controls_repeat",
+            "controls_repeat_ext",
+            "controls_whileUntil",
+            "controls_for",
+            "controls_forEach",
+            "controls_flow_statements",
+        ],
+    ),
+    (
+        "Math",
+        &[
+            "math_number",
+            "math_arithmetic",
+            "math_single",
+            "math_trig",
+            "math_atan2",
+            "math_constant",
+            "math_number_property",
+            "math_round",
+            "math_modulo",
+            "math_constrain",
+            "math_random_int",
+            "math_random_float",
+            "math_on_list",
+            "math_change",
+        ],
+    ),
+    (
+        "Text",
+        &[
+            "text",
+            "text_join",
+            "text_append",
+            "text_length",
+            "text_isEmpty",
+            "text_indexOf",
+            "text_charAt",
+            "text_getSubstring",
+            "text_changeCase",
+            "text_trim",
+            "text_count",
+            "text_replace",
+            "text_reverse",
+            "text_print",
+            "text_prompt",
+            "text_prompt_ext",
+        ],
+    ),
+    (
+        "Lists",
+        &[
+            "lists_create_empty",
+            "lists_create_with",
+            "lists_repeat",
+            "lists_length",
+            "lists_isEmpty",
+            "lists_indexOf",
+            "lists_getIndex",
+            "lists_setIndex",
+            "lists_getSublist",
+            "lists_sort",
+            "lists_split",
+            "lists_reverse",
+        ],
+    ),
+    (
+        "Variables",
+        &[
+            "variables_get",
+            "variables_set",
+            "variables_get_dynamic",
+            "variables_set_dynamic",
+        ],
+    ),
+    (
+        "Procedures",
+        &[
+            "procedures_defnoreturn",
+            "procedures_defreturn",
+            "procedures_callnoreturn",
+            "procedures_callreturn",
+            "procedures_ifreturn",
+        ],
+    ),
+];
+
 /// Resolve a Blockly block type (with its dropdown code, if any) to a mapping.
 ///
 /// Returns `None` for the three deliberate gaps and for any unknown type —
@@ -690,5 +808,73 @@ mod tests {
         const { assert!(crate::palette::DEVICE_FAMILY_FLOOR < u8::MAX) };
         let highest_pin = pinned.iter().map(|(_, _, b)| *b).max().unwrap();
         assert!(highest_pin < crate::palette::DEVICE_FAMILY_FLOOR);
+    }
+
+    /// [`CATEGORIES`] lists EXACTLY the types [`resolve`] handles.
+    ///
+    /// Parses this file's own `resolve` match arms at compile time, so the
+    /// list cannot drift from the code it describes. Both directions are
+    /// checked: a handled-but-unlisted type would be invisible in any toolbox
+    /// built from `CATEGORIES` (the 46-of-64 gap this const was added to
+    /// close), and a listed-but-unhandled type would offer the user a block
+    /// that refuses the moment they drag it.
+    #[test]
+    fn every_resolvable_type_is_listed_and_every_listed_type_resolves() {
+        let src = include_str!("codebook.rs");
+        let body = src
+            .split("pub fn resolve(")
+            .nth(1)
+            .and_then(|s| s.split("\npub fn ").next())
+            .expect("resolve() must be findable in this file");
+
+        // Match arms look like `("ty", ...) =>` or `("a" | "b", ...) =>`.
+        let mut handled: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let t = line.trim_start();
+            if !t.starts_with('(') || !line.contains("=>") {
+                continue;
+            }
+            // Take the arm's FIRST tuple element only — the block type(s).
+            let head = t[1..].split(',').next().unwrap_or("");
+            for piece in head.split('|') {
+                let p = piece.trim().trim_matches('"');
+                if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    handled.push(p.to_string());
+                }
+            }
+        }
+        handled.sort();
+        handled.dedup();
+        assert!(
+            handled.len() > 50,
+            "arm parse found only {} types — the parser broke, not the code",
+            handled.len()
+        );
+
+        let mut listed: Vec<String> = CATEGORIES
+            .iter()
+            .flat_map(|(_, types)| types.iter().map(|t| (*t).to_string()))
+            .collect();
+        let before = listed.len();
+        listed.sort();
+        listed.dedup();
+        assert_eq!(before, listed.len(), "a type is listed in two categories");
+
+        let missing: Vec<_> = handled.iter().filter(|t| !listed.contains(t)).collect();
+        assert!(
+            missing.is_empty(),
+            "handled by resolve() but absent from CATEGORIES, so invisible in \
+             any toolbox built from it: {missing:?}"
+        );
+
+        // …and the other direction: every offered block must actually cast.
+        // `resolve` needs the right dropdown code for selector blocks, so
+        // probe with the codes this file already knows for the type.
+        let unhandled: Vec<_> = listed.iter().filter(|t| !handled.contains(t)).collect();
+        assert!(
+            unhandled.is_empty(),
+            "listed in CATEGORIES but resolve() does not handle them — the \
+             toolbox would offer blocks that refuse on drag: {unhandled:?}"
+        );
     }
 }

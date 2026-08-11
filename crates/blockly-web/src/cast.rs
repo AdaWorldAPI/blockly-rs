@@ -21,7 +21,7 @@
 use blockly_abi::{FunctionNode, Program};
 use blockly_abi::{lower_program, parse_text, raise_calls, render_text};
 use blockly_shim::from_workspace_json;
-use ogar_loco::{FunctionBody, LaneShape};
+use ogar_loco::{FnIndex, FunctionBody, LaneShape};
 use serde::Serialize;
 
 /// The demo key the entry node is stored under.
@@ -70,15 +70,102 @@ pub struct ScriptOut {
     pub roundtrip: Option<bool>,
 }
 
+/// Where the bytes on this page actually came from.
+///
+/// Exists because the page could not previously answer the only question a
+/// reader has about a substrate demo: *whose substrate is this?* Every field
+/// is READ at request time from the live registry and the live `ogar-loco`
+/// types — never a string this crate typed out. If the plug ever stops
+/// resolving, these fields say so instead of offering a stale reassurance.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SubstrateOut {
+    /// The palette concept this consumer declares and plugs (`0x1717`).
+    pub palette_concept: String,
+    /// The stored key's full classid — canon-high `(concept << 16) | prefix`.
+    pub classid: String,
+    /// Whether `VocabularyRegistry::resolve_classid` found a vocabulary for
+    /// it. This is the plug FIRING, not an assertion that it did.
+    pub resolved: bool,
+    /// How many vocabularies are plugged into the boot registry.
+    pub plugged: usize,
+    /// The node shape the body is stored in — `ogar-loco`'s, NOT the
+    /// palette's. A classid selects which vocabulary reads the call bytes;
+    /// it never selects the node's shape.
+    pub node_shape_concept: String,
+    /// Stored node stride, read from `ogar_loco::node::NODE_BYTES`.
+    pub node_bytes: usize,
+    /// First byte of the palette's own range. Below it is the shared
+    /// computational core, whose tables live once in the substrate.
+    pub domain_floor: String,
+    /// A shared-core opcode answering THROUGH the plugged vocabulary — the
+    /// round trip in one line, computed live rather than claimed.
+    pub core_probe: String,
+}
+
 /// Everything one cast produces.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct CastOut {
+    /// Provenance of the substrate that produced everything below.
+    pub substrate: SubstrateOut,
     /// The lane shape the cast ran under.
     pub shape: String,
     /// One entry per top-level script that cast cleanly.
     pub scripts: Vec<ScriptOut>,
     /// One entry per script that was REFUSED, with the reason.
     pub errors: Vec<String>,
+}
+
+/// Read the substrate's provenance out of the LIVE registry.
+///
+/// Everything returned is computed, not recited: the classid comes from the
+/// same [`demo_key`] the stored node uses, `resolved` is the actual
+/// `resolve_classid` result, and `core_probe` asks the plugged vocabulary a
+/// shared-core question and prints what it answered. A page that merely SAID
+/// "served by ogar-loco" would look identical whether or not it were true;
+/// this cannot.
+fn substrate_out() -> SubstrateOut {
+    let key = demo_key();
+    substrate_for(u32::from_le_bytes([key[0], key[1], key[2], key[3]]))
+}
+
+/// [`substrate_out`] for an arbitrary classid.
+///
+/// Split out so a test can drive THIS function with a classid nothing
+/// plugged and watch `resolved` come back false. Without that seam, every
+/// assertion about `resolved` is equally satisfied by a hardcoded `true` —
+/// measured, not theorised: the first version of this panel was tested only
+/// through [`substrate_out`], and the suite passed unchanged when `resolved`
+/// was replaced with a literal.
+fn substrate_for(classid: u32) -> SubstrateOut {
+    // The plug, actually firing.
+    let registry = blockly_abi::registry();
+    let (resolved, plugged, core_probe) = match &registry {
+        Ok(r) => {
+            let probe = match r.resolve_classid(classid) {
+                // REPEAT is a shared-core opcode: its arity lives once, in
+                // the substrate, and reaches us THROUGH the palette. That is
+                // the whole sharing discipline in one line.
+                Some(table) => match table.stack_arity(FnIndex::REPEAT) {
+                    Some(n) => format!("REPEAT (0x03) → stack_arity {n}, via the shared core"),
+                    None => "REPEAT (0x03) → refused — the shared core did not answer".to_string(),
+                },
+                None => "no vocabulary is plugged for this classid".to_string(),
+            };
+            (r.resolve_classid(classid).is_some(), r.len(), probe)
+        }
+        Err(e) => (false, 0, format!("registry refused: {e:?}")),
+    };
+
+    SubstrateOut {
+        palette_concept: format!("{:#06x}", blockly_abi::palette::PALETTE_CONCEPT),
+        classid: format!("{classid:#010x}"),
+        resolved,
+        plugged,
+        node_shape_concept: format!("{:#06x}", ogar_loco::LocoConcept::FunctionBody.concept_id()),
+        node_bytes: ogar_loco::node::NODE_BYTES,
+        domain_floor: format!("{:#04x}", ogar_loco::DOMAIN_FLOOR),
+        core_probe,
+    }
 }
 
 fn shape_of(name: &str) -> LaneShape {
@@ -157,6 +244,7 @@ fn script_out(prog: &Program) -> ScriptOut {
 pub fn cast_workspace(json: &str, shape_name: &str) -> CastOut {
     let shape = shape_of(shape_name);
     let mut out = CastOut {
+        substrate: substrate_out(),
         shape: format!("{shape:?}"),
         scripts: Vec::new(),
         errors: Vec::new(),
@@ -273,5 +361,50 @@ mod tests {
         let out = cast_workspace(text, "pairs");
         assert_eq!(out.scripts.len(), 0);
         assert_eq!(out.errors.len(), 1, "the refusal must be visible");
+    }
+
+    /// The provenance panel reports what it MEASURED, not what it was told.
+    ///
+    /// Two-sided on the only field that can lie: `resolved` must be true
+    /// because the plug fired for the demo classid, AND false for a classid
+    /// nothing plugged. A panel hardcoded to `true` passes the first half and
+    /// fails the second — which is exactly the failure this test exists for,
+    /// since a page that merely SAYS "served by ogar-loco" looks identical
+    /// whether or not it is.
+    #[test]
+    fn the_substrate_panel_reads_the_live_plug_and_can_also_report_a_miss() {
+        let s = cast_workspace(ARITH, "pairs").substrate;
+
+        // Can-fire: the demo classid resolves through the real registry.
+        assert!(s.resolved, "the palette must actually be plugged");
+        assert_eq!(s.plugged, 1);
+        assert_eq!(s.palette_concept, "0x1717");
+        assert_eq!(s.classid, "0x1717ff00");
+
+        // The shared core answered THROUGH the plugged vocabulary — the
+        // sharing discipline, measured. REPEAT takes one operand.
+        assert!(
+            s.core_probe.contains("stack_arity 1"),
+            "core probe did not reach the shared core: {}",
+            s.core_probe
+        );
+
+        // The node shape is the SUBSTRATE's, never the palette's — a classid
+        // selects which vocabulary reads the bytes, not the node's shape.
+        assert_eq!(s.node_shape_concept, "0x1701");
+        assert_ne!(s.node_shape_concept, s.palette_concept);
+        assert_eq!(s.node_bytes, 512);
+
+        // Can-stay-silent, THROUGH THE SAME FUNCTION the panel uses. Driving
+        // the registry directly here would prove nothing about the panel —
+        // the first version of this test did exactly that and passed with
+        // `resolved` hardcoded to `true`.
+        let miss = substrate_for(0x0999_0000);
+        assert!(
+            !miss.resolved,
+            "an unplugged classid must report resolved=false — otherwise the \
+             field carries no information"
+        );
+        assert_eq!(miss.core_probe, "no vocabulary is plugged for this classid");
     }
 }
