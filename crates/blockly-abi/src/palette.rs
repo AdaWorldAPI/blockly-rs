@@ -66,24 +66,28 @@ pub const fn render_classid(app_prefix: u16) -> u32 {
 
 /// The Blockly/Scratch palette as an `ogar-loco` [`Vocabulary`].
 ///
-/// Every operation this palette has *allocated* sits below the floor — in the
-/// shared computational core, whose tables live in the substrate — so the
-/// domain hooks answer nothing yet. That is honest rather than lazy: the
-/// device families above [`DEVICE_FAMILY_FLOOR`] are reserved, not allocated,
-/// and when they mint their arity tables land here (and only here — the
-/// substrate never learns device vocabulary).
+/// Operations below [`DEVICE_FAMILY_FLOOR`] belong to the shared
+/// computational core, whose tables live once in the substrate; this palette
+/// never answers for them. At or above the floor are the Scratch device
+/// families — motion, looks, sound, events, sensing, plus clone control and
+/// the stage monitors — and those tables live HERE and only here. The
+/// substrate never learns device vocabulary.
+///
+/// Both numbers come from [`crate::scratch::SCRATCH_DEVICE`], whose arity and
+/// body-reference counts were read from each block's own `args0` declaration
+/// in the Apache-2.0 source rather than assigned by hand. A byte in the range
+/// with no minted row is still refused rather than guessed — the 15
+/// unallocated slots above the last mint answer `None`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlocklyPalette;
 
 impl Vocabulary for BlocklyPalette {
-    fn domain_stack_arity(&self, _f: FnIndex) -> Option<u8> {
-        // No device family is minted yet; an above-floor byte is refused,
-        // never guessed.
-        None
+    fn domain_stack_arity(&self, f: FnIndex) -> Option<u8> {
+        crate::scratch::device_by_byte(f.0).map(|(_, arity, _)| arity)
     }
 
-    fn domain_body_refs(&self, _f: FnIndex) -> u8 {
-        0
+    fn domain_body_refs(&self, f: FnIndex) -> u8 {
+        crate::scratch::device_by_byte(f.0).map_or(0, |(_, _, refs)| refs)
     }
 }
 
@@ -117,8 +121,23 @@ mod tests {
         assert_eq!(v.stack_arity(FnIndex::REPEAT), Some(1));
         assert_eq!(v.body_refs(FnIndex::IF_ELSE), 2);
         assert_eq!(v.stack_arity(FnIndex::ADD), Some(2));
-        // …and an unminted device byte is refused, not guessed.
-        assert_eq!(v.stack_arity(FnIndex(DEVICE_FAMILY_FLOOR)), None);
+
+        // The device range answers from THIS palette's own table. 0x90 is
+        // `motion_movesteps`, which declares one `input_value` in the
+        // Apache-2.0 source — so the arity is read, not chosen.
+        assert_eq!(DEVICE_FAMILY_FLOOR, 0x90);
+        assert_eq!(
+            crate::scratch::device_by_byte(DEVICE_FAMILY_FLOOR).map(|(n, ..)| n),
+            Some("motion_movesteps")
+        );
+        assert_eq!(v.stack_arity(FnIndex(DEVICE_FAMILY_FLOOR)), Some(1));
+
+        // …and a byte in the range that nothing minted is still REFUSED
+        // rather than guessed. Without this half the range would look like it
+        // answers for everything, which carries no information.
+        let unminted = FnIndex(0xFF);
+        assert!(crate::scratch::device_by_byte(0xFF).is_none());
+        assert_eq!(v.stack_arity(unminted), None);
     }
 
     #[test]
