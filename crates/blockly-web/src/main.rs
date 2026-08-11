@@ -11,11 +11,13 @@
 //! fallback — never hardcoded as the deploy port).
 
 mod cast;
+mod surface;
 
 use askama::Template;
 use axum::extract::Query;
 use axum::http::StatusCode;
-use axum::response::Html;
+use axum::http::header;
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -177,6 +179,45 @@ async fn api_template(Query(q): Query<TemplateQuery>) -> Result<String, StatusCo
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// The cast program as **bytes** — the canonical surface, no serialization.
+///
+/// `Frame::NodeDelta(...).to_le_bytes()`: the 512-byte stored node travels as
+/// itself, addressed by its 16-byte key, with a changed-field mask the client
+/// resolves through the classid's ClassView. This is what `/api/cast`'s JSON
+/// should have been from the start — the arc's whole claim is that the node IS
+/// the program, and a JSON description of it says the opposite.
+async fn api_frame(Query(q): Query<CastQuery>, body: String) -> Response {
+    let shape = q.shape.as_deref().unwrap_or("pairs");
+    match cast::first_program(&body, shape) {
+        Some(prog) => {
+            let bytes = surface::program_frame_bytes(cast::demo_key(), &prog);
+            ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+        }
+        // No castable script is not an error — an empty canvas is legal. An
+        // empty body is the honest answer: zero nodes changed.
+        None => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            Vec::new(),
+        )
+            .into_response(),
+    }
+}
+
+/// The surface, rendered SERVER-SIDE through the upstream askama brick.
+///
+/// The page receives HTML that a ClassView projection produced, not a document
+/// it has to lay out itself. That is the a2ui posture: the render happens from
+/// the projection, and the client holds the codebook rather than the schema.
+async fn api_surface(Query(q): Query<CastQuery>, body: String) -> Result<Html<String>, StatusCode> {
+    let shape = q.shape.as_deref().unwrap_or("pairs");
+    let Some(prog) = cast::first_program(&body, shape) else {
+        return Ok(Html(String::new()));
+    };
+    surface::render_surface(cast::demo_key(), &prog, shape)
+        .map(Html)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 fn blocks(types: &[&str]) -> Vec<serde_json::Value> {
     types
         .iter()
@@ -233,6 +274,8 @@ async fn main() {
         .route("/api/toolbox", get(api_toolbox))
         .route("/api/scratch-defs", get(api_scratch_defs))
         .route("/api/template", get(api_template))
+        .route("/api/frame", post(api_frame))
+        .route("/api/surface", post(api_surface))
         .route("/api/cast", post(api_cast));
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)

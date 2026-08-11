@@ -38,3 +38,13 @@ rust-version = "1.95"
 # copies are DELETED and CI forbids their return (the executable
 # no-second-vocabulary trap, ruling R1/Q6).
 ogar-loco = { path = "../OGAR/crates/ogar-loco" }
+
+# The a2ui canonical surface, both halves. Same sibling checkout as
+# `ogar-loco` -- no new repository, and the Dockerfile already clones it.
+#
+# These replace the demo's JSON read-surface. `ogar-a2ui-frame` is BYTE-NATIVE
+# (`Frame::to_le_bytes`; its serde derive is feature-gated and left OFF), so
+# the program crossing the wire is the stored bytes rather than a description
+# of them -- charter T3, and the whole point of an ABI-shaped SoA.
+ogar-a2ui-frame = { path = "../OGAR/crates/ogar-a2ui-frame" }
+ogar-render-askama = { path = "../OGAR/crates/ogar-render-askama" }
