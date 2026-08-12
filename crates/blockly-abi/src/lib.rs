@@ -86,6 +86,7 @@ pub mod klickweg;
 pub mod palette;
 pub mod program;
 pub mod projection;
+pub mod raise;
 pub mod registry;
 pub mod scratch;
 

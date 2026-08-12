@@ -240,6 +240,22 @@ fn script_out(prog: &Program) -> ScriptOut {
 /// [`CastOut::errors`] with the block type and the reason, because the
 /// refusals ARE the demo. A malformed save (not a workspace JSON at all)
 /// yields one error and zero scripts.
+/// The first script of a workspace, cast — the input the canonical byte
+/// surface needs.
+///
+/// Split out so [`crate::surface`] can reach a `Program` without going through
+/// [`CastOut`], which exists to be JSON. A surface that had to build the JSON
+/// shape first and then read it back would be carrying the very serialization
+/// it replaces.
+#[must_use]
+pub fn first_program(json: &str, shape_name: &str) -> Option<Program> {
+    let shape = shape_of(shape_name);
+    from_workspace_json(json)
+        .ok()?
+        .iter()
+        .find_map(|record| lower_program(shape, record).ok())
+}
+
 #[must_use]
 pub fn cast_workspace(json: &str, shape_name: &str) -> CastOut {
     let shape = shape_of(shape_name);
