@@ -44,8 +44,10 @@ struct TemplateQuery {
 struct RunQuery {
     /// Lane shape, as elsewhere.
     shape: Option<String>,
-    /// How many calls the run may execute before it stops. Bounds `forever`.
-    budget: Option<u32>,
+    /// How many scheduler rounds to run — one trace frame each.
+    rounds: Option<u32>,
+    /// Calls each script gets per round. Bounds `forever` within a slice.
+    slice: Option<u32>,
     /// Mouse position the sensing reporters see.
     mouse_y: Option<f32>,
     /// Whether `sensing_touchingobject` answers true.
@@ -250,26 +252,41 @@ async fn api_surface(Query(q): Query<CastQuery>, body: String) -> Result<Html<St
 /// run, never of the program.
 async fn api_run(Query(q): Query<RunQuery>, body: String) -> Html<String> {
     let shape = q.shape.as_deref().unwrap_or("pairs");
-    let budget = q.budget.unwrap_or(600).min(200_000);
-    let Some(prog) = cast::first_program(&body, shape) else {
-        return Html(stage::svg(&blockly_run::Stage::default(), false));
-    };
-    let mut m = blockly_run::Machine::new(&prog.functions, budget);
-    m.stage.mouse_y = q.mouse_y.unwrap_or(0.0);
-    m.stage.touching = q.touching.unwrap_or(false);
-    // A refusal is INFORMATION, not a failure to hide: the stage still draws,
-    // and the note says which operation stopped the run.
-    let note = match m.run() {
+    let rounds = q.rounds.unwrap_or(240).clamp(2, 2000);
+    let slice = q.slice.unwrap_or(60).clamp(1, 5000);
+
+    // EVERY script becomes an actor in ONE scene. Running each on its own
+    // stage is what made the deploy a frozen dot: the paddle script's result
+    // was discarded and only one sprite was ever drawn.
+    let progs = cast::all_programs(&body, shape);
+    if progs.is_empty() {
+        return Html(stage::svg(&[blockly_run::Stage::pong()], 1.0));
+    }
+    let bodies: Vec<&[ogar_loco::FunctionBody]> =
+        progs.iter().map(|p| p.functions.as_slice()).collect();
+
+    // A sweeping pointer, so a mouse-tracking paddle has something to track.
+    // Simulated input, named as such — see `Scene::with_mouse_sweep`.
+    let mut scene = blockly_run::Scene::new(blockly_run::Stage::pong(), bodies)
+        .with_mouse_sweep(q.mouse_y.unwrap_or(120.0));
+    scene.stage.touching = q.touching.unwrap_or(false);
+
+    // A refusal is INFORMATION: the scene still renders what it reached, and
+    // the note names the operation that stopped it.
+    let note = match scene.run(rounds, slice) {
         Ok(()) => None,
         Err(e) => Some(e.to_string()),
     };
-    let mut svg = stage::svg(&m.stage, true);
+
+    let trace = scene.trace();
+    let mut out = stage::svg(trace, (rounds as f32 / 60.0).clamp(1.0, 20.0));
+    out.push_str(&stage::stats(&scene.stage, trace.len()));
     if let Some(n) = note {
-        svg.push_str(&format!(
+        out.push_str(&format!(
             "<p class=\"err\" style=\"margin:.3rem 0 0\">run stopped: {n}</p>"
         ));
     }
-    Html(svg)
+    Html(out)
 }
 
 fn blocks(types: &[&str]) -> Vec<serde_json::Value> {

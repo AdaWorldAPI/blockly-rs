@@ -256,6 +256,24 @@ pub fn first_program(json: &str, shape_name: &str) -> Option<Program> {
         .find_map(|record| lower_program(shape, record).ok())
 }
 
+/// EVERY script of a workspace, cast — the scene's actors.
+///
+/// `first_program` was enough while a run had one sprite; a scene needs all of
+/// them, because the paddle is a second script and dropping it is precisely
+/// what made the rendered stage look frozen.
+#[must_use]
+pub fn all_programs(json: &str, shape_name: &str) -> Vec<Program> {
+    let shape = shape_of(shape_name);
+    from_workspace_json(json)
+        .map(|records| {
+            records
+                .iter()
+                .filter_map(|r| lower_program(shape, r).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[must_use]
 pub fn cast_workspace(json: &str, shape_name: &str) -> CastOut {
     let shape = shape_of(shape_name);
