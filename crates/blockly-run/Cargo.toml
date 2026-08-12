@@ -1,0 +1,13 @@
+[package]
+name = "blockly-run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Executes a stored program directly from its function bodies — the 512-byte node run as-is, no JSON, no re-parse. Permissive: an original interpreter over the call rails, never the GPL rash JIT."
+
+[dependencies]
+blockly-abi = { path = "../blockly-abi" }
+ogar-loco = { workspace = true }

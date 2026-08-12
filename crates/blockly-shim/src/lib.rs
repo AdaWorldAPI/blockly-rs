@@ -853,3 +853,54 @@ mod baked_nodes {
         }
     }
 }
+
+#[cfg(test)]
+mod pong_runs {
+    use super::templates;
+    use blockly_abi::lower_program;
+    use blockly_run::Machine;
+    use ogar_loco::LaneShape;
+
+    /// Pong RUNS from its stored nodes — the ball moves, the paddle tracks
+    /// the mouse, the score counts.
+    ///
+    /// The whole arc in one test: nodes → bodies → execution, with no JSON and
+    /// no block tree in the path. Each script is asserted for the effect it is
+    /// supposed to have, so a run that merely completed without panicking
+    /// would still fail.
+    #[test]
+    fn pong_runs_from_its_stored_nodes() {
+        let scripts = templates::raise_nodes(templates::PONG_NODES).expect("raises");
+        assert_eq!(scripts.len(), 3);
+
+        // Script 0 — the ball moves.
+        let ball = lower_program(LaneShape::Pairs, &scripts[0]).expect("casts");
+        let mut m = Machine::new(&ball.functions, 400);
+        m.run().expect("the ball script runs");
+        assert!(
+            m.stage.x != 0.0 || m.stage.y != 0.0,
+            "the ball must have moved: ({}, {})",
+            m.stage.x,
+            m.stage.y
+        );
+
+        // Script 1 — the paddle follows the mouse.
+        let paddle = lower_program(LaneShape::Pairs, &scripts[1]).expect("casts");
+        let mut p = Machine::new(&paddle.functions, 200);
+        p.stage.mouse_y = 42.0;
+        p.run().expect("the paddle script runs");
+        assert_eq!(p.stage.y, 42.0, "the paddle must track the mouse");
+
+        // Script 2 — scoring, and it must NOT score when nothing is touched.
+        let score = lower_program(LaneShape::Pairs, &scripts[2]).expect("casts");
+        let mut hit = Machine::new(&score.functions, 200);
+        hit.stage.touching = true;
+        hit.run().expect("the score script runs");
+        assert!(hit.stage.var > 0.0, "touching the goal must score");
+
+        let mut miss = Machine::new(&score.functions, 200);
+        miss.stage.touching = false;
+        miss.run().expect("runs");
+        assert_eq!(miss.stage.var, 0.0, "no goal, no score");
+    }
+}

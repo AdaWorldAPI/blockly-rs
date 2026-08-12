@@ -20,3 +20,6 @@ ogar-loco = { workspace = true }
 # the dependency cannot leak into `blockly-abi` by accident — it would take a
 # manifest edit, not an import.
 serde_json = "1"
+
+[dev-dependencies]
+blockly-run = { path = "../blockly-run" }

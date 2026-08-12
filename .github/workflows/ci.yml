@@ -49,7 +49,7 @@ jobs:
       # workspace"). Each new member is added here explicitly.
       - name: cargo fmt --check (scoped — never --all across path deps)
         working-directory: blockly-rs
-        run: cargo fmt -p blockly-abi -p blockly-shim -p blockly-web --check
+        run: cargo fmt -p blockly-abi -p blockly-run -p blockly-shim -p blockly-web --check
       - name: cargo clippy -D warnings
         working-directory: blockly-rs
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -65,7 +65,7 @@ jobs:
         working-directory: blockly-rs
         env:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
-        run: cargo doc -p blockly-abi -p blockly-shim --no-deps
+        run: cargo doc -p blockly-abi -p blockly-run -p blockly-shim --no-deps
       # The executable no-second-vocabulary trap (ruling R1/Q6): after the
       # flip onto ogar-loco, consumer-local definitions of the generic ABI
       # symbols must NOT exist in this repo. Re-exports (`use`) are fine —
