@@ -783,9 +783,44 @@ pub mod emit {
     }
 
     /// Render top-level scripts as a Blockly workspace save.
+    ///
+    /// # Where the coordinates come from
+    ///
+    /// They are INVENTED HERE, and that is the correct place. `x`/`y` are
+    /// presentation: the ABI excludes them on purpose — *"moving a block 40
+    /// pixels must not touch the ABI"* is the arc's W1 falsifier — so stored
+    /// nodes carry no layout at all.
+    ///
+    /// Which means a raised program has nowhere to get one, and without this
+    /// every top-level script lands at (0,0) and they stack into an unreadable
+    /// pile. That is not hypothetical: the deployed demo rendered Pong's three
+    /// scripts on top of each other.
+    ///
+    /// So the membrane assigns a layout when it renders, exactly as it
+    /// assigns JSON — a projection detail produced on demand, never stored.
+    /// The spacing is a plain column; a real editor would let the user move
+    /// them, and moving them still would not touch the bytes.
     #[must_use]
     pub fn to_workspace_json(scripts: &[BlockRecord]) -> String {
-        let blocks: Vec<Value> = scripts.iter().map(block_json).collect();
+        /// Horizontal inset, and the vertical step between scripts. Generous
+        /// enough that a tall script (Pong's ball is a `forever` holding an
+        /// `if`) does not overlap the next one.
+        const X: i64 = 40;
+        const Y0: i64 = 30;
+        const DY: i64 = 260;
+
+        let blocks: Vec<Value> = scripts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut v = block_json(s);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("x".into(), Value::from(X));
+                    o.insert("y".into(), Value::from(Y0 + DY * i as i64));
+                }
+                v
+            })
+            .collect();
         serde_json::json!({"blocks": {"languageVersion": 0, "blocks": blocks}}).to_string()
     }
 }
@@ -902,5 +937,79 @@ mod pong_runs {
         miss.stage.touching = false;
         miss.run().expect("runs");
         assert_eq!(miss.stage.var, 0.0, "no goal, no score");
+    }
+}
+
+#[cfg(test)]
+mod layout {
+    use super::templates;
+
+    /// Raised scripts get DISTINCT coordinates, so they cannot stack.
+    ///
+    /// Regression: the deployed demo rendered Pong's three scripts on top of
+    /// one another, because stored nodes carry no layout (correctly — `x`/`y`
+    /// are presentation and the ABI excludes them) and the emit assigned
+    /// none. Two-sided: every script must have a position AND no two may
+    /// share one, which a constant offset would fail.
+    #[test]
+    fn emitted_scripts_are_laid_out_and_never_overlap() {
+        let scripts = templates::raise_nodes(templates::PONG_NODES).expect("raises");
+        assert_eq!(scripts.len(), 3);
+        let json = super::emit::to_workspace_json(&scripts);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let blocks = v["blocks"]["blocks"].as_array().unwrap();
+
+        let mut seen: Vec<(i64, i64)> = Vec::new();
+        for (i, b) in blocks.iter().enumerate() {
+            let x = b["x"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("script {i} has no x"));
+            let y = b["y"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("script {i} has no y"));
+            assert!(
+                !seen.contains(&(x, y)),
+                "script {i} shares position ({x},{y}) with an earlier script"
+            );
+            seen.push((x, y));
+        }
+        // …and they are separated enough to be readable, not merely distinct.
+        let mut ys: Vec<i64> = seen.iter().map(|(_, y)| *y).collect();
+        ys.sort_unstable();
+        for w in ys.windows(2) {
+            assert!(
+                w[1] - w[0] >= 200,
+                "scripts {} and {} are too close",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Layout is PRESENTATION: it must not reach the stored bytes.
+    ///
+    /// The arc's W1 falsifier says moving a block 40 pixels must not touch the
+    /// ABI. Assigning coordinates at the membrane is only safe if that still
+    /// holds, so this proves the emitted layout casts to the same program.
+    #[test]
+    fn the_assigned_layout_does_not_change_the_program() {
+        use blockly_abi::lower_program;
+        use ogar_loco::LaneShape;
+
+        let scripts = templates::raise_nodes(templates::PONG_NODES).expect("raises");
+        let json = super::emit::to_workspace_json(&scripts);
+        let reread = super::from_workspace_json(&json).expect("parses");
+
+        for (i, (a, b)) in scripts.iter().zip(reread.iter()).enumerate() {
+            let x = lower_program(LaneShape::Pairs, a).expect("casts");
+            let y = lower_program(LaneShape::Pairs, b).expect("casts");
+            for (f, (p, q)) in x.functions.iter().zip(y.functions.iter()).enumerate() {
+                assert_eq!(
+                    p.as_body_bytes(),
+                    q.as_body_bytes(),
+                    "script {i} fn {f}: layout leaked into the program"
+                );
+            }
+        }
     }
 }

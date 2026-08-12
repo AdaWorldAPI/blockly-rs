@@ -16,8 +16,6 @@ const INK: &str = "#333333";
 const BG: &str = "#f9f9f9";
 const EDGE: &str = "#88888844";
 const GRID: &str = "#88888822";
-const MUTED: &str = "#666666";
-const MONO: &str = "ui-monospace,monospace";
 
 /// Draw the stage. Scratch coordinates (centre origin, y up) map to SVG's
 /// top-left origin with y down, which is the one conversion this does.
@@ -44,13 +42,18 @@ pub fn svg(stage: &Stage, ran: bool) -> String {
         String::new()
     };
 
+    // The stats live OUTSIDE the SVG. Inside, they inherit the viewBox
+    // scaling — a 480-wide stage squeezed into a panel renders 11px text at
+    // roughly a third of that, which is what the deployed page showed:
+    // present, and unreadable. HTML below the picture stays at page size.
     let note = if ran {
         format!(
-            "x {:.0}  y {:.0}  dir {:.0}°  var {:.0}  t {:.2}s",
+            "<code>x {:.0}</code> <code>y {:.0}</code> <code>dir {:.0}°</code> \
+             <code>var {:.0}</code> <code>t {:.2}s</code>",
             stage.x, stage.y, stage.direction, stage.var, stage.timer
         )
     } else {
-        "not run".to_string()
+        "<span class=\"muted\">not run</span>".to_string()
     };
 
     format!(
@@ -58,11 +61,10 @@ pub fn svg(stage: &Stage, ran: bool) -> String {
          style=\"max-height:240px;background:{BG};border:1px solid {EDGE};border-radius:6px\">\n  \
          <line x1=\"{hw}\" y1=\"0\" x2=\"{hw}\" y2=\"{h}\" stroke=\"{GRID}\"/>\n  \
          <line x1=\"0\" y1=\"{hh}\" x2=\"{w}\" y2=\"{hh}\" stroke=\"{GRID}\"/>\n  \
-         {body}\n  \
-         <text x=\"6\" y=\"{ty}\" font-family=\"{MONO}\" font-size=\"11\" fill=\"{MUTED}\">{note}</text>\n\
-         </svg>",
+         {body}\n\
+         </svg>\n\
+         <div class=\"stage-stats\">{note}</div>",
         hw = stage.half_w,
-        hh = stage.half_h,
-        ty = h - 6.0
+        hh = stage.half_h
     )
 }
