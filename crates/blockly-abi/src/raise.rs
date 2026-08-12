@@ -16,9 +16,9 @@
 //! Lowering is a post-order walk: operands before the operator, statements in
 //! sequence, nested bodies by reference. Raising replays that on a stack:
 //!
-//! - pop [`stack_arity`] operands — they are the calls already emitted, so
+//! - pop [`shared_core::stack_arity`] operands — they are the calls already emitted, so
 //!   they are on the stack in the order the block declares its inputs;
-//! - take the first [`body_refs`] value bytes as FUNCTION INDICES (the same
+//! - take the first [`shared_core::body_refs`] value bytes as FUNCTION INDICES (the same
 //!   `values[..n]` carving `branches_of` reads) and raise each as a statement
 //!   input;
 //! - if the call pushes a result it is an expression → push it back; otherwise
