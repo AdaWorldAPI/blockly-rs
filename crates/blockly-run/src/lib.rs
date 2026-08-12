@@ -42,23 +42,57 @@ use blockly_abi::scratch;
 use ogar_loco::vocabulary::shared_core;
 use ogar_loco::{FnIndex, FunctionBody};
 
-/// The stage a program acts on.
-///
-/// Deliberately tiny and concrete: one sprite plus the few globals the
-/// reference game reads. A general sprite model is a bigger design than the
-/// demo needs, and inventing one here would be scope this cannot test.
+/// What a sprite looks like. Presentation only — the program never reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Look {
+    /// A round ball.
+    Ball,
+    /// A tall paddle.
+    Paddle,
+}
+
+/// One actor on the stage.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Stage {
-    /// Sprite position, Scratch coordinates (centre origin, y up).
+pub struct Sprite {
+    /// Position, Scratch coordinates (centre origin, y up).
     pub x: f32,
-    /// Sprite position.
+    /// Position.
     pub y: f32,
     /// Heading in degrees, Scratch convention: 90 = right, 0 = up.
     pub direction: f32,
-    /// Whether the sprite draws.
+    /// Whether it draws.
     pub visible: bool,
-    /// Sprite scale, percent.
+    /// Scale, percent.
     pub size: f32,
+    /// How it is drawn.
+    pub look: Look,
+}
+
+impl Default for Sprite {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            direction: 90.0,
+            visible: true,
+            size: 100.0,
+            look: Look::Ball,
+        }
+    }
+}
+
+/// The stage a program acts on.
+///
+/// Several sprites, because a one-sprite stage cannot BE Pong: the ball and
+/// the paddle are two actors driven by two concurrent scripts, and running
+/// each script against its own private stage produced exactly what the deploy
+/// showed — a single dot in an empty grid, with the paddle nowhere.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stage {
+    /// Every actor. Scripts address one by index.
+    pub sprites: Vec<Sprite>,
+    /// Which sprite the currently-running script controls.
+    pub current: usize,
     /// The single variable the demo scores with.
     pub var: f32,
     /// Mouse position the sensing reporters return.
@@ -78,11 +112,8 @@ pub struct Stage {
 impl Default for Stage {
     fn default() -> Self {
         Self {
-            x: 0.0,
-            y: 0.0,
-            direction: 90.0,
-            visible: true,
-            size: 100.0,
+            sprites: vec![Sprite::default()],
+            current: 0,
             var: 0.0,
             mouse_x: 0.0,
             mouse_y: 0.0,
@@ -90,6 +121,37 @@ impl Default for Stage {
             touching: false,
             half_w: 240.0,
             half_h: 180.0,
+        }
+    }
+}
+
+impl Stage {
+    /// The sprite the running script controls.
+    #[must_use]
+    pub fn me(&self) -> &Sprite {
+        &self.sprites[self.current.min(self.sprites.len() - 1)]
+    }
+
+    /// A Pong scene: a ball in the middle, a paddle at the right edge.
+    ///
+    /// The looks and starting positions are PRESENTATION — the program never
+    /// reads them, it only moves whatever sprite it was bound to.
+    #[must_use]
+    pub fn pong() -> Self {
+        Self {
+            sprites: vec![
+                Sprite {
+                    look: Look::Ball,
+                    direction: 62.0,
+                    ..Sprite::default()
+                },
+                Sprite {
+                    look: Look::Paddle,
+                    x: 210.0,
+                    ..Sprite::default()
+                },
+            ],
+            ..Self::default()
         }
     }
 }
@@ -128,9 +190,36 @@ pub struct Machine<'a> {
     pub stage: Stage,
     functions: &'a [FunctionBody],
     budget: u32,
+    /// Sampled stage snapshots — the run's TRACE, not its result.
+    ///
+    /// A run that only reports its final stage cannot show motion: the demo
+    /// rendered one frame and looked static, which is exactly what a program
+    /// that did nothing would look like. Recording the intermediate states
+    /// lets the renderer show the path the program actually took.
+    trace: Vec<Stage>,
+    every: u32,
+    counter: u32,
 }
 
 impl<'a> Machine<'a> {
+    /// Continue a run on an EXISTING stage, as a given sprite.
+    ///
+    /// The scheduler uses this to give each script a slice of time against
+    /// the shared scene, which is what makes two scripts appear to run at
+    /// once.
+    #[must_use]
+    pub fn resuming(
+        functions: &'a [FunctionBody],
+        budget: u32,
+        stage: Stage,
+        sprite: usize,
+    ) -> Self {
+        let mut m = Self::new(functions, budget);
+        m.stage = stage;
+        m.stage.current = sprite;
+        m
+    }
+
     /// Start a run over a program's function bodies.
     ///
     /// `budget` bounds the total number of calls executed, so a `forever`
@@ -141,7 +230,29 @@ impl<'a> Machine<'a> {
             stage: Stage::default(),
             functions,
             budget,
+            trace: Vec::new(),
+            every: 0,
+            counter: 0,
         }
+    }
+
+    /// Record a stage snapshot every `n` calls, for rendering the motion.
+    ///
+    /// Off by default: tracing is a property of the OBSERVATION, not of the
+    /// program, and a caller that only wants the final stage should not pay
+    /// for a trace it never reads.
+    #[must_use]
+    pub fn tracing_every(mut self, n: u32) -> Self {
+        self.every = n.max(1);
+        self.trace.push(self.stage.clone());
+        self
+    }
+
+    /// The sampled snapshots, oldest first. Empty unless [`Self::tracing_every`]
+    /// was set.
+    #[must_use]
+    pub fn trace(&self) -> &[Stage] {
+        &self.trace
     }
 
     /// Run the entry function until the budget is spent.
@@ -165,6 +276,13 @@ impl<'a> Machine<'a> {
                 return Ok(());
             }
             self.budget -= 1;
+            if self.every > 0 {
+                self.counter += 1;
+                if self.counter >= self.every {
+                    self.counter = 0;
+                    self.trace.push(self.stage.clone());
+                }
+            }
 
             let f = call.function;
             let refs = usize::from(shared_core::body_refs(f));
@@ -174,9 +292,12 @@ impl<'a> Machine<'a> {
                 let target = usize::from(call.values.first().copied().unwrap_or(0));
                 match f {
                     FnIndex::FOREVER => {
+                        // No tick here: the SCENE advances the clock once per
+                        // round. Ticking per loop iteration too counted the
+                        // same time twice and reported t = 480 s for a run of
+                        // 240 frames.
                         while self.budget > 0 {
                             self.exec(target)?;
-                            self.tick();
                         }
                     }
                     FnIndex::IF => {
@@ -209,7 +330,6 @@ impl<'a> Machine<'a> {
                         if (c != 0.0) == want {
                             while self.budget > 0 {
                                 self.exec(target)?;
-                                self.tick();
                             }
                         }
                     }
@@ -238,18 +358,12 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    fn tick(&mut self) {
-        self.timer_advance();
-    }
-
-    fn timer_advance(&mut self) {
-        self.stage.timer += 1.0 / 30.0;
-    }
-
     /// Apply one non-branching call. `Some(v)` means it yielded a value.
     fn apply(&mut self, f: FnIndex, ops: &[f32], imm: f32) -> Result<Option<f32>, RunError> {
         let a = |i: usize| ops.get(i).copied().unwrap_or(0.0);
         let s = &mut self.stage;
+        // Motion/looks act on the sprite this script is bound to.
+        let me = s.current.min(s.sprites.len() - 1);
 
         // Shared core first — one table, both frontends.
         let core = match f {
@@ -292,75 +406,82 @@ impl<'a> Machine<'a> {
         match name {
             "event_whenflagclicked" | "event_whenthisspriteclicked" => Ok(None),
             "motion_movesteps" => {
-                let r = s.direction.to_radians();
-                s.x += a(0) * r.sin();
-                s.y += a(0) * r.cos();
+                let r = s.sprites[me].direction.to_radians();
+                s.sprites[me].x += a(0) * r.sin();
+                s.sprites[me].y += a(0) * r.cos();
                 Ok(None)
             }
             "motion_turnright" => {
-                s.direction += a(0);
+                s.sprites[me].direction += a(0);
                 Ok(None)
             }
             "motion_turnleft" => {
-                s.direction -= a(0);
+                s.sprites[me].direction -= a(0);
                 Ok(None)
             }
             "motion_pointindirection" => {
-                s.direction = a(0);
+                s.sprites[me].direction = a(0);
                 Ok(None)
             }
             "motion_gotoxy" => {
-                s.x = a(0);
-                s.y = a(1);
+                s.sprites[me].x = a(0);
+                s.sprites[me].y = a(1);
                 Ok(None)
             }
             "motion_setx" => {
-                s.x = a(0);
+                s.sprites[me].x = a(0);
                 Ok(None)
             }
             "motion_sety" => {
-                s.y = a(0);
+                s.sprites[me].y = a(0);
                 Ok(None)
             }
             "motion_changexby" => {
-                s.x += a(0);
+                s.sprites[me].x += a(0);
                 Ok(None)
             }
             "motion_changeyby" => {
-                s.y += a(0);
+                s.sprites[me].y += a(0);
                 Ok(None)
             }
             "motion_ifonedgebounce" => {
-                if s.x.abs() >= s.half_w {
-                    s.direction = -s.direction;
-                    s.x = s.x.clamp(-s.half_w, s.half_w);
+                // Clamp strictly INSIDE the edge. Clamping to exactly the
+                // boundary leaves `abs() >= half` true on the next call, so
+                // the sprite flips direction every frame and sticks to the
+                // wall — measured: the ball ended pinned at y = half_h.
+                const INSET: f32 = 1.0;
+                if s.sprites[me].x.abs() >= s.half_w {
+                    s.sprites[me].direction = -s.sprites[me].direction;
+                    let lim = s.half_w - INSET;
+                    s.sprites[me].x = s.sprites[me].x.clamp(-lim, lim);
                 }
-                if s.y.abs() >= s.half_h {
-                    s.direction = 180.0 - s.direction;
-                    s.y = s.y.clamp(-s.half_h, s.half_h);
+                if s.sprites[me].y.abs() >= s.half_h {
+                    s.sprites[me].direction = 180.0 - s.sprites[me].direction;
+                    let lim = s.half_h - INSET;
+                    s.sprites[me].y = s.sprites[me].y.clamp(-lim, lim);
                 }
                 Ok(None)
             }
-            "motion_xposition" => Ok(Some(s.x)),
-            "motion_yposition" => Ok(Some(s.y)),
-            "motion_direction" => Ok(Some(s.direction)),
+            "motion_xposition" => Ok(Some(s.sprites[me].x)),
+            "motion_yposition" => Ok(Some(s.sprites[me].y)),
+            "motion_direction" => Ok(Some(s.sprites[me].direction)),
             "looks_show" => {
-                s.visible = true;
+                s.sprites[me].visible = true;
                 Ok(None)
             }
             "looks_hide" => {
-                s.visible = false;
+                s.sprites[me].visible = false;
                 Ok(None)
             }
             "looks_changesizeby" => {
-                s.size += a(0);
+                s.sprites[me].size += a(0);
                 Ok(None)
             }
             "looks_setsizeto" => {
-                s.size = a(0);
+                s.sprites[me].size = a(0);
                 Ok(None)
             }
-            "looks_size" => Ok(Some(s.size)),
+            "looks_size" => Ok(Some(s.sprites[me].size)),
             // A costume switch has no visual model here; it is a real op with
             // no effect on this stage, which is different from unimplemented.
             "looks_nextcostume" | "looks_nextbackdrop" => Ok(None),
@@ -380,6 +501,103 @@ impl<'a> Machine<'a> {
 
 fn pop(stack: &mut Vec<f32>, f: FnIndex) -> Result<f32, RunError> {
     stack.pop().ok_or(RunError::StackUnderflow(f.0))
+}
+
+/// Several scripts sharing one stage — the thing that makes a scene.
+///
+/// # Why a scheduler at all
+///
+/// Running each script to completion on its own stage is what the demo did
+/// first, and it produced a frozen dot: the ball script never saw the paddle,
+/// the paddle script's result was discarded, and only one sprite was ever
+/// drawn. Pong is two concurrent scripts over one scene, so the runner has to
+/// be too.
+///
+/// # How concurrency is approximated, honestly
+///
+/// The interpreter is recursive, not resumable — it cannot be paused mid-body
+/// and continued. So instead of pretending, each round gives every script a
+/// SLICE of calls against the shared stage, restarting that script's own
+/// entry each time. A `forever` therefore advances a little per round, which
+/// is exactly the visible behaviour a cooperative scheduler produces, and the
+/// stage carries the accumulated state across rounds.
+///
+/// It is an approximation, and it is written down as one: a script whose
+/// prologue does real work before its loop would re-run that prologue each
+/// round. Pong's scripts are `hat → forever { … }`, where the prologue is the
+/// hat, so the approximation is exact for them.
+pub struct Scene<'a> {
+    /// The shared stage every script acts on.
+    pub stage: Stage,
+    scripts: Vec<&'a [FunctionBody]>,
+    trace: Vec<Stage>,
+    /// Simulated pointer travel, in stage units per round.
+    ///
+    /// The mouse is an INPUT. Held constant, a paddle that tracks it has
+    /// nothing to track and renders as two positions — which reads as frozen,
+    /// and was: the demo showed a motionless paddle because the input never
+    /// changed, not because the program was wrong. A demo therefore has to
+    /// supply an input, and this makes that explicit rather than pretending
+    /// the stage moves it.
+    mouse_sweep: f32,
+}
+
+impl<'a> Scene<'a> {
+    /// Build a scene from one program per sprite.
+    #[must_use]
+    pub fn new(stage: Stage, scripts: Vec<&'a [FunctionBody]>) -> Self {
+        Self {
+            stage,
+            scripts,
+            trace: Vec::new(),
+            mouse_sweep: 0.0,
+        }
+    }
+
+    /// Sweep the simulated pointer up and down while the scene runs.
+    ///
+    /// `amplitude` is how far it travels from centre. Zero (the default)
+    /// leaves the mouse wherever the caller put it.
+    #[must_use]
+    pub fn with_mouse_sweep(mut self, amplitude: f32) -> Self {
+        self.mouse_sweep = amplitude;
+        self
+    }
+
+    /// Run `rounds` rounds, giving each script `slice` calls per round, and
+    /// record one trace frame per round.
+    ///
+    /// # Errors
+    ///
+    /// The first refusal any script raises, so a broken program is named
+    /// rather than silently producing a stage that merely looks still.
+    pub fn run(&mut self, rounds: u32, slice: u32) -> Result<(), RunError> {
+        self.trace.push(self.stage.clone());
+        for round in 0..rounds {
+            // Move the simulated pointer BEFORE the scripts read it, so a
+            // paddle that tracks the mouse sees a fresh value each round.
+            if self.mouse_sweep != 0.0 {
+                let phase = f32::from(u16::try_from(round % 1000).unwrap_or(0));
+                self.stage.mouse_y = (phase * 0.07).sin() * self.mouse_sweep;
+            }
+            for (i, script) in self.scripts.iter().enumerate() {
+                let stage = core::mem::take(&mut self.stage);
+                let mut m = Machine::resuming(script, slice, stage, i);
+                let outcome = m.run();
+                self.stage = m.stage;
+                outcome?;
+            }
+            self.stage.timer += 1.0 / 30.0;
+            self.trace.push(self.stage.clone());
+        }
+        Ok(())
+    }
+
+    /// One stage snapshot per round, oldest first.
+    #[must_use]
+    pub fn trace(&self) -> &[Stage] {
+        &self.trace
+    }
 }
 
 #[cfg(test)]
@@ -443,8 +661,16 @@ mod tests {
 
         let mut m = Machine::new(&prog.functions, 1000);
         m.run().expect("runs");
-        assert!((m.stage.x - 10.0).abs() < 0.01, "x = {}", m.stage.x);
-        assert!(m.stage.y.abs() < 0.01, "y = {}", m.stage.y);
+        assert!(
+            (m.stage.sprites[0].x - 10.0).abs() < 0.01,
+            "x = {}",
+            m.stage.sprites[0].x
+        );
+        assert!(
+            m.stage.sprites[0].y.abs() < 0.01,
+            "y = {}",
+            m.stage.sprites[0].y
+        );
 
         // Can-stay-silent: a program that moves nothing leaves the stage at
         // its default, so the assertion above measures the RUN, not the
@@ -456,7 +682,7 @@ mod tests {
         .expect("casts");
         let mut m2 = Machine::new(&idle.functions, 1000);
         m2.run().expect("runs");
-        assert_eq!(m2.stage.x, 0.0);
+        assert_eq!(m2.stage.sprites[0].x, 0.0);
     }
 
     /// `forever` terminates on the budget, and the budget bounds the RUN only.
@@ -488,12 +714,12 @@ mod tests {
         let mut large = Machine::new(&prog.functions, 200);
         large.run().expect("runs");
 
-        assert!(small.stage.x > 0.0, "the loop must actually run");
+        assert!(small.stage.sprites[0].x > 0.0, "the loop must actually run");
         assert!(
-            large.stage.x > small.stage.x,
+            large.stage.sprites[0].x > small.stage.sprites[0].x,
             "a bigger budget must run longer: {} vs {}",
-            large.stage.x,
-            small.stage.x
+            large.stage.sprites[0].x,
+            small.stage.sprites[0].x
         );
     }
 

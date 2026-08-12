@@ -913,10 +913,10 @@ mod pong_runs {
         let mut m = Machine::new(&ball.functions, 400);
         m.run().expect("the ball script runs");
         assert!(
-            m.stage.x != 0.0 || m.stage.y != 0.0,
+            m.stage.sprites[0].x != 0.0 || m.stage.sprites[0].y != 0.0,
             "the ball must have moved: ({}, {})",
-            m.stage.x,
-            m.stage.y
+            m.stage.sprites[0].x,
+            m.stage.sprites[0].y
         );
 
         // Script 1 — the paddle follows the mouse.
@@ -924,7 +924,10 @@ mod pong_runs {
         let mut p = Machine::new(&paddle.functions, 200);
         p.stage.mouse_y = 42.0;
         p.run().expect("the paddle script runs");
-        assert_eq!(p.stage.y, 42.0, "the paddle must track the mouse");
+        assert_eq!(
+            p.stage.sprites[0].y, 42.0,
+            "the paddle must track the mouse"
+        );
 
         // Script 2 — scoring, and it must NOT score when nothing is touched.
         let score = lower_program(LaneShape::Pairs, &scripts[2]).expect("casts");
@@ -1011,5 +1014,124 @@ mod layout {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pong_scene {
+    use super::templates;
+    use blockly_abi::lower_program;
+    use blockly_run::{Scene, Stage};
+    use ogar_loco::LaneShape;
+
+    /// Pong is a SCENE: ball and paddle both move, together, and the ball's
+    /// path actually varies over time.
+    ///
+    /// Regression for what the deploy showed — "a frozen coordinate system
+    /// with a very small frozen paddle". Three separate causes, all asserted
+    /// here: the scripts must share one stage (so both sprites exist), they
+    /// must interleave (so both move), and the trace must contain DISTINCT
+    /// positions (so it is motion, not one repeated frame).
+    #[test]
+    fn pong_is_a_scene_where_both_sprites_move() {
+        let scripts = templates::raise_nodes(templates::PONG_NODES).expect("raises");
+        let progs: Vec<_> = scripts
+            .iter()
+            .map(|s| lower_program(LaneShape::Pairs, s).expect("casts"))
+            .collect();
+        let bodies: Vec<&[ogar_loco::FunctionBody]> =
+            progs.iter().map(|p| p.functions.as_slice()).collect();
+
+        // A sweeping pointer: a paddle that tracks a CONSTANT mouse has
+        // nothing to track and renders as two positions, which reads as
+        // frozen. The input is simulated, and named as such.
+        let mut scene = Scene::new(Stage::pong(), bodies).with_mouse_sweep(120.0);
+        scene.run(120, 40).expect("the scene runs");
+
+        let t = scene.trace();
+        assert!(t.len() > 10, "the trace must have frames: {}", t.len());
+
+        // The BALL moved.
+        let ball_xs: Vec<f32> = t.iter().map(|s| s.sprites[0].x).collect();
+        assert!(
+            ball_xs.iter().any(|x| (x - ball_xs[0]).abs() > 1.0),
+            "the ball never moved: {ball_xs:?}"
+        );
+        // …and it did not merely jump once and stop: several distinct
+        // positions, which is what makes it an animation.
+        let distinct = {
+            let mut v: Vec<i32> = ball_xs.iter().map(|x| *x as i32).collect();
+            v.sort_unstable();
+            v.dedup();
+            v.len()
+        };
+        assert!(
+            distinct > 5,
+            "the ball has only {distinct} distinct positions"
+        );
+
+        // The ball is still moving at the END of the run, not just at the
+        // start. Regression: clamping a bounce to EXACTLY the edge left the
+        // `abs() >= half` test true forever, so the ball flipped direction
+        // every frame and stuck to the wall — a run that starts lively and
+        // freezes would pass the assertions above.
+        let tail = &t[t.len() * 3 / 4..];
+        let tail_distinct = {
+            let mut v: Vec<i32> = tail.iter().map(|s| s.sprites[0].x as i32).collect();
+            v.sort_unstable();
+            v.dedup();
+            v.len()
+        };
+        assert!(
+            tail_distinct > tail.len() / 4,
+            "the ball stalls late in the run: {tail_distinct} distinct of {} frames",
+            tail.len()
+        );
+        // …and it is CONTAINED: it may overshoot by at most one step, because
+        // a trace frame can land between `movesteps` and `ifonedgebounce` —
+        // after the step, before the correction. What must not happen is
+        // drifting away, so the bound is one step and the run must END inside.
+        //
+        // Measured rather than assumed: the first version of this assertion
+        // demanded `<= half_h` exactly and failed at y = -181.55, which is
+        // sampling, not escape.
+        const OVERSHOOT: f32 = 8.0;
+        for s in t {
+            assert!(
+                s.sprites[0].y.abs() <= s.half_h + OVERSHOOT,
+                "the ball escaped the stage: y = {}",
+                s.sprites[0].y
+            );
+            assert!(
+                s.sprites[0].x.abs() <= s.half_w + OVERSHOOT,
+                "the ball escaped the stage: x = {}",
+                s.sprites[0].x
+            );
+        }
+        let end = &t[t.len() - 1].sprites[0];
+        assert!(
+            end.y.abs() <= t[0].half_h && end.x.abs() <= t[0].half_w,
+            "the run must end inside the stage: ({}, {})",
+            end.x,
+            end.y
+        );
+
+        // The PADDLE moved too, in the SAME scene — this is the half that was
+        // impossible before, because the paddle script ran on its own stage.
+        assert!(
+            scene.stage.sprites.len() >= 2,
+            "the scene needs both actors"
+        );
+        let paddle_ys: Vec<f32> = t.iter().map(|s| s.sprites[1].y).collect();
+        let paddle_distinct = {
+            let mut v: Vec<i32> = paddle_ys.iter().map(|y| *y as i32).collect();
+            v.sort_unstable();
+            v.dedup();
+            v.len()
+        };
+        assert!(
+            paddle_distinct > 5,
+            "the paddle barely moves: {paddle_distinct} distinct positions"
+        );
     }
 }

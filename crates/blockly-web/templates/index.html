@@ -38,8 +38,8 @@
     </select>
   </label>
   <button id="run" type="button" title="Execute the STORED BYTES — the interpreter reads function-body call rails, never blocks">▶ run</button>
-  <label title="How many calls the run may execute; this is what bounds `forever`">budget
-    <input id="budget" type="number" value="600" min="1" max="200000" step="100" style="width:6.5em">
+  <label title="Scheduler rounds — one animation frame each">frames
+    <input id="budget" type="number" value="240" min="2" max="2000" step="20" style="width:6em">
   </label>
   <label title="What sensing_touchingobject answers"><input id="touching" type="checkbox"> touching</label>
   <button id="loadPong" type="button" title="A built-in reference program, compiled into blockly-shim and cast in its tests">load Pong</button>
@@ -190,7 +190,7 @@ async function runProgram() {
   const save = Blockly.serialization.workspaces.save(workspace);
   const q = new URLSearchParams({
     shape: document.getElementById("shape").value,
-    budget: document.getElementById("budget").value,
+    rounds: document.getElementById("budget").value,
     touching: document.getElementById("touching").checked,
     mouse_y: "40",
   });
