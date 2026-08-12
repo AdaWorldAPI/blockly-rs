@@ -141,10 +141,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blockly-run"
+version = "0.1.0"
+dependencies = [
+ "blockly-abi",
+ "ogar-loco",
+]
+
+[[package]]
 name = "blockly-shim"
 version = "0.1.0"
 dependencies = [
  "blockly-abi",
+ "blockly-run",
  "ogar-loco",
  "serde_json",
 ]
@@ -156,6 +165,7 @@ dependencies = [
  "askama",
  "axum",
  "blockly-abi",
+ "blockly-run",
  "blockly-shim",
  "ogar-a2ui-frame",
  "ogar-loco",

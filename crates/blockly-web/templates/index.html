@@ -35,6 +35,11 @@
       <option value="scratch">Scratch — 138 tiles, 94 device mints</option>
     </select>
   </label>
+  <button id="run" type="button" title="Execute the STORED BYTES — the interpreter reads function-body call rails, never blocks">▶ run</button>
+  <label title="How many calls the run may execute; this is what bounds `forever`">budget
+    <input id="budget" type="number" value="600" min="1" max="200000" step="100" style="width:6.5em">
+  </label>
+  <label title="What sensing_touchingobject answers"><input id="touching" type="checkbox"> touching</label>
   <button id="loadPong" type="button" title="A built-in reference program, compiled into blockly-shim and cast in its tests">load Pong</button>
   <label>lane shape
     <select id="shape">
@@ -47,6 +52,7 @@
 <main>
   <div id="blocklyDiv"></div>
   <div id="panels">
+    <section><h2>stage</h2><div id="stage" class="muted">press ▶ run — the interpreter executes the stored bytes, not the blocks</div></section>
     <section><h2>substrate</h2><div id="substrate" class="muted">cast something to read the live plug</div></section>
     <section><h2>refusals</h2><div id="errors" class="muted">none — the cast accepted everything on the canvas</div></section>
     <section><h2>scripts</h2><div id="scripts" class="muted">drag a block to begin</div></section>
@@ -176,6 +182,26 @@ document.getElementById("dialect").addEventListener("change", boot);
 // The reference game. Loading it switches to the Scratch palette first —
 // Pong is Scratch blocks, so the definitions must exist before the workspace
 // can be deserialized into them.
+// Run the STORED program. The stage SVG is rendered server-side from the
+// interpreter's own state, so the picture is the result of execution.
+async function runProgram() {
+  const save = Blockly.serialization.workspaces.save(workspace);
+  const q = new URLSearchParams({
+    shape: document.getElementById("shape").value,
+    budget: document.getElementById("budget").value,
+    touching: document.getElementById("touching").checked,
+    mouse_y: "40",
+  });
+  const res = await fetch("/api/run?" + q, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(save),
+  });
+  const el = document.getElementById("stage");
+  el.className = "";
+  el.innerHTML = await res.text();
+}
+document.getElementById("run").addEventListener("click", runProgram);
 document.getElementById("loadPong").addEventListener("click", async () => {
   const sel = document.getElementById("dialect");
   if (sel.value !== "scratch") { sel.value = "scratch"; await boot(); }

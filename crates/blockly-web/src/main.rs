@@ -11,6 +11,7 @@
 //! fallback — never hardcoded as the deploy port).
 
 mod cast;
+mod stage;
 mod surface;
 
 use askama::Template;
@@ -37,6 +38,18 @@ struct ToolboxQuery {
 struct TemplateQuery {
     /// Which built-in reference program to load.
     name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RunQuery {
+    /// Lane shape, as elsewhere.
+    shape: Option<String>,
+    /// How many calls the run may execute before it stops. Bounds `forever`.
+    budget: Option<u32>,
+    /// Mouse position the sensing reporters see.
+    mouse_y: Option<f32>,
+    /// Whether `sensing_touchingobject` answers true.
+    touching: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -226,6 +239,39 @@ async fn api_surface(Query(q): Query<CastQuery>, body: String) -> Result<Html<St
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// RUN the cast program and render the resulting stage.
+///
+/// The interpreter reads `FunctionBody` call rails — the stored bytes — so
+/// what this draws is the result of EXECUTING the program, not an animation
+/// of the block layout. That is the last step of the arc's claim: the node is
+/// not merely the storage form, it is the thing that runs.
+///
+/// `budget` bounds the run so a `forever` terminates. It is a property of the
+/// run, never of the program.
+async fn api_run(Query(q): Query<RunQuery>, body: String) -> Html<String> {
+    let shape = q.shape.as_deref().unwrap_or("pairs");
+    let budget = q.budget.unwrap_or(600).min(200_000);
+    let Some(prog) = cast::first_program(&body, shape) else {
+        return Html(stage::svg(&blockly_run::Stage::default(), false));
+    };
+    let mut m = blockly_run::Machine::new(&prog.functions, budget);
+    m.stage.mouse_y = q.mouse_y.unwrap_or(0.0);
+    m.stage.touching = q.touching.unwrap_or(false);
+    // A refusal is INFORMATION, not a failure to hide: the stage still draws,
+    // and the note says which operation stopped the run.
+    let note = match m.run() {
+        Ok(()) => None,
+        Err(e) => Some(e.to_string()),
+    };
+    let mut svg = stage::svg(&m.stage, true);
+    if let Some(n) = note {
+        svg.push_str(&format!(
+            "<p class=\"err\" style=\"margin:.3rem 0 0\">run stopped: {n}</p>"
+        ));
+    }
+    Html(svg)
+}
+
 fn blocks(types: &[&str]) -> Vec<serde_json::Value> {
     types
         .iter()
@@ -284,6 +330,7 @@ async fn main() {
         .route("/api/template", get(api_template))
         .route("/api/frame", post(api_frame))
         .route("/api/surface", post(api_surface))
+        .route("/api/run", post(api_run))
         .route("/api/cast", post(api_cast));
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)

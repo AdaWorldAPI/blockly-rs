@@ -17,6 +17,7 @@ ogar-loco = { workspace = true }
 ogar-a2ui-frame = { workspace = true }
 ogar-render-askama = { workspace = true }
 blockly-shim = { path = "../blockly-shim" }
+blockly-run = { path = "../blockly-run" }
 
 askama = "0.12"
 axum = "0.7"
