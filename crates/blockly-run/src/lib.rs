@@ -111,6 +111,11 @@ pub struct Stage {
     /// compares its operand — the index a `sensing_keyoptions` reporter pushed
     /// — against this; the `any` option matches any held key.
     pub key: Option<u8>,
+    /// The broadcast sent this round, as an `event_broadcast_menu` codebook
+    /// index (menu 23), or `None`. `event_broadcast` sets it; the scene's
+    /// wake mask reads it at the START of the next round to wake the
+    /// `event_whenbroadcastreceived` scripts that name it, then clears it.
+    pub broadcast: Option<u8>,
     /// Stage half-width — the edge `if on edge, bounce` reflects against.
     pub half_w: f32,
     /// Stage half-height.
@@ -128,6 +133,7 @@ impl Default for Stage {
             timer: 0.0,
             touching: false,
             key: None,
+            broadcast: None,
             half_w: 240.0,
             half_h: 180.0,
         }
@@ -285,6 +291,8 @@ enum Op {
     ResetTimer,
     Touching,
     MouseDown,
+    /// `event_broadcast`: its operand is the message's codebook index.
+    Broadcast,
 }
 
 /// The per-vocabulary execution plan: for every possible function byte, the
@@ -318,7 +326,8 @@ fn plan() -> &'static Plan {
                 match name {
                     "event_whenflagclicked"
                     | "event_whenthisspriteclicked"
-                    | "event_whenkeypressed" => Op::Hat,
+                    | "event_whenkeypressed"
+                    | "event_whenbroadcastreceived" => Op::Hat,
                     "sensing_keypressed" => Op::KeyPressed,
                     "looks_gotofrontback" | "looks_goforwardbackwardlayers" => Op::LayerNoop,
                     "motion_movesteps" => Op::MoveSteps,
@@ -346,11 +355,140 @@ fn plan() -> &'static Plan {
                     "sensing_resettimer" => Op::ResetTimer,
                     "sensing_touchingobject" | "sensing_touchingcolor" => Op::Touching,
                     "sensing_mousedown" => Op::MouseDown,
+                    "event_broadcast" | "event_broadcastandwait" => Op::Broadcast,
                     _ => Op::Unimplemented,
                 }
             };
         }
         Plan { op, arity }
+    })
+}
+
+/// What wakes a script: read ONCE off its entry's first call (its hat).
+///
+/// This is the participation mask idea from `ndarray`'s jitson
+/// (`ScanParams::focus_mask`: which dimensions take part, decided before the
+/// loop and baked, never re-asked per element) applied to scheduling. A
+/// Scratch project is mostly hats that are NOT firing — key hats for keys
+/// nobody holds, broadcast receivers for messages nobody sent — and the
+/// honest cost of a round is the scripts that ARE awake, not the script
+/// count. So the scene compiles, once, one bitmask per input value
+/// (`by_key[k]` = every script `when k pressed` wakes; `by_broadcast[b]`
+/// likewise) and per round ORs three masks and walks the set bits. A script
+/// the mask leaves clear costs zero calls and zero machine setup.
+///
+/// A script with no hat — a bare chain, the built-in templates' shape — is
+/// `Always`, which is exactly the pre-mask behaviour, so nothing that ran
+/// before stops running unless a hat says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    Always,
+    /// `event_whenkeypressed`: the `KEY_OPTION` index in the hat's immediate.
+    /// Index 0 (the empty selection) and the `any` option wake on any key.
+    Key(u8),
+    /// `event_whenbroadcastreceived`: the message index in the hat's
+    /// immediate.
+    Broadcast(u8),
+}
+
+impl Wake {
+    /// Read a script's wake condition off its entry's first call.
+    fn of_script(functions: &[FunctionBody]) -> Self {
+        let Some(head) = functions.first().and_then(|f| f.calls().next()) else {
+            return Self::Always;
+        };
+        match scratch::device_by_byte(head.function.0) {
+            Some(("event_whenkeypressed", ..)) => Self::Key(head.values[0]),
+            Some(("event_whenbroadcastreceived", ..)) => Self::Broadcast(head.values[0]),
+            _ => Self::Always,
+        }
+    }
+}
+
+/// The baked wake masks of one scene: `u64` words over script indices.
+#[derive(Debug, Clone, Default)]
+struct WakeTable {
+    words: usize,
+    /// Scripts awake every round (no hat, or an always-on hat).
+    always: Vec<u64>,
+    /// Scripts that wake on ANY held key (`any`, or an unset key option).
+    any_key: Vec<u64>,
+    /// `(key index, mask)` for every key some script names.
+    by_key: Vec<(u8, Vec<u64>)>,
+    /// `(message index, mask)` for every message some script receives.
+    by_broadcast: Vec<(u8, Vec<u64>)>,
+}
+
+impl WakeTable {
+    fn build(scripts: &[&[FunctionBody]]) -> Self {
+        let words = scripts.len().div_ceil(64);
+        let any = blockly_abi::menus::menu_by_id(1)
+            .and_then(|m| blockly_abi::menus::encode(m, "any"))
+            .unwrap_or(0);
+        let mut t = Self {
+            words,
+            always: vec![0; words],
+            any_key: vec![0; words],
+            by_key: Vec::new(),
+            by_broadcast: Vec::new(),
+        };
+        fn set(mask: &mut [u64], i: usize) {
+            mask[i / 64] |= 1u64 << (i % 64);
+        }
+        fn entry(table: &mut Vec<(u8, Vec<u64>)>, k: u8, words: usize) -> &mut Vec<u64> {
+            if let Some(pos) = table.iter().position(|(key, _)| *key == k) {
+                return &mut table[pos].1;
+            }
+            table.push((k, vec![0; words]));
+            &mut table.last_mut().expect("just pushed").1
+        }
+        for (i, s) in scripts.iter().enumerate() {
+            match Wake::of_script(s) {
+                Wake::Always => set(&mut t.always, i),
+                Wake::Key(k) if k == 0 || k == any => set(&mut t.any_key, i),
+                Wake::Key(k) => set(entry(&mut t.by_key, k, words), i),
+                Wake::Broadcast(b) => set(entry(&mut t.by_broadcast, b, words), i),
+            }
+        }
+        t
+    }
+
+    /// The scripts awake this round, given the inputs: three ORs per word.
+    fn awake(&self, key: Option<u8>, broadcast: Option<u8>, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend_from_slice(&self.always);
+        if let Some(k) = key {
+            for (o, a) in out.iter_mut().zip(&self.any_key) {
+                *o |= a;
+            }
+            if let Some((_, m)) = self.by_key.iter().find(|(kk, _)| *kk == k) {
+                for (o, a) in out.iter_mut().zip(m) {
+                    *o |= a;
+                }
+            }
+        }
+        if let Some(b) = broadcast
+            && let Some((_, m)) = self.by_broadcast.iter().find(|(bb, _)| *bb == b)
+        {
+            for (o, a) in out.iter_mut().zip(m) {
+                *o |= a;
+            }
+        }
+    }
+}
+
+/// Walk the set bits of a word mask, lowest first.
+fn set_bits(mask: &[u64]) -> impl Iterator<Item = usize> + '_ {
+    mask.iter().enumerate().flat_map(|(w, &word)| {
+        let mut bits = word;
+        core::iter::from_fn(move || {
+            if bits == 0 {
+                return None;
+            }
+            let tz = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            Some(w * 64 + tz)
+        })
     })
 }
 
@@ -783,6 +921,14 @@ impl<'a> Machine<'a> {
                 Ok(None)
             }
             Op::Touching => Ok(Some(f32::from(s.touching))),
+            // The message index was pushed by the `event_broadcast_menu`
+            // reporter. Delivery is the scene's: receivers wake next round.
+            // (`and wait` cannot wait here — a slice is not a frame — so it
+            // sends and continues, which is the bounded reading.)
+            Op::Broadcast => {
+                s.broadcast = Some(a(0) as u8);
+                Ok(None)
+            }
             Op::MouseDown => Ok(Some(0.0)),
         }
     }
@@ -826,6 +972,10 @@ pub struct Scene<'a> {
     /// the unit is the sprite: cast all of a sprite's scripts against one
     /// `LoweringContext` and hand its pool here.
     pool: Option<&'a ogar_loco::ConstantPool>,
+    /// The baked participation masks — see [`Wake`].
+    wake: WakeTable,
+    /// Scratch space for the round's awake mask, reused every round.
+    awake: Vec<u64>,
     trace: Vec<Stage>,
     /// Simulated pointer travel, in stage units per round.
     ///
@@ -851,11 +1001,14 @@ impl<'a> Scene<'a> {
             .into_iter()
             .partition(|s| Procedure::of_script(s).is_some());
         let procs = defs.into_iter().filter_map(Procedure::of_script).collect();
+        let wake = WakeTable::build(&scheduled);
         Self {
             stage,
             scripts: scheduled,
             procs,
             pool: None,
+            awake: Vec::with_capacity(wake.words),
+            wake,
             trace: Vec::new(),
             mouse_sweep: 0.0,
             key_period: 0,
@@ -915,8 +1068,15 @@ impl<'a> Scene<'a> {
                 };
                 self.stage.key = blockly_abi::menus::encode(keys, code);
             }
+            // The participation mask for this round: decided ONCE from the
+            // inputs, before any script runs — a script whose hat is not
+            // firing costs nothing. The broadcast is consumed here: it was
+            // sent last round, its receivers wake this round.
+            self.wake
+                .awake(self.stage.key, self.stage.broadcast.take(), &mut self.awake);
             let procs = &self.procs;
-            for (i, script) in self.scripts.iter().enumerate() {
+            for i in set_bits(&self.awake) {
+                let script = self.scripts[i];
                 let stage = core::mem::take(&mut self.stage);
                 let mut m = Machine::resuming(script, slice, stage, i).with_procs(procs);
                 if let Some(pool) = self.pool {
@@ -936,6 +1096,15 @@ impl<'a> Scene<'a> {
     #[must_use]
     pub fn procedures(&self) -> &[Procedure<'a>] {
         &self.procs
+    }
+
+    /// How many scheduled scripts would run a round under these inputs —
+    /// the size of the participation mask, for measurement.
+    #[must_use]
+    pub fn awake_count(&self, key: Option<u8>, broadcast: Option<u8>) -> usize {
+        let mut m = Vec::with_capacity(self.wake.words);
+        self.wake.awake(key, broadcast, &mut m);
+        m.iter().map(|w| w.count_ones() as usize).sum()
     }
 
     /// One stage snapshot per round, oldest first.
@@ -1458,5 +1627,159 @@ mod tests {
 
         let mut bare = Machine::new(&prog.functions, 100);
         assert_eq!(bare.run(), Err(RunError::MissingConstant(idx)));
+    }
+
+    /// The participation mask, can-fire and can-stay-silent: two key-hat
+    /// scripts on two sprites, one key held — ONLY that key's sprite moves,
+    /// the other never runs (its motion would be visible). With no key held
+    /// neither runs, and a hat-less script runs regardless.
+    #[test]
+    fn a_key_hat_script_runs_only_while_its_key_is_held() {
+        use blockly_abi::menus;
+        let code = |c: &str| {
+            rec(
+                "event_whenkeypressed",
+                vec![("KEY_OPTION".into(), FieldValue::Code(c.into()))],
+                vec![],
+                vec![],
+                Some(rec(
+                    "motion_changexby",
+                    vec![],
+                    vec![("DX".into(), num(1))],
+                    vec![],
+                    None,
+                )),
+            )
+        };
+        let up = lower_program(LaneShape::Pairs, &code("up arrow")).unwrap();
+        let down = lower_program(LaneShape::Pairs, &code("down arrow")).unwrap();
+        let free = lower_program(
+            LaneShape::Pairs,
+            &rec(
+                "motion_changeyby",
+                vec![],
+                vec![("DY".into(), num(1))],
+                vec![],
+                None,
+            ),
+        )
+        .unwrap();
+        let keys = menus::menu_by_id(1).unwrap();
+        let k_up = menus::encode(keys, "up arrow");
+
+        let run = |key: Option<u8>| {
+            let stage = Stage {
+                sprites: vec![Sprite::default(); 3],
+                key,
+                ..Stage::default()
+            };
+            let mut scene = Scene::new(
+                stage,
+                vec![
+                    up.functions.as_slice(),
+                    down.functions.as_slice(),
+                    free.functions.as_slice(),
+                ],
+            );
+            scene.run(5, 100).unwrap();
+            (
+                scene.stage.sprites[0].x,
+                scene.stage.sprites[1].x,
+                scene.stage.sprites[2].y,
+                scene.awake_count(key, None),
+            )
+        };
+        // Up held: script 0 fires 5 rounds, script 1 never, the free one always.
+        assert_eq!(run(k_up), (5.0, 0.0, 5.0, 2));
+        // Nothing held: only the hat-less script runs.
+        assert_eq!(run(None), (0.0, 0.0, 5.0, 1));
+    }
+
+    /// A broadcast wakes its receiver on the NEXT round and nothing else:
+    /// the sender runs under a flag hat, the receiver moves once per
+    /// message, a receiver of a different message never moves.
+    #[test]
+    fn a_broadcast_wakes_its_receiver_next_round_and_no_other() {
+        use blockly_abi::menus;
+        let menu_leaf = |c: &str| {
+            rec(
+                "event_broadcast_menu",
+                vec![("BROADCAST_OPTION".into(), FieldValue::Code(c.into()))],
+                vec![],
+                vec![],
+                None,
+            )
+        };
+        let receiver = |c: &str| {
+            rec(
+                "event_whenbroadcastreceived",
+                vec![("BROADCAST_OPTION".into(), FieldValue::Code(c.into()))],
+                vec![],
+                vec![],
+                Some(rec(
+                    "motion_changexby",
+                    vec![],
+                    vec![("DX".into(), num(1))],
+                    vec![],
+                    None,
+                )),
+            )
+        };
+        // Two project broadcasts, interned into menu 23 of a project basin.
+        use ogar_loco::basin::BasinCodebooks;
+        let mut basin = BasinCodebooks::new();
+        let m = menus::menu_by_id(23).unwrap();
+        let mut b = menus::builder(
+            m,
+            ogar_loco::pool::placeholder::CONST_UTF8_INLINE,
+            menus::PLACEHOLDER_DIGEST_CLASSID,
+        )
+        .unwrap();
+        b.intern(ogar_loco::pool::placeholder::CONST_UTF8_INLINE, b"go")
+            .unwrap();
+        b.intern(ogar_loco::pool::placeholder::CONST_UTF8_INLINE, b"stop")
+            .unwrap();
+        basin.plug(b.seal()).unwrap();
+        let cast =
+            |r: &BlockRecord| blockly_abi::lower_program_in(LaneShape::Pairs, r, &basin).unwrap();
+        let sender = cast(&rec(
+            "event_whenflagclicked",
+            vec![],
+            vec![],
+            vec![],
+            Some(rec(
+                "event_broadcast",
+                vec![],
+                vec![("BROADCAST_INPUT".into(), menu_leaf("go"))],
+                vec![],
+                None,
+            )),
+        ));
+        let on_go = cast(&receiver("go"));
+        let on_stop = cast(&receiver("stop"));
+
+        let stage = Stage {
+            sprites: vec![Sprite::default(); 3],
+            ..Stage::default()
+        };
+        let mut scene = Scene::new(
+            stage,
+            vec![
+                sender.functions.as_slice(),
+                on_go.functions.as_slice(),
+                on_stop.functions.as_slice(),
+            ],
+        );
+        // Round 1: sender sends, no receiver awake yet (mask read at round start).
+        scene.run(1, 100).unwrap();
+        assert_eq!(scene.stage.sprites[1].x, 0.0, "a receiver wakes NEXT round");
+        // Round 2: `go` receiver wakes; the sender sends again.
+        scene.run(1, 100).unwrap();
+        assert_eq!(scene.stage.sprites[1].x, 1.0);
+        assert_eq!(scene.stage.sprites[2].x, 0.0, "`stop` was never sent");
+        // Steady state: one wake per message.
+        scene.run(3, 100).unwrap();
+        assert_eq!(scene.stage.sprites[1].x, 4.0);
+        assert_eq!(scene.stage.sprites[2].x, 0.0);
     }
 }
