@@ -52,11 +52,33 @@
 //!   because nothing downstream of this reader needs it. This is why
 //!   `data_variable` / `data_listcontents` leaves carry `Code`, not
 //!   [`FieldValue::Ref`] — this parser does not produce `Ref` at all.
-//! - **`procedures_call` is carried, not interpreted.** Its `mutation` lands
-//!   verbatim in [`BlockRecord::extra_state`](blockly_abi::BlockRecord), and
-//!   the cast refuses it with `CastError::MutatorUnsupported` for the same
-//!   reason it refuses any other mutator payload — per-block-type mutator
-//!   schemas are their own wave.
+//! - **Custom blocks (`procedures_*`) are lowered to the shared core's
+//!   `PROC_DEF` / `PROC_CALL` / `PROC_ARG` fields at PARSE time, not carried
+//!   as an opaque mutator payload.** `procedures_definition` reads its
+//!   paired `procedures_prototype` (found via the `custom_block` input,
+//!   which is consumed and never re-emitted) for `proccode` and
+//!   `argumentnames`, and becomes a `PROCCODE` field plus one `SUBSTACK`
+//!   statement holding the definition's own `next` chain — the
+//!   definition's `next` itself is never set on the returned record, since
+//!   sb3 never chains a following top-level script off a definition.
+//!   Inside that body, an `argument_reporter_string_number` /
+//!   `argument_reporter_boolean` whose `VALUE` name is one of the
+//!   definition's `argumentnames` becomes a `("VALUE",
+//!   FieldValue::Byte(position))` field (the 0-based index into
+//!   `argumentnames`) instead of the reporter's own name; outside any
+//!   definition's body it keeps the ordinary `FieldValue::Code`/`Wide`
+//!   reading. `procedures_call` becomes `[("PROCCODE", Code), ("ARGC",
+//!   Byte)]` — in that field order, since the cast turns them into the
+//!   call's two immediate bytes in order — plus one input per id in
+//!   `argumentids` order, named by the id; a declared-but-empty argument
+//!   (`[1, null]`) contributes no input, so `ARGC` is the DECLARED count
+//!   from `argumentids`, not the populated one. `argumentdefaults` and
+//!   `warp` are read off the mutation and dropped: defaults matter only to
+//!   the editor's UI, and `warp` is a scheduling hint this crate does not
+//!   model. `procedures_prototype` is never itself converted — it is only
+//!   ever read for its `mutation`, from the definition that names it via
+//!   `custom_block`. No block anywhere carries `extra_state` any longer;
+//!   `control_stop`'s `hasnext` mutation is, likewise, read by nothing.
 
 use blockly_abi::{BlockRecord, FieldValue};
 use ogar_loco::basin::BasinCodebooks;
@@ -119,6 +141,11 @@ pub struct Sb3Target {
     pub lists: Vec<String>,
     /// Broadcast names declared on this target.
     pub broadcasts: Vec<String>,
+    /// Every custom-block `PROCCODE` this target defines
+    /// (`procedures_definition` scripts only), in the order the `blocks`
+    /// map yields them — the same order [`Sb3Target::scripts`] carries
+    /// them in.
+    pub proccodes: Vec<String>,
     /// Costume names, in project order.
     pub costumes: Vec<String>,
     /// Sound names, in project order.
@@ -180,6 +207,7 @@ fn read_target(t: &Value) -> Result<Sb3Target, Sb3Error> {
             variables,
             lists,
             broadcasts,
+            proccodes: Vec::new(),
             costumes,
             sounds,
             block_count: 0,
@@ -204,9 +232,18 @@ fn read_target(t: &Value) -> Result<Sb3Target, Sb3Error> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if top_level && !shadow {
-            scripts.push(read_sb3_block(id, blocks_obj)?);
+            scripts.push(read_sb3_block(id, blocks_obj, None)?);
         }
     }
+
+    let proccodes: Vec<String> = scripts
+        .iter()
+        .filter(|s| s.ty == "procedures_definition")
+        .filter_map(|s| match s.field("PROCCODE") {
+            Some(FieldValue::Code(c)) => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
 
     Ok(Sb3Target {
         name,
@@ -215,6 +252,7 @@ fn read_target(t: &Value) -> Result<Sb3Target, Sb3Error> {
         variables,
         lists,
         broadcasts,
+        proccodes,
         costumes,
         sounds,
         block_count,
@@ -253,9 +291,16 @@ fn names_of(v: Option<&Value>) -> Vec<String> {
 
 /// Read one block by id out of the target's `blocks` map, following its
 /// `next` chain.
+///
+/// `scope` is the argument-name list of the innermost enclosing
+/// `procedures_definition` body, when this call is inside one — it is what
+/// lets an `argument_reporter_string_number` / `argument_reporter_boolean`
+/// resolve its `VALUE` name to a `PROC_ARG` index. `None` outside any
+/// definition body.
 fn read_sb3_block(
     id: &str,
     blocks: &serde_json::Map<String, Value>,
+    scope: Option<&[String]>,
 ) -> Result<BlockRecord, Sb3Error> {
     let Some(v) = blocks.get(id) else {
         return Err(Sb3Error::DanglingReference {
@@ -277,51 +322,183 @@ fn read_sb3_block(
                 what: "missing `opcode`".to_string(),
             })?;
 
-    let mut rec = BlockRecord::leaf(opcode, id);
-
-    if let Some(fields) = obj.get("fields").and_then(Value::as_object) {
-        for (name, fv) in fields {
-            let Some(arr) = fv.as_array() else {
-                return Err(Sb3Error::MalformedBlock {
-                    id: id.to_string(),
-                    what: format!("field `{name}` is not an array"),
-                });
-            };
-            let Some(value) = arr.first() else {
-                return Err(Sb3Error::MalformedBlock {
-                    id: id.to_string(),
-                    what: format!("field `{name}` is empty"),
-                });
-            };
-            let field_id = arr.get(1).and_then(Value::as_str);
-            rec = rec.with_field(name.clone(), read_sb3_field(name, value, field_id));
-        }
+    // `procedures_definition` is a composite hat: its own `next` is the
+    // BODY chain, not a following top-level script, and its shape (fields,
+    // inputs, statements) comes from its paired `procedures_prototype`
+    // rather than from its own `fields`/`inputs` object. Handled entirely
+    // separately; the returned record's `next` is intentionally never set.
+    if opcode == "procedures_definition" {
+        return read_procedures_definition(id, obj, blocks);
     }
 
-    if let Some(mutation) = obj.get("mutation") {
-        rec = rec.with_extra_state(mutation.to_string());
-    }
+    let mut rec = if opcode == "procedures_call" {
+        read_procedures_call(id, obj, blocks, scope)?
+    } else {
+        let mut rec = BlockRecord::leaf(opcode, id);
+        let is_argument_reporter = matches!(
+            opcode,
+            "argument_reporter_string_number" | "argument_reporter_boolean"
+        );
 
-    if let Some(inputs) = obj.get("inputs").and_then(Value::as_object) {
-        let stmt_names = statement_names(opcode);
-        for (name, input) in inputs {
-            let Some(child) = read_sb3_input(id, input, blocks)? else {
-                continue;
-            };
-            if stmt_names.iter().any(|s| s == name) || name.starts_with("SUBSTACK") {
-                rec = rec.with_statement(name.clone(), child);
-            } else {
-                rec = rec.with_input(name.clone(), child);
+        if let Some(fields) = obj.get("fields").and_then(Value::as_object) {
+            for (name, fv) in fields {
+                let Some(arr) = fv.as_array() else {
+                    return Err(Sb3Error::MalformedBlock {
+                        id: id.to_string(),
+                        what: format!("field `{name}` is not an array"),
+                    });
+                };
+                let Some(value) = arr.first() else {
+                    return Err(Sb3Error::MalformedBlock {
+                        id: id.to_string(),
+                        what: format!("field `{name}` is empty"),
+                    });
+                };
+                let field_id = arr.get(1).and_then(Value::as_str);
+                let as_argument_index = (is_argument_reporter && name == "VALUE")
+                    .then_some(scope)
+                    .flatten()
+                    .and_then(|names| {
+                        let arg_name = value.as_str()?;
+                        let pos = names.iter().position(|n| n == arg_name)?;
+                        Some(FieldValue::Byte(u8::try_from(pos).unwrap_or(u8::MAX)))
+                    });
+                let field_value =
+                    as_argument_index.unwrap_or_else(|| read_sb3_field(name, value, field_id));
+                rec = rec.with_field(name.clone(), field_value);
             }
         }
-        if let Some(order) = crate::statement_inputs(opcode) {
-            rec.statements
-                .sort_by_key(|(n, _)| order.iter().position(|o| o == n).unwrap_or(usize::MAX));
+
+        if let Some(inputs) = obj.get("inputs").and_then(Value::as_object) {
+            let stmt_names = statement_names(opcode);
+            for (name, input) in inputs {
+                let Some(child) = read_sb3_input(id, input, blocks, scope)? else {
+                    continue;
+                };
+                if stmt_names.iter().any(|s| s == name) || name.starts_with("SUBSTACK") {
+                    rec = rec.with_statement(name.clone(), child);
+                } else {
+                    rec = rec.with_input(name.clone(), child);
+                }
+            }
+            if let Some(order) = crate::statement_inputs(opcode) {
+                rec.statements
+                    .sort_by_key(|(n, _)| order.iter().position(|o| o == n).unwrap_or(usize::MAX));
+            }
         }
-    }
+
+        rec
+    };
 
     if let Some(next_id) = obj.get("next").and_then(Value::as_str) {
-        rec = rec.with_next(read_sb3_block(next_id, blocks)?);
+        rec = rec.with_next(read_sb3_block(next_id, blocks, scope)?);
+    }
+
+    Ok(rec)
+}
+
+/// Read a `procedures_definition` block: its shape comes from the paired
+/// `procedures_prototype` named by its `custom_block` input (consumed here,
+/// never emitted), and its own `next` becomes the ONE `SUBSTACK` statement
+/// rather than a following script.
+fn read_procedures_definition(
+    id: &str,
+    obj: &serde_json::Map<String, Value>,
+    blocks: &serde_json::Map<String, Value>,
+) -> Result<BlockRecord, Sb3Error> {
+    let malformed = |what: &str| Sb3Error::MalformedBlock {
+        id: id.to_string(),
+        what: what.to_string(),
+    };
+
+    let prototype_id = obj
+        .get("inputs")
+        .and_then(Value::as_object)
+        .and_then(|inputs| inputs.get("custom_block"))
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("missing or malformed `inputs.custom_block`"))?;
+
+    let prototype = blocks
+        .get(prototype_id)
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed("`custom_block` names a missing prototype block"))?;
+
+    let mutation = prototype
+        .get("mutation")
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed("the prototype has no `mutation`"))?;
+
+    let proccode = mutation
+        .get("proccode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("the prototype's mutation has no `proccode`"))?;
+
+    let argumentnames_str = mutation
+        .get("argumentnames")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("the prototype's mutation has no `argumentnames`"))?;
+    let argumentnames: Vec<String> = serde_json::from_str(argumentnames_str)
+        .map_err(|_| malformed("`argumentnames` is not a JSON string array"))?;
+
+    let mut rec = BlockRecord::leaf("procedures_definition", id)
+        .with_field("PROCCODE", FieldValue::Code(proccode.to_string()));
+
+    if let Some(body_id) = obj.get("next").and_then(Value::as_str) {
+        let body = read_sb3_block(body_id, blocks, Some(argumentnames.as_slice()))?;
+        rec = rec.with_statement("SUBSTACK", body);
+    }
+
+    Ok(rec)
+}
+
+/// Read a `procedures_call` block: `PROCCODE` then `ARGC` (field order is
+/// load-bearing — the cast turns them into the call's two immediate bytes
+/// in this order), then one input per id in `argumentids` order, skipping a
+/// declared-but-empty (`[1, null]`) argument entirely.
+fn read_procedures_call(
+    id: &str,
+    obj: &serde_json::Map<String, Value>,
+    blocks: &serde_json::Map<String, Value>,
+    scope: Option<&[String]>,
+) -> Result<BlockRecord, Sb3Error> {
+    let malformed = |what: &str| Sb3Error::MalformedBlock {
+        id: id.to_string(),
+        what: what.to_string(),
+    };
+
+    let mutation = obj
+        .get("mutation")
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed("a `procedures_call` has no `mutation`"))?;
+
+    let proccode = mutation
+        .get("proccode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("the call's mutation has no `proccode`"))?;
+
+    let argumentids_str = mutation
+        .get("argumentids")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("the call's mutation has no `argumentids`"))?;
+    let argumentids: Vec<String> = serde_json::from_str(argumentids_str)
+        .map_err(|_| malformed("`argumentids` is not a JSON string array"))?;
+    let argc = u8::try_from(argumentids.len())
+        .map_err(|_| malformed("more than 255 declared arguments"))?;
+
+    let mut rec = BlockRecord::leaf("procedures_call", id)
+        .with_field("PROCCODE", FieldValue::Code(proccode.to_string()))
+        .with_field("ARGC", FieldValue::Byte(argc));
+
+    let inputs_obj = obj.get("inputs").and_then(Value::as_object);
+    for argid in &argumentids {
+        let Some(input_val) = inputs_obj.and_then(|m| m.get(argid)) else {
+            continue;
+        };
+        if let Some(child) = read_sb3_input(id, input_val, blocks, scope)? {
+            rec = rec.with_input(argid.clone(), child);
+        }
     }
 
     Ok(rec)
@@ -344,6 +521,7 @@ fn read_sb3_input(
     parent_id: &str,
     input: &Value,
     blocks: &serde_json::Map<String, Value>,
+    scope: Option<&[String]>,
 ) -> Result<Option<BlockRecord>, Sb3Error> {
     let Some(arr) = input.as_array() else {
         return Err(Sb3Error::MalformedBlock {
@@ -359,8 +537,8 @@ fn read_sb3_input(
     };
     let x = arr.get(1);
     match tag {
-        1 | 2 => resolve_operand(parent_id, x, blocks),
-        3 => resolve_operand(parent_id, x, blocks),
+        1 | 2 => resolve_operand(parent_id, x, blocks, scope),
+        3 => resolve_operand(parent_id, x, blocks, scope),
         other => Err(Sb3Error::MalformedBlock {
             id: parent_id.to_string(),
             what: format!("unrecognised input tag {other}"),
@@ -374,6 +552,7 @@ fn resolve_operand(
     parent_id: &str,
     x: Option<&Value>,
     blocks: &serde_json::Map<String, Value>,
+    scope: Option<&[String]>,
 ) -> Result<Option<BlockRecord>, Sb3Error> {
     let Some(x) = x else {
         return Ok(None);
@@ -396,7 +575,7 @@ fn resolve_operand(
             to: block_id.to_string(),
         });
     }
-    Ok(Some(read_sb3_block(block_id, blocks)?))
+    Ok(Some(read_sb3_block(block_id, blocks, scope)?))
 }
 
 /// Turn one primitive array (`[tag, ..]`) into the leaf `BlockRecord` it
@@ -581,6 +760,11 @@ pub fn target_basin(project: &Sb3Project, target: &Sb3Target) -> BasinCodebooks 
                 v
             }
             "CLONE_OF" => sprite_names(&sprites, target, &["_myself_"]),
+            // Not in `SCRATCH_MENUS` yet — matched here so this arm
+            // activates the moment a `PROCEDURE` menu lands, with no
+            // further change needed. Definition order, this target only
+            // (a custom block is not shared across sprites).
+            "PROCEDURE" => target.proccodes.clone(),
             _ => Vec::new(),
         };
         for name in &names {
@@ -856,7 +1040,14 @@ mod tests {
     }
 
     #[test]
-    fn a_mutation_is_carried_as_extra_state() {
+    fn a_procedures_call_becomes_proccode_and_argc_fields_no_extra_state() {
+        // Deliberate re-pin: `mutation` used to land verbatim in
+        // `extra_state`, refused by the cast. It is now lowered at parse
+        // time (`PROCCODE` + `ARGC` fields), so `extra_state` must be
+        // `None` here — the fixture's `callproc` declares one argument id
+        // (`"a"`) but supplies no matching `inputs` entry, so it also
+        // exercises "a declared id absent from `inputs` contributes no
+        // input" without needing a definition in this fixture at all.
         let p = project();
         let sp = sprite(&p);
         let call = sp
@@ -864,7 +1055,22 @@ mod tests {
             .iter()
             .find(|s| s.ty == "procedures_call")
             .unwrap();
-        assert!(call.extra_state.is_some());
+        assert!(call.extra_state.is_none());
+        assert_eq!(
+            call.fields,
+            vec![
+                (
+                    "PROCCODE".to_string(),
+                    FieldValue::Code("go %s".to_string())
+                ),
+                ("ARGC".to_string(), FieldValue::Byte(1)),
+            ],
+            "PROCCODE then ARGC, in that order"
+        );
+        assert!(
+            call.inputs.is_empty(),
+            "declared id `a` has no `inputs` entry at all, so no input is emitted"
+        );
     }
 
     #[test]
@@ -1023,5 +1229,304 @@ mod tests {
         ));
         // Two-sided: a well-formed document still reads.
         assert!(from_project_json(PROJECT_JSON).is_ok());
+    }
+
+    /// A second project, dedicated to `procedures_*`: one
+    /// `procedures_definition` for `"walk %n steps %n times"` (two
+    /// arguments, `n` and `times`) whose paired `procedures_prototype`
+    /// carries the `proccode`/`argumentnames`; a body of two blocks each
+    /// referencing one argument (`motion_movesteps` -> `argrep0` ("n"),
+    /// then `motion_turnright` -> `argrep1` ("times")); two
+    /// `procedures_call`s of it — one fully populated (`ARGC == 1`, one
+    /// `math_number` input), one that DECLARES two arguments but supplies
+    /// neither (`ARGC == 2`, zero inputs); and one loose
+    /// `argument_reporter_boolean` sitting at script top level, outside any
+    /// definition body, to prove scope does not leak.
+    const PROC_PROJECT_JSON: &str = r#"{
+      "targets": [
+        {
+          "isStage": false, "name": "Sprite1",
+          "blocks": {
+            "def1": {
+              "opcode": "procedures_definition", "next": "body1", "parent": null,
+              "topLevel": true, "fields": {},
+              "inputs": {"custom_block": [1, "proto1"]}
+            },
+            "proto1": {
+              "opcode": "procedures_prototype", "next": null, "parent": "def1",
+              "topLevel": false, "shadow": true, "fields": {},
+              "inputs": {"input0": [1, "argshadow0"], "input1": [1, "argshadow1"]},
+              "mutation": {
+                "tagName": "mutation", "children": [],
+                "proccode": "walk %n steps %n times",
+                "argumentnames": "[\"n\",\"times\"]",
+                "argumentids": "[\"input0\",\"input1\"]",
+                "argumentdefaults": "[1,1]", "warp": "false"
+              }
+            },
+            "argshadow0": {
+              "opcode": "argument_reporter_string_number", "next": null, "parent": "proto1",
+              "topLevel": false, "shadow": true,
+              "fields": {"VALUE": ["n", null]}, "inputs": {}
+            },
+            "argshadow1": {
+              "opcode": "argument_reporter_string_number", "next": null, "parent": "proto1",
+              "topLevel": false, "shadow": true,
+              "fields": {"VALUE": ["times", null]}, "inputs": {}
+            },
+            "body1": {
+              "opcode": "motion_movesteps", "next": "body2", "parent": "def1",
+              "topLevel": false, "fields": {},
+              "inputs": {"STEPS": [3, "argrep0", [4, "10"]]}
+            },
+            "argrep0": {
+              "opcode": "argument_reporter_string_number", "next": null, "parent": "body1",
+              "topLevel": false, "shadow": false,
+              "fields": {"VALUE": ["n", null]}, "inputs": {}
+            },
+            "body2": {
+              "opcode": "motion_turnright", "next": null, "parent": "body1",
+              "topLevel": false, "fields": {},
+              "inputs": {"DEGREES": [2, "argrep1"]}
+            },
+            "argrep1": {
+              "opcode": "argument_reporter_string_number", "next": null, "parent": "body2",
+              "topLevel": false, "shadow": false,
+              "fields": {"VALUE": ["times", null]}, "inputs": {}
+            },
+            "callwalk": {
+              "opcode": "procedures_call", "next": null, "parent": null,
+              "topLevel": true, "fields": {},
+              "inputs": {"input0": [1, [4, "7"]]},
+              "mutation": {
+                "tagName": "mutation", "children": [],
+                "proccode": "walk %n steps %n times",
+                "argumentids": "[\"input0\"]", "warp": "false"
+              }
+            },
+            "callwalk_empty": {
+              "opcode": "procedures_call", "next": null, "parent": null,
+              "topLevel": true, "fields": {},
+              "inputs": {"input0": [1, null], "input1": [1, null]},
+              "mutation": {
+                "tagName": "mutation", "children": [],
+                "proccode": "walk %n steps %n times",
+                "argumentids": "[\"input0\",\"input1\"]", "warp": "false"
+              }
+            },
+            "loose_arg": {
+              "opcode": "argument_reporter_boolean", "next": null, "parent": null,
+              "topLevel": true, "fields": {"VALUE": ["flag", null]}, "inputs": {}
+            }
+          }
+        }
+      ],
+      "monitors": [], "extensions": [], "meta": {"semver": "3.0.0"}
+    }"#;
+
+    fn proc_project() -> Sb3Project {
+        from_project_json(PROC_PROJECT_JSON).expect("the procedures fixture parses")
+    }
+
+    fn proc_sprite(p: &Sb3Project) -> &Sb3Target {
+        p.targets.iter().find(|t| !t.is_stage).unwrap()
+    }
+
+    /// No block anywhere in the tree carries `extra_state` — walked
+    /// recursively so a mutation smuggled in through an input, a statement,
+    /// or a `next` chain link would still be caught.
+    fn assert_no_extra_state(rec: &BlockRecord) {
+        assert!(
+            rec.extra_state.is_none(),
+            "`{}` (id `{}`) carries extra_state",
+            rec.ty,
+            rec.id
+        );
+        for (_, b) in &rec.inputs {
+            assert_no_extra_state(b);
+        }
+        for (_, b) in &rec.statements {
+            assert_no_extra_state(b);
+        }
+        if let Some(n) = &rec.next {
+            assert_no_extra_state(n);
+        }
+    }
+
+    #[test]
+    fn procedures_definition_becomes_proccode_and_one_substack_no_next() {
+        let p = proc_project();
+        let sp = proc_sprite(&p);
+        let def = sp
+            .scripts
+            .iter()
+            .find(|s| s.ty == "procedures_definition")
+            .unwrap();
+        assert_eq!(
+            def.field("PROCCODE"),
+            Some(&FieldValue::Code("walk %n steps %n times".to_string()))
+        );
+        assert!(
+            def.inputs.is_empty(),
+            "the custom_block input is consumed, never emitted"
+        );
+        assert_eq!(def.statements.len(), 1);
+        assert_eq!(def.statements[0].0, "SUBSTACK");
+        assert_eq!(def.statements[0].1.ty, "motion_movesteps");
+        assert!(
+            def.next.is_none(),
+            "a definition's own `next` is the body, never a following script"
+        );
+        assert_no_extra_state(def);
+        assert_eq!(
+            sp.proccodes,
+            vec!["walk %n steps %n times".to_string()],
+            "one PROCCODE, in definition order"
+        );
+    }
+
+    #[test]
+    fn argument_reporters_inside_the_body_resolve_to_their_position() {
+        let p = proc_project();
+        let sp = proc_sprite(&p);
+        let def = sp
+            .scripts
+            .iter()
+            .find(|s| s.ty == "procedures_definition")
+            .unwrap();
+        let body1 = &def.statements[0].1;
+        assert_eq!(body1.ty, "motion_movesteps");
+        let argrep0 = &body1.inputs[0].1;
+        assert_eq!(argrep0.ty, "argument_reporter_string_number");
+        assert_eq!(
+            argrep0.field("VALUE"),
+            Some(&FieldValue::Byte(0)),
+            "`n` is argumentnames[0]"
+        );
+
+        let body2 = body1.next.as_ref().unwrap();
+        assert_eq!(body2.ty, "motion_turnright");
+        let argrep1 = &body2.inputs[0].1;
+        assert_eq!(argrep1.ty, "argument_reporter_string_number");
+        assert_eq!(
+            argrep1.field("VALUE"),
+            Some(&FieldValue::Byte(1)),
+            "`times` is argumentnames[1] — a second name resolves too, not just the first"
+        );
+    }
+
+    #[test]
+    fn a_loose_argument_reporter_outside_a_definition_keeps_its_name() {
+        let p = proc_project();
+        let sp = proc_sprite(&p);
+        let loose = sp
+            .scripts
+            .iter()
+            .find(|s| s.ty == "argument_reporter_boolean")
+            .unwrap();
+        // "flag" is lowercase, so the general `byte_or_wide` classifier
+        // reads it as `Wide`, not `Code` — same precedent as the
+        // `_mouse_` shadow menu test above. What matters here is that it
+        // is NOT `Byte(_)`: no enclosing definition scope means no
+        // argument-index resolution happens at all.
+        assert_eq!(
+            loose.field("VALUE"),
+            Some(&FieldValue::Wide("flag".to_string())),
+            "no enclosing definition scope, so the reporter keeps its own name"
+        );
+    }
+
+    #[test]
+    fn procedures_call_fields_and_argc_vs_populated_inputs() {
+        let p = proc_project();
+        let sp = proc_sprite(&p);
+        let calls: Vec<&BlockRecord> = sp
+            .scripts
+            .iter()
+            .filter(|s| s.ty == "procedures_call")
+            .collect();
+        assert_eq!(calls.len(), 2);
+
+        let full = calls.iter().find(|c| c.id == "callwalk").unwrap();
+        assert_eq!(
+            full.fields,
+            vec![
+                (
+                    "PROCCODE".to_string(),
+                    FieldValue::Code("walk %n steps %n times".to_string())
+                ),
+                ("ARGC".to_string(), FieldValue::Byte(1)),
+            ],
+            "PROCCODE then ARGC, in that order"
+        );
+        assert_eq!(full.inputs.len(), 1);
+        assert_eq!(full.inputs[0].0, "input0");
+        assert_eq!(full.inputs[0].1.ty, "math_number");
+        assert_eq!(full.inputs[0].1.field("NUM"), Some(&FieldValue::Byte(7)));
+
+        let empty = calls.iter().find(|c| c.id == "callwalk_empty").unwrap();
+        assert_eq!(
+            empty.field("ARGC"),
+            Some(&FieldValue::Byte(2)),
+            "ARGC is the DECLARED count from argumentids"
+        );
+        assert!(
+            empty.inputs.len() < 2,
+            "fewer populated inputs than ARGC — both declared arguments are `[1, null]`"
+        );
+        assert_eq!(empty.inputs.len(), 0);
+    }
+
+    #[test]
+    fn nothing_in_the_whole_proc_project_carries_extra_state() {
+        let p = proc_project();
+        let sp = proc_sprite(&p);
+        for script in &sp.scripts {
+            assert_no_extra_state(script);
+        }
+    }
+
+    #[test]
+    fn a_definition_with_a_missing_prototype_is_malformed() {
+        let broken = r#"{"targets":[{"isStage":false,"name":"S","blocks":{
+            "def":{"opcode":"procedures_definition","topLevel":true,"next":null,
+                   "parent":null,"fields":{},
+                   "inputs":{"custom_block":[1,"missing_proto"]}}
+        }}]}"#;
+        assert!(matches!(
+            from_project_json(broken),
+            Err(Sb3Error::MalformedBlock { .. })
+        ));
+    }
+
+    #[test]
+    fn procedures_scripts_cast_under_triples() {
+        let p = proc_project();
+        let sp = proc_sprite(&p);
+        let basin = target_basin(&p, sp);
+
+        let def = sp
+            .scripts
+            .iter()
+            .find(|s| s.ty == "procedures_definition")
+            .unwrap();
+        let call = sp
+            .scripts
+            .iter()
+            .find(|s| s.ty == "procedures_call" && s.id == "callwalk")
+            .unwrap();
+
+        let def_result = lower_program_in(LaneShape::Triples, def, &basin);
+        assert!(
+            def_result.is_ok(),
+            "procedures_definition failed to cast: {:?}",
+            def_result.err()
+        );
+        let call_result = lower_program_in(LaneShape::Triples, call, &basin);
+        assert!(
+            call_result.is_ok(),
+            "procedures_call failed to cast: {:?}",
+            call_result.err()
+        );
     }
 }

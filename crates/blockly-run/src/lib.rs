@@ -244,6 +244,108 @@ impl<'a> Procedure<'a> {
     }
 }
 
+/// One device operation the interpreter knows how to perform. An integer
+/// tag, resolved from the harvested opcode NAME exactly once per process —
+/// so the hot path never compares strings and never scans the device table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    /// A minted device byte this interpreter does not implement.
+    Unimplemented,
+    /// A menu shadow block: yields its own codebook index.
+    Menu,
+    Hat,
+    KeyPressed,
+    LayerNoop,
+    MoveSteps,
+    TurnRight,
+    TurnLeft,
+    PointDir,
+    GotoXy,
+    SetX,
+    SetY,
+    ChangeX,
+    ChangeY,
+    Bounce,
+    XPos,
+    YPos,
+    Dir,
+    Show,
+    Hide,
+    ChangeSize,
+    SetSize,
+    Size,
+    CostumeNoop,
+    MouseX,
+    MouseY,
+    Timer,
+    ResetTimer,
+    Touching,
+    MouseDown,
+}
+
+/// The per-vocabulary execution plan: for every possible function byte, the
+/// operation and the stack arity. Derived data — 512 bytes, computed once —
+/// never a copy of any program. This is the "prefetch" a body needs before
+/// it runs, and it is shared by every body under this palette.
+struct Plan {
+    op: [Op; 256],
+    arity: [Option<u8>; 256],
+}
+
+fn plan() -> &'static Plan {
+    static PLAN: std::sync::OnceLock<Plan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        let mut op = [Op::Unimplemented; 256];
+        let mut arity = [None; 256];
+        for b in 0..=255u8 {
+            let f = FnIndex(b);
+            arity[usize::from(b)] = shared_core::stack_arity(f)
+                .or_else(|| scratch::device_by_byte(b).map(|(_, a, _)| a));
+            let Some((name, ..)) = scratch::device_by_byte(b) else {
+                continue;
+            };
+            op[usize::from(b)] = if blockly_abi::menus::is_menu_block(name) {
+                Op::Menu
+            } else {
+                match name {
+                    "event_whenflagclicked"
+                    | "event_whenthisspriteclicked"
+                    | "event_whenkeypressed" => Op::Hat,
+                    "sensing_keypressed" => Op::KeyPressed,
+                    "looks_gotofrontback" | "looks_goforwardbackwardlayers" => Op::LayerNoop,
+                    "motion_movesteps" => Op::MoveSteps,
+                    "motion_turnright" => Op::TurnRight,
+                    "motion_turnleft" => Op::TurnLeft,
+                    "motion_pointindirection" => Op::PointDir,
+                    "motion_gotoxy" => Op::GotoXy,
+                    "motion_setx" => Op::SetX,
+                    "motion_sety" => Op::SetY,
+                    "motion_changexby" => Op::ChangeX,
+                    "motion_changeyby" => Op::ChangeY,
+                    "motion_ifonedgebounce" => Op::Bounce,
+                    "motion_xposition" => Op::XPos,
+                    "motion_yposition" => Op::YPos,
+                    "motion_direction" => Op::Dir,
+                    "looks_show" => Op::Show,
+                    "looks_hide" => Op::Hide,
+                    "looks_changesizeby" => Op::ChangeSize,
+                    "looks_setsizeto" => Op::SetSize,
+                    "looks_size" => Op::Size,
+                    "looks_nextcostume" | "looks_nextbackdrop" => Op::CostumeNoop,
+                    "sensing_mousex" => Op::MouseX,
+                    "sensing_mousey" => Op::MouseY,
+                    "sensing_timer" => Op::Timer,
+                    "sensing_resettimer" => Op::ResetTimer,
+                    "sensing_touchingobject" | "sensing_touchingcolor" => Op::Touching,
+                    "sensing_mousedown" => Op::MouseDown,
+                    _ => Op::Unimplemented,
+                }
+            };
+        }
+        Plan { op, arity }
+    })
+}
+
 /// A bounded run over stored function bodies.
 pub struct Machine<'a> {
     /// The stage the program acts on.
@@ -346,12 +448,16 @@ impl<'a> Machine<'a> {
     /// Execute function `index` of `functions` — this script's, or a custom
     /// block's defining script when called through `PROC_CALL`.
     fn exec_in(&mut self, functions: &'a [FunctionBody], index: usize) -> Result<(), RunError> {
-        let body = *functions
+        // Borrowed, never copied: the body is read in place from the slice
+        // the node bytes were decoded into, and `calls()` yields each `Call`
+        // by value from it — no per-body copy, no per-call allocation.
+        let body = functions
             .get(index)
             .ok_or(RunError::DanglingReference(index as u8))?;
-        let mut stack: Vec<f32> = Vec::new();
+        let mut stack: Vec<f32> = Vec::with_capacity(8);
+        let plan = plan();
 
-        for call in blockly_abi::raise_calls(&body) {
+        for call in body.calls() {
             if self.budget == 0 {
                 return Ok(());
             }
@@ -443,18 +549,19 @@ impl<'a> Machine<'a> {
             }
 
             // ── everything else: pop arity, compute, push if it yields ────
-            let arity = usize::from(
-                shared_core::stack_arity(f)
-                    .or_else(|| scratch::device_by_byte(f.0).map(|(_, a, _)| a))
-                    .ok_or(RunError::Uncovered(f.0))?,
-            );
+            let arity = usize::from(plan.arity[usize::from(f.0)].ok_or(RunError::Uncovered(f.0))?);
             if stack.len() < arity {
                 return Err(RunError::StackUnderflow(f.0));
             }
-            let ops: Vec<f32> = stack.split_off(stack.len() - arity);
-            let immediate = f32::from(call.values.first().copied().unwrap_or(0));
+            // Operands into a fixed window — the ABI's arity is at most 3 —
+            // rather than a fresh `Vec` per call.
+            let base = stack.len() - arity;
+            let mut window = [0.0f32; ogar_loco::MAX_VALUES_PER_CALL];
+            window[..arity].copy_from_slice(&stack[base..]);
+            stack.truncate(base);
+            let immediate = f32::from(call.values[0]);
 
-            let result = self.apply(f, &ops, immediate)?;
+            let result = self.apply(f, &window[..arity], immediate)?;
             if let Some(v) = result {
                 stack.push(v);
             }
@@ -514,22 +621,16 @@ impl<'a> Machine<'a> {
             return Ok(Some(v));
         }
 
-        // Then the device half, by its harvested name — so the interpreter
-        // reads the same table the palette and the toolbox do.
-        let Some((name, ..)) = scratch::device_by_byte(f.0) else {
-            return Err(RunError::Unimplemented(f.0));
-        };
-        // A menu shadow block is a value: it yields its own codebook index,
-        // which the consuming block pops as an operand (OGAR #295 — a menu is
-        // one function plus a table, and the table's index is the value).
-        if blockly_abi::menus::is_menu_block(name) {
-            return Ok(Some(imm));
-        }
-        match name {
-            "event_whenflagclicked" | "event_whenthisspriteclicked" | "event_whenkeypressed" => {
-                Ok(None)
-            }
-            "sensing_keypressed" => {
+        // Then the device half, through the plan — the harvested NAME table
+        // resolved to integer tags once, so the palette, the toolbox and the
+        // interpreter still read one source and the hot path reads none.
+        match plan().op[usize::from(f.0)] {
+            Op::Unimplemented => Err(RunError::Unimplemented(f.0)),
+            // A menu shadow block is a value: it yields its own codebook
+            // index, which the consuming block pops as an operand.
+            Op::Menu => Ok(Some(imm)),
+            Op::Hat => Ok(None),
+            Op::KeyPressed => {
                 // The operand is the KEY_OPTION index the menu reporter
                 // pushed; `any` is the harvested option 6.
                 let want = a(0) as u8;
@@ -541,47 +642,47 @@ impl<'a> Machine<'a> {
             }
             // Front/back layering has no visual model here; a real op with
             // no effect on this stage, not an unimplemented one.
-            "looks_gotofrontback" | "looks_goforwardbackwardlayers" => Ok(None),
-            "motion_movesteps" => {
+            Op::LayerNoop => Ok(None),
+            Op::MoveSteps => {
                 let r = s.sprites[me].direction.to_radians();
                 s.sprites[me].x += a(0) * r.sin();
                 s.sprites[me].y += a(0) * r.cos();
                 Ok(None)
             }
-            "motion_turnright" => {
+            Op::TurnRight => {
                 s.sprites[me].direction += a(0);
                 Ok(None)
             }
-            "motion_turnleft" => {
+            Op::TurnLeft => {
                 s.sprites[me].direction -= a(0);
                 Ok(None)
             }
-            "motion_pointindirection" => {
+            Op::PointDir => {
                 s.sprites[me].direction = a(0);
                 Ok(None)
             }
-            "motion_gotoxy" => {
+            Op::GotoXy => {
                 s.sprites[me].x = a(0);
                 s.sprites[me].y = a(1);
                 Ok(None)
             }
-            "motion_setx" => {
+            Op::SetX => {
                 s.sprites[me].x = a(0);
                 Ok(None)
             }
-            "motion_sety" => {
+            Op::SetY => {
                 s.sprites[me].y = a(0);
                 Ok(None)
             }
-            "motion_changexby" => {
+            Op::ChangeX => {
                 s.sprites[me].x += a(0);
                 Ok(None)
             }
-            "motion_changeyby" => {
+            Op::ChangeY => {
                 s.sprites[me].y += a(0);
                 Ok(None)
             }
-            "motion_ifonedgebounce" => {
+            Op::Bounce => {
                 // Clamp strictly INSIDE the edge. Clamping to exactly the
                 // boundary leaves `abs() >= half` true on the next call, so
                 // the sprite flips direction every frame and sticks to the
@@ -599,39 +700,38 @@ impl<'a> Machine<'a> {
                 }
                 Ok(None)
             }
-            "motion_xposition" => Ok(Some(s.sprites[me].x)),
-            "motion_yposition" => Ok(Some(s.sprites[me].y)),
-            "motion_direction" => Ok(Some(s.sprites[me].direction)),
-            "looks_show" => {
+            Op::XPos => Ok(Some(s.sprites[me].x)),
+            Op::YPos => Ok(Some(s.sprites[me].y)),
+            Op::Dir => Ok(Some(s.sprites[me].direction)),
+            Op::Show => {
                 s.sprites[me].visible = true;
                 Ok(None)
             }
-            "looks_hide" => {
+            Op::Hide => {
                 s.sprites[me].visible = false;
                 Ok(None)
             }
-            "looks_changesizeby" => {
+            Op::ChangeSize => {
                 s.sprites[me].size += a(0);
                 Ok(None)
             }
-            "looks_setsizeto" => {
+            Op::SetSize => {
                 s.sprites[me].size = a(0);
                 Ok(None)
             }
-            "looks_size" => Ok(Some(s.sprites[me].size)),
+            Op::Size => Ok(Some(s.sprites[me].size)),
             // A costume switch has no visual model here; it is a real op with
             // no effect on this stage, which is different from unimplemented.
-            "looks_nextcostume" | "looks_nextbackdrop" => Ok(None),
-            "sensing_mousex" => Ok(Some(s.mouse_x)),
-            "sensing_mousey" => Ok(Some(s.mouse_y)),
-            "sensing_timer" => Ok(Some(s.timer)),
-            "sensing_resettimer" => {
+            Op::CostumeNoop => Ok(None),
+            Op::MouseX => Ok(Some(s.mouse_x)),
+            Op::MouseY => Ok(Some(s.mouse_y)),
+            Op::Timer => Ok(Some(s.timer)),
+            Op::ResetTimer => {
                 s.timer = 0.0;
                 Ok(None)
             }
-            "sensing_touchingobject" | "sensing_touchingcolor" => Ok(Some(f32::from(s.touching))),
-            "sensing_mousedown" => Ok(Some(0.0)),
-            _ => Err(RunError::Unimplemented(f.0)),
+            Op::Touching => Ok(Some(f32::from(s.touching))),
+            Op::MouseDown => Ok(Some(0.0)),
         }
     }
 }
