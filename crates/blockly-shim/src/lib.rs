@@ -1176,7 +1176,7 @@ mod pong_scene {
         let menus_in_paddle = progs[1]
             .functions
             .iter()
-            .flat_map(|f| blockly_abi::raise_calls(f))
+            .flat_map(blockly_abi::raise_calls)
             .filter(|c| c.function.0 == key_byte)
             .count();
         assert_eq!(menus_in_paddle, 2, "up and down keyoptions");
