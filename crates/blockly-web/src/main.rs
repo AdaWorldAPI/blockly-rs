@@ -148,16 +148,17 @@ async fn api_scratch_defs() -> Json<serde_json::Value> {
                 args.push(serde_json::json!({"type": "input_statement", "name": name}));
             }
             // A dropdown — inline field or menu shadow block — offers the
-            // harvested static options. The page shows `[label, code]` pairs
-            // whose code is what the cast turns into a codebook index; a
-            // dynamic menu (sprite / costume names) has no static options and
-            // is offered empty until a project interns its own.
+            // options. The page shows `[label, code]` pairs whose code is what
+            // the cast turns into a codebook index; a dynamic menu whose
+            // project interned nothing is offered empty.
             if let Some((field, menu)) = blockly_abi::menus::menu_for_block(ty) {
-                let options: Vec<_> = menu
-                    .options
-                    .iter()
-                    .map(|o| serde_json::json!([o, o]))
-                    .collect();
+                // Static prefix plus the demo project's interned tail (sprite
+                // names) — the same basin the cast resolves against.
+                let options: Vec<_> =
+                    blockly_abi::menus::options_in(blockly_shim::templates::project_basin(), menu)
+                        .into_iter()
+                        .map(|o| serde_json::json!([o, o]))
+                        .collect();
                 let options = if options.is_empty() {
                     vec![serde_json::json!(["—", ""])]
                 } else {

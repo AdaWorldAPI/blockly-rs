@@ -19,8 +19,9 @@
 //!   loud, named error instead of silently-wrong stored bytes.
 
 use blockly_abi::{FunctionNode, Program};
-use blockly_abi::{lower_program, parse_text, raise_calls, render_text};
+use blockly_abi::{parse_text, raise_calls, render_text};
 use blockly_shim::from_workspace_json;
+use blockly_shim::templates::cast as lower_program;
 use ogar_loco::{FnIndex, FunctionBody, LaneShape};
 use serde::Serialize;
 

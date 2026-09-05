@@ -123,6 +123,20 @@ pub fn raise_body(
     functions: &[FunctionBody],
     index: usize,
 ) -> Result<Option<BlockRecord>, RaiseError> {
+    raise_body_in(functions, index, crate::menus::static_basin())
+}
+
+/// [`raise_body`] against a project's own basin, so a dropdown index in the
+/// project-interned tail (a sprite name) decodes instead of being refused.
+///
+/// # Errors
+///
+/// See [`RaiseError`].
+pub fn raise_body_in(
+    functions: &[FunctionBody],
+    index: usize,
+    basin: &ogar_loco::basin::BasinCodebooks,
+) -> Result<Option<BlockRecord>, RaiseError> {
     let body = functions
         .get(index)
         .ok_or(RaiseError::DanglingReference(index as u8))?;
@@ -172,7 +186,7 @@ pub fn raise_body(
             let name = stmt_names
                 .get(r)
                 .map_or_else(|| format!("S{r}"), |n| (*n).to_string());
-            if let Some(sub) = raise_body(functions, target)? {
+            if let Some(sub) = raise_body_in(functions, target, basin)? {
                 statements.push((name, sub));
             }
         }
@@ -191,8 +205,9 @@ pub fn raise_body(
         // (a sprite name the palette cannot know) and is refused, not guessed.
         if let Some((field, menu)) = crate::menus::menu_for_block(ty) {
             let b = call.values.get(refs).copied().unwrap_or(0);
-            let code = crate::menus::decode(menu, b).ok_or(RaiseError::UnknownOption(f.0, b))?;
-            fields.push((field.to_string(), FieldValue::Code(code.to_string())));
+            let code =
+                crate::menus::decode_in(basin, menu, b).ok_or(RaiseError::UnknownOption(f.0, b))?;
+            fields.push((field.to_string(), FieldValue::Code(code)));
         }
 
         let record = BlockRecord {
@@ -245,6 +260,18 @@ pub fn raise_body(
 /// See [`RaiseError`].
 pub fn raise_program(functions: &[FunctionBody]) -> Result<Option<BlockRecord>, RaiseError> {
     raise_body(functions, 0)
+}
+
+/// [`raise_program`] against a project's own basin.
+///
+/// # Errors
+///
+/// See [`RaiseError`].
+pub fn raise_program_in(
+    functions: &[FunctionBody],
+    basin: &ogar_loco::basin::BasinCodebooks,
+) -> Result<Option<BlockRecord>, RaiseError> {
+    raise_body_in(functions, 0, basin)
 }
 
 #[cfg(test)]

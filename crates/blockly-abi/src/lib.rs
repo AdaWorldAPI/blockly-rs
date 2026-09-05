@@ -96,7 +96,7 @@ pub use klickweg::{BlockAddress, address_of};
 pub use palette::{
     BlocklyPalette, DEVICE_FAMILY_FLOOR, PALETTE_CONCEPT, plug_into, render_classid,
 };
-pub use program::lower_program;
+pub use program::{lower_program, lower_program_in};
 pub use projection::{ProjectionError, parse_text, render_text};
 pub use registry::registry;
 
@@ -588,7 +588,7 @@ fn lower_block(
     for (_, operand) in &block.inputs {
         lower_block(operand, body, ctx.as_deref_mut())?;
     }
-    let call = call_for(block, ctx)?;
+    let call = call_for(block, ctx, menus::static_basin())?;
     body.push(call)?;
     Ok(())
 }
@@ -597,6 +597,7 @@ fn lower_block(
 pub(crate) fn call_for(
     block: &BlockRecord,
     mut ctx: Option<&mut LoweringContext>,
+    basin: &ogar_loco::basin::BasinCodebooks,
 ) -> Result<Call, CastError> {
     // A mutator payload decides the block's SHAPE. Lowering without it would
     // emit a call that looks complete and is not.
@@ -645,8 +646,9 @@ pub(crate) fn call_for(
         // shape the shim guessed for it: Scratch codes are lowercase
         // (`"up arrow"`, `"front"`) so the all-caps heuristic reads them as
         // wide literals, and the digit keys `"0".."9"` arrive as bytes. The
-        // table, not the spelling, decides — and a code outside the static
-        // prefix is refused, never interned as text.
+        // table, not the spelling, decides — static prefix first, then the
+        // basin's project-interned tail; a code in neither is refused, never
+        // interned as text.
         if let Some(menu) = menus::menu_for_field(&block.ty, name) {
             let text: String = match v {
                 FieldValue::Code(c) | FieldValue::Wide(c) => c.clone(),
@@ -658,9 +660,11 @@ pub(crate) fn call_for(
                     });
                 }
             };
-            let idx = menus::encode(menu, &text).ok_or_else(|| CastError::UnencodedValueParam {
-                ty: block.ty.clone(),
-                code: text.clone(),
+            let idx = menus::encode_in(basin, menu, &text).ok_or_else(|| {
+                CastError::UnencodedValueParam {
+                    ty: block.ty.clone(),
+                    code: text.clone(),
+                }
             })?;
             push(idx)?;
             continue;

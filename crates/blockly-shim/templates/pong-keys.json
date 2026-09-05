@@ -40,11 +40,11 @@
                                 "id": "touch",
                                 "inputs": {
                                   "TOUCHINGOBJECTMENU": {
-                                    "block": {
-                                      "type": "math_number",
-                                      "id": "n_pad",
+                                    "shadow": {
+                                      "type": "sensing_touchingobjectmenu",
+                                      "id": "m_pad",
                                       "fields": {
-                                        "NUM": 1
+                                        "TOUCHINGOBJECTMENU": "Paddle"
                                       }
                                     }
                                   }
@@ -211,11 +211,11 @@
                         "id": "goal_t",
                         "inputs": {
                           "TOUCHINGOBJECTMENU": {
-                            "block": {
-                              "type": "math_number",
-                              "id": "n_goal",
+                            "shadow": {
+                              "type": "sensing_touchingobjectmenu",
+                              "id": "m_goal",
                               "fields": {
-                                "NUM": 2
+                                "TOUCHINGOBJECTMENU": "Goal"
                               }
                             }
                           }

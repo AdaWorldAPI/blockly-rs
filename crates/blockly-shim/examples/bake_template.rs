@@ -4,7 +4,7 @@
 //!
 //! Emits `templates/<name>.nodes`:each script's functions as 512-byte nodes,
 //! concatenated. The JSON stays only as the authoring form.
-use blockly_abi::{FunctionNode, lower_program};
+use blockly_abi::FunctionNode;
 use ogar_loco::LaneShape;
 
 fn main() {
@@ -13,7 +13,7 @@ fn main() {
         let mut out: Vec<u8> = Vec::new();
         let mut counts: Vec<u8> = Vec::new();
         for s in &scripts {
-            let prog = lower_program(LaneShape::Pairs, s).expect("casts");
+            let prog = blockly_shim::templates::cast(LaneShape::Pairs, s).expect("casts");
             counts.push(u8::try_from(prog.functions.len()).expect("bounded"));
             for (i, body) in prog.functions.iter().enumerate() {
                 let mut key = [0u8; 16];
