@@ -275,6 +275,18 @@ pub const SCRATCH_MENUS: &[Menu] = &[
         name: "CLONE_OF",
         options: &[],
     },
+    // Variable and list dropdowns (`field_variable` in the source): names a
+    // project declares, unique per scope, so the name is the identity.
+    Menu {
+        id: 25,
+        name: "VARIABLE",
+        options: &[],
+    },
+    Menu {
+        id: 26,
+        name: "LIST",
+        options: &[],
+    },
 ];
 
 /// Blocks carrying an INLINE dropdown: `(block type, field name, menu id)`.
@@ -297,6 +309,26 @@ pub const MENU_FIELDS: &[(&str, &str, u8)] = &[
     ("sensing_current", "CURRENTMENU", 10),
     ("event_whengreaterthan", "WHENGREATERTHANMENU", 11),
     ("control_stop", "STOP_OPTION", 12),
+    // Variable / list dropdowns. All shared-core bytes, so — like STOP — the
+    // substrate declares no codebook for them; the palette table is the
+    // authority, and the interpreter indexes its variable store by the byte.
+    ("data_variable", "VARIABLE", 25),
+    ("data_setvariableto", "VARIABLE", 25),
+    ("data_changevariableby", "VARIABLE", 25),
+    ("data_showvariable", "VARIABLE", 25),
+    ("data_hidevariable", "VARIABLE", 25),
+    ("data_listcontents", "LIST", 26),
+    ("data_addtolist", "LIST", 26),
+    ("data_deleteoflist", "LIST", 26),
+    ("data_deletealloflist", "LIST", 26),
+    ("data_insertatlist", "LIST", 26),
+    ("data_replaceitemoflist", "LIST", 26),
+    ("data_itemoflist", "LIST", 26),
+    ("data_itemnumoflist", "LIST", 26),
+    ("data_lengthoflist", "LIST", 26),
+    ("data_listcontainsitem", "LIST", 26),
+    ("data_showlist", "LIST", 26),
+    ("data_hidelist", "LIST", 26),
 ];
 
 /// Menu SHADOW blocks — a dropdown that arrives as a nested reporter:
@@ -404,7 +436,21 @@ pub fn encode_in(basin: &BasinCodebooks, menu: &Menu, code: &str) -> Option<u8> 
     let first_dynamic = menu.options.len() + 1;
     (first_dynamic..=book.len())
         .filter_map(|i| u8::try_from(i).ok())
-        .find(|&i| book.resolve(i).and_then(entry_code).as_deref() == Some(code))
+        .find(|&i| book.resolve(i).is_some_and(|e| entry_matches(e, code)))
+}
+
+/// Whether an entry was interned FROM this code — either as its UTF-8 bytes
+/// (a code that fits a facet) or as its FNV-1a digest (a wider one, the same
+/// rule [`builder`] applies). Matching the digest is what lets a sprite
+/// named longer than 12 bytes still cast; the raise cannot recover such a
+/// name from the table alone and refuses, which is measured, not hidden.
+fn entry_matches(entry: &ogar_loco::pool::Constant, code: &str) -> bool {
+    if code.len() <= CONSTANT_BYTES {
+        entry.bytes[..code.len()] == *code.as_bytes()
+            && entry.bytes[code.len()..].iter().all(|&b| b == 0)
+    } else {
+        entry.bytes[..8] == digest(code).to_le_bytes() && entry.bytes[8..].iter().all(|&b| b == 0)
+    }
 }
 
 /// [`decode`], then the basin's dynamic tail.
@@ -689,6 +735,24 @@ mod tests {
         assert_eq!(options_in(&basin, goto), vec!["Ball", "Paddle"]);
         assert_eq!(options_in(&basin, keys).len(), 43);
         assert_eq!(options_in(static_basin(), goto), Vec::<String>::new());
+
+        // A name wider than a facet is interned as its digest: it still
+        // ENCODES (the cast works), but the raise cannot read the name back
+        // from the table and refuses rather than inventing one.
+        let long = "Pseudorandom Cycle";
+        assert!(long.len() > CONSTANT_BYTES);
+        let mut w = builder(goto, CONST_UTF8_INLINE, PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        let idx = w
+            .intern(PLACEHOLDER_DIGEST_CLASSID, &digest(long).to_le_bytes())
+            .unwrap();
+        let mut wide = BasinCodebooks::new();
+        wide.plug(w.seal()).unwrap();
+        assert_eq!(encode_in(&wide, goto, long), Some(idx));
+        assert_eq!(decode_in(&wide, goto, idx), None, "a digest is not a name");
+        // Anti-vacuity: a different long name does not match the same digest
+        // entry, and a short prefix of the long name does not either.
+        assert_eq!(encode_in(&wide, goto, "Pseudorandom Cycles"), None);
+        assert_eq!(encode_in(&wide, goto, "Pseudorandom"), None);
     }
 
     #[test]

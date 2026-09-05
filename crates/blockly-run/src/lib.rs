@@ -93,8 +93,11 @@ pub struct Stage {
     pub sprites: Vec<Sprite>,
     /// Which sprite the currently-running script controls.
     pub current: usize,
-    /// The single variable the demo scores with.
-    pub var: f32,
+    /// Variable store, indexed by the `VARIABLE` codebook byte a
+    /// `data_*variable*` call carries (`blockly_abi::menus`, menu 25). Index
+    /// `0` is the zero-fallback slot — a variable block with no declared name
+    /// (the built-in templates) reads and writes it. Grown on demand.
+    pub vars: Vec<f32>,
     /// Mouse position the sensing reporters return.
     pub mouse_x: f32,
     /// Mouse position.
@@ -119,7 +122,7 @@ impl Default for Stage {
         Self {
             sprites: vec![Sprite::default()],
             current: 0,
-            var: 0.0,
+            vars: vec![0.0],
             mouse_x: 0.0,
             mouse_y: 0.0,
             timer: 0.0,
@@ -132,6 +135,21 @@ impl Default for Stage {
 }
 
 impl Stage {
+    /// A variable by its codebook index; unset reads as `0`, as in Scratch.
+    #[must_use]
+    pub fn var(&self, idx: u8) -> f32 {
+        self.vars.get(usize::from(idx)).copied().unwrap_or(0.0)
+    }
+
+    /// The variable slot for a codebook index, growing the store to reach it.
+    pub fn var_mut(&mut self, idx: u8) -> &mut f32 {
+        let i = usize::from(idx);
+        if self.vars.len() <= i {
+            self.vars.resize(i + 1, 0.0);
+        }
+        &mut self.vars[i]
+    }
+
     /// The sprite the running script controls.
     #[must_use]
     pub fn me(&self) -> &Sprite {
@@ -389,13 +407,14 @@ impl<'a> Machine<'a> {
             FnIndex::NOT => Some(f32::from(a(0) == 0.0)),
             FnIndex::ABS => Some(a(0).abs()),
             FnIndex::ROUND => Some(a(0).round()),
-            FnIndex::VAR_GET => Some(s.var),
+            // The immediate is the VARIABLE codebook byte — which variable.
+            FnIndex::VAR_GET => Some(s.var(imm as u8)),
             FnIndex::VAR_SET => {
-                s.var = a(0);
+                *s.var_mut(imm as u8) = a(0);
                 return Ok(None);
             }
             FnIndex::VAR_CHANGE => {
-                s.var += if ops.is_empty() { imm } else { a(0) };
+                *s.var_mut(imm as u8) += a(0);
                 return Ok(None);
             }
             _ => None,
@@ -842,6 +861,70 @@ mod tests {
         assert_eq!(m.stage.sprites[0].y, 0.0);
     }
 
+    /// Two variables are two slots: the VARIABLE codebook byte a `data_*`
+    /// call carries selects which one, so `score` and `lives` do not alias —
+    /// and the zero-fallback slot the templates use is a third, untouched.
+    #[test]
+    fn variables_are_addressed_by_their_codebook_byte_not_shared() {
+        use blockly_abi::menus;
+        use ogar_loco::basin::BasinCodebooks;
+        let vars = menus::SCRATCH_MENUS
+            .iter()
+            .find(|m| m.name == "VARIABLE")
+            .unwrap();
+        let mut b = menus::builder(
+            vars,
+            ogar_loco::pool::placeholder::CONST_UTF8_INLINE,
+            menus::PLACEHOLDER_DIGEST_CLASSID,
+        )
+        .unwrap();
+        let score = b
+            .intern(ogar_loco::pool::placeholder::CONST_UTF8_INLINE, b"score")
+            .unwrap();
+        let lives = b
+            .intern(ogar_loco::pool::placeholder::CONST_UTF8_INLINE, b"lives")
+            .unwrap();
+        let mut basin = BasinCodebooks::new();
+        basin.plug(b.seal()).unwrap();
+        assert_ne!(score, lives);
+
+        // set score to 7; change lives by 3
+        let set = |var: &str, ty: &str, v: u8, next: Option<BlockRecord>| {
+            rec(
+                ty,
+                vec![("VARIABLE".into(), FieldValue::Code(var.into()))],
+                vec![("VALUE".into(), num(v))],
+                vec![],
+                next,
+            )
+        };
+        let prog = blockly_abi::lower_program_in(
+            LaneShape::Pairs,
+            &set(
+                "score",
+                "data_setvariableto",
+                7,
+                Some(set("lives", "data_changevariableby", 3, None)),
+            ),
+            &basin,
+        )
+        .expect("named variables cast against the project basin");
+        let mut m = Machine::new(&prog.functions, 1000);
+        m.run().unwrap();
+        assert_eq!(m.stage.var(score), 7.0);
+        assert_eq!(m.stage.var(lives), 3.0);
+        assert_eq!(m.stage.var(0), 0.0, "the zero-fallback slot is untouched");
+        // Silence half: the static basin knows no variable names, so the
+        // same program is refused rather than silently written to slot 0.
+        assert!(
+            blockly_abi::lower_program(
+                LaneShape::Pairs,
+                &set("score", "data_setvariableto", 7, None)
+            )
+            .is_err()
+        );
+    }
+
     /// `forever` terminates on the budget, and the budget bounds the RUN only.
     #[test]
     fn forever_is_bounded_by_the_budget_not_by_a_special_case() {
@@ -916,13 +999,14 @@ mod tests {
         let mut hit = Machine::new(&prog.functions, 100);
         hit.stage.touching = true;
         hit.run().expect("runs");
-        assert_eq!(hit.stage.var, 5.0, "the branch must fire when touching");
+        assert_eq!(hit.stage.var(0), 5.0, "the branch must fire when touching");
 
         let mut miss = Machine::new(&prog.functions, 100);
         miss.stage.touching = false;
         miss.run().expect("runs");
         assert_eq!(
-            miss.stage.var, 0.0,
+            miss.stage.var(0),
+            0.0,
             "the branch must NOT fire when not touching"
         );
     }
