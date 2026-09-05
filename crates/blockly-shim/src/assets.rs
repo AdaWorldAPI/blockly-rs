@@ -8,7 +8,7 @@
 //! file referenced by ten sprites or ten projects is stored once.
 //!
 //! The store is a seam: [`AssetStore`] is the whole contract, [`MemoryStore`]
-//! is the in-process implementation every test uses, and [`S3Store`]
+//! is the in-process implementation every test uses, and `S3Store`
 //! (feature `s3`) is the deployment one — an S3-compatible bucket (Tigris on
 //! Railway) reached through the standard `AWS_*` variables. A Lance side
 //! table keyed by the same `md5ext` is the natural index over the bucket
@@ -24,7 +24,8 @@ use std::sync::RwLock;
 pub enum AssetError {
     /// The backing store refused or failed; the message is the backend's.
     Store(String),
-    /// Configuration is missing — for [`S3Store::from_env`], which variable.
+    /// Configuration is missing — for `S3Store::from_env` (feature `s3`),
+    /// which variable.
     Config(&'static str),
 }
 
