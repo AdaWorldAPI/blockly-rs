@@ -618,8 +618,11 @@ fn primitive_leaf(parent_id: &str, arr: &[Value]) -> Result<BlockRecord, Sb3Erro
                 .get(1)
                 .and_then(Value::as_str)
                 .ok_or_else(|| malformed("a broadcast primitive has no name"))?;
+            // Lowercased: Scratch matches broadcasts case-insensitively (the
+            // sb3 id is `broadcastMsgId-<lowercase>`), and the BROADCAST
+            // basin arm interns the same lowercase key.
             Ok(BlockRecord::leaf("event_broadcast_menu", id)
-                .with_field("BROADCAST_OPTION", FieldValue::Code(name.to_string())))
+                .with_field("BROADCAST_OPTION", FieldValue::Code(name.to_lowercase())))
         }
         12 => {
             let name = arr
@@ -662,29 +665,43 @@ fn scalar_text(v: Option<&Value>) -> Option<String> {
 
 /// Read one `fields` entry's value into a [`FieldValue`].
 ///
+/// **In sb3 a field is a dropdown unless it is one of the three literal
+/// fields** (`NUM`, `TEXT`, `COLOUR`) — measured on real project files, where
+/// every other field (`OPERATOR`, `KEY_OPTION`, `EFFECT`, `PROPERTY`,
+/// `STOP_OPTION`, …) carries a lowercase or mixed-case selector code. The
+/// all-caps heuristic the Blockly editor path uses would read `"sqrt"` or
+/// `"x position"` as a wide TEXT literal, so it is not applied here: a
+/// dropdown is `Code(text)` verbatim, and the cast's menu table (or the
+/// mathop selector table) decides what the code means.
+///
+/// Two codes are case-normalised because Scratch itself treats them so:
+/// a broadcast name is matched case-insensitively (the sb3 broadcast id is
+/// `broadcastMsgId-<lowercase name>`), so `BROADCAST_OPTION` lowercases;
+/// an `EFFECT` is stored lowercase (`"ghost"`, occasionally `"BRIGHTNESS"`)
+/// while the menu codebook lists the harvested uppercase codes, so it
+/// uppercases.
+///
 /// A variable/list/broadcast field is a **dropdown of names**: Scratch
 /// enforces unique names per scope, so the name — the FIRST element of the
 /// field array — is what a menu codebook interns, and the `id` parameter
 /// (the array's second element, when present) is deliberately unused here.
 fn read_sb3_field(name: &str, value: &Value, _id: Option<&str>) -> FieldValue {
-    let is_name_menu = matches!(name, "VARIABLE" | "LIST" | "BROADCAST_OPTION");
-    if is_name_menu {
-        let text = value
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| value.as_f64().map(|n| n.to_string()).unwrap_or_default());
-        return FieldValue::Code(text);
+    let text = if let Some(s) = value.as_str() {
+        s.to_string()
+    } else if let Some(n) = value.as_f64() {
+        n.to_string()
+    } else if let Some(b) = value.as_bool() {
+        if b { "TRUE" } else { "FALSE" }.to_string()
+    } else {
+        value.to_string()
+    };
+    match name {
+        "NUM" => crate::byte_or_wide(text),
+        "TEXT" | "COLOUR" => FieldValue::Wide(text),
+        "BROADCAST_OPTION" => FieldValue::Code(text.to_lowercase()),
+        "EFFECT" => FieldValue::Code(text.to_uppercase()),
+        _ => FieldValue::Code(text),
     }
-    if let Some(n) = value.as_f64() {
-        return crate::byte_or_wide(n.to_string());
-    }
-    if let Some(s) = value.as_str() {
-        return crate::byte_or_wide(s.to_string());
-    }
-    if let Some(b) = value.as_bool() {
-        return FieldValue::Code(if b { "TRUE" } else { "FALSE" }.to_string());
-    }
-    crate::byte_or_wide(value.to_string())
 }
 
 /// The project basin as seen from one target: every static menu prefix
@@ -743,17 +760,45 @@ pub fn target_basin(project: &Sb3Project, target: &Sb3Target) -> BasinCodebooks 
                 v.extend(target.lists.iter().cloned());
                 v
             }
+            // Broadcast names are interned LOWERCASE: a real project's
+            // `event_whenbroadcastreceived` fields spell the same message
+            // `"Green Flag"` and `"green flag"` in different sprites while
+            // the stage table and the sb3 id (`broadcastMsgId-green flag`)
+            // agree on one lowercase key. Stage first, then every sprite.
             "BROADCAST" => {
                 let mut v: Vec<String> = Vec::new();
                 if let Some(s) = stage {
-                    v.extend(s.broadcasts.iter().cloned());
+                    for name in &s.broadcasts {
+                        let key = name.to_lowercase();
+                        if !v.contains(&key) {
+                            v.push(key);
+                        }
+                    }
                 }
                 for t in &project.targets {
                     if !t.is_stage {
                         for name in &t.broadcasts {
-                            if !v.contains(name) {
-                                v.push(name.clone());
+                            let key = name.to_lowercase();
+                            if !v.contains(&key) {
+                                v.push(key);
                             }
+                        }
+                    }
+                }
+                v
+            }
+            // `sensing_of`'s PROPERTY: the fixed sprite/stage attributes
+            // (as observed in real project files), then EVERY target's
+            // variables — the property belongs to the OBJECT sprite, not
+            // to the sprite holding the block, so the basin must carry all
+            // of them. Duplicates (the same variable name in two sprites)
+            // intern once: the codebook is keyed by name.
+            "OF_PROPERTY" => {
+                let mut v: Vec<String> = OF_PROPERTIES.iter().map(|s| (*s).to_string()).collect();
+                for t in &project.targets {
+                    for name in &t.variables {
+                        if !v.contains(name) {
+                            v.push(name.clone());
                         }
                     }
                 }
@@ -784,6 +829,21 @@ pub fn target_basin(project: &Sb3Project, target: &Sb3Target) -> BasinCodebooks 
     }
     basin
 }
+
+/// The fixed attribute names a `sensing_of` PROPERTY dropdown offers before
+/// a target's own variables: the sprite attributes, then the stage-only
+/// ones. Observed in real project files (`"x position"`, `"costume #"`, …).
+pub const OF_PROPERTIES: &[&str] = &[
+    "x position",
+    "y position",
+    "direction",
+    "costume #",
+    "costume name",
+    "size",
+    "volume",
+    "backdrop #",
+    "backdrop name",
+];
 
 /// The fixed pointer/random/mouse names, then every sprite except `target`
 /// itself, in project order.
@@ -978,16 +1038,12 @@ mod tests {
         assert_eq!(touching.ty, "sensing_touchingobject");
         let menu = &touching.inputs[0].1;
         assert_eq!(menu.ty, "sensing_touchingobjectmenu");
-        // `_mouse_` is not all-uppercase, so the general `byte_or_wide`
-        // classifier reads it as `Wide`, not `Code` — and that is fine for
-        // casting: `blockly_abi`'s field resolution treats `Code` and `Wide`
-        // identically for any field the menu table names
-        // (`FieldValue::Code(c) | FieldValue::Wide(c) => c.clone()`), so a
-        // menu-shadow field resolves through the codebook regardless of
-        // which of the two this reader happened to classify it as.
+        // An sb3 field is a dropdown unless it is NUM/TEXT/COLOUR, so the
+        // shadow's `_mouse_` reads as `Code` verbatim — never through the
+        // all-caps heuristic, which would have called it a wide literal.
         assert_eq!(
             menu.field("TOUCHINGOBJECTMENU"),
-            Some(&FieldValue::Wide("_mouse_".to_string()))
+            Some(&FieldValue::Code("_mouse_".to_string()))
         );
     }
 
@@ -1424,14 +1480,13 @@ mod tests {
             .iter()
             .find(|s| s.ty == "argument_reporter_boolean")
             .unwrap();
-        // "flag" is lowercase, so the general `byte_or_wide` classifier
-        // reads it as `Wide`, not `Code` — same precedent as the
-        // `_mouse_` shadow menu test above. What matters here is that it
-        // is NOT `Byte(_)`: no enclosing definition scope means no
+        // An sb3 field is a dropdown unless it is NUM/TEXT/COLOUR, so the
+        // name reads as `Code("flag")`. What matters here is that it is
+        // NOT `Byte(_)`: no enclosing definition scope means no
         // argument-index resolution happens at all.
         assert_eq!(
             loose.field("VALUE"),
-            Some(&FieldValue::Wide("flag".to_string())),
+            Some(&FieldValue::Code("flag".to_string())),
             "no enclosing definition scope, so the reporter keeps its own name"
         );
     }
