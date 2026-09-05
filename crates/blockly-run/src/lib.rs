@@ -365,6 +365,10 @@ pub struct Procedure<'a> {
     pub functions: &'a [FunctionBody],
     /// The body function within `functions`.
     pub body: usize,
+    /// The sprite that owns the definition. A PROCEDURE index is minted per
+    /// target, so two sprites' "procedure 1" are different blocks; a scene
+    /// with owners bound resolves a call within the caller's sprite.
+    pub owner: usize,
 }
 
 impl<'a> Procedure<'a> {
@@ -378,6 +382,7 @@ impl<'a> Procedure<'a> {
             index: head.values.get(1).copied().unwrap_or(0),
             functions,
             body: usize::from(head.values.first().copied().unwrap_or(0)),
+            owner: 0,
         })
     }
 }
@@ -440,6 +445,14 @@ enum Op {
     DeleteClone,
     /// `data_showvariable` and friends: monitors have no model here.
     MonitorNoop,
+    /// `motion_goto`: operand is the GOTO menu index.
+    GoTo,
+    /// `motion_pointtowards`: operand is the POINT_TOWARDS menu index.
+    PointTowards,
+    /// `sensing_askandwait`: yields the slice; there is no input channel.
+    Ask,
+    /// `sensing_answer` / `sensing_username`: the empty text.
+    EmptyText,
 }
 
 /// The per-vocabulary execution plan: for every possible function byte, the
@@ -526,6 +539,10 @@ fn plan() -> &'static Plan {
                     "control_start_as_clone" => Op::Hat,
                     "data_showvariable" | "data_hidevariable" | "data_showlist"
                     | "data_hidelist" => Op::MonitorNoop,
+                    "motion_goto" => Op::GoTo,
+                    "motion_pointtowards" => Op::PointTowards,
+                    "sensing_askandwait" => Op::Ask,
+                    "sensing_answer" | "sensing_username" => Op::EmptyText,
                     _ => Op::Unimplemented,
                 }
             };
@@ -678,6 +695,9 @@ pub struct Machine<'a> {
     functions: &'a [FunctionBody],
     /// Custom blocks callable from this run, by index.
     procs: &'a [Procedure<'a>],
+    /// Whether procedure lookup is scoped to the caller's sprite (a scene
+    /// with owners bound) or global by index (the templates' shape).
+    scoped_procs: bool,
     /// The constant pool `POOL_LOAD` reads. `None` = every load is refused,
     /// which is what a program with no wide literal never notices.
     pool: Option<&'a ogar_loco::ConstantPool>,
@@ -732,6 +752,7 @@ impl<'a> Machine<'a> {
             stage: Stage::default(),
             functions,
             procs: &[],
+            scoped_procs: false,
             pool: None,
             basin: None,
             frames: Vec::new(),
@@ -747,6 +768,14 @@ impl<'a> Machine<'a> {
     #[must_use]
     pub fn with_procs(mut self, procs: &'a [Procedure<'a>]) -> Self {
         self.procs = procs;
+        self
+    }
+
+    /// Resolve procedure calls within the running sprite (its root, for a
+    /// clone) rather than globally by index.
+    #[must_use]
+    pub fn with_scoped_procs(mut self, scoped: bool) -> Self {
+        self.scoped_procs = scoped;
         self
     }
 
@@ -893,10 +922,21 @@ impl<'a> Machine<'a> {
                     return Err(RunError::StackUnderflow(f.0));
                 }
                 let args: Vec<Value> = self.stack.split_off(self.stack.len() - argc);
+                let me = self
+                    .stage
+                    .current
+                    .min(self.stage.sprites.len().saturating_sub(1));
+                let root = self
+                    .stage
+                    .sprites
+                    .get(me)
+                    .and_then(|s| s.clone_of)
+                    .unwrap_or(me);
+                let scoped = self.scoped_procs;
                 let proc_ = *self
                     .procs
                     .iter()
-                    .find(|p| p.index == index)
+                    .find(|p| p.index == index && (!scoped || p.owner == root))
                     .ok_or(RunError::UnknownProcedure(index))?;
                 self.frames.push(args);
                 let outcome = self.exec_in(proc_.functions, proc_.body);
@@ -1096,6 +1136,19 @@ impl<'a> Machine<'a> {
             FnIndex::NOT => Some(f32::from(a(0) == 0.0)),
             FnIndex::ABS => Some(a(0).abs()),
             FnIndex::ROUND => Some(a(0).round()),
+            FnIndex::FLOOR => Some(a(0).floor()),
+            FnIndex::CEIL => Some(a(0).ceil()),
+            FnIndex::SQRT => Some(a(0).sqrt()),
+            FnIndex::SIN => Some(a(0).to_radians().sin()),
+            FnIndex::COS => Some(a(0).to_radians().cos()),
+            FnIndex::TAN => Some(a(0).to_radians().tan()),
+            FnIndex::ASIN => Some(a(0).asin().to_degrees()),
+            FnIndex::ACOS => Some(a(0).acos().to_degrees()),
+            FnIndex::ATAN => Some(a(0).atan().to_degrees()),
+            FnIndex::LN => Some(a(0).ln()),
+            FnIndex::LOG10 => Some(a(0).log10()),
+            FnIndex::EXP_E => Some(a(0).exp()),
+            FnIndex::EXP_10 => Some(10f32.powf(a(0))),
             // The immediate is the VARIABLE codebook byte — which variable.
             FnIndex::VAR_GET => Some(s.var(imm as u8)),
             // The immediate is the argument's POSITION in the innermost
@@ -1361,6 +1414,45 @@ impl<'a> Machine<'a> {
                 Ok(None)
             }
             Op::MonitorNoop => Ok(None),
+            // GOTO / POINT_TOWARDS menus: 1 = `_mouse_`, 2 = `_random_`,
+            // k ≥ 3 = the (k−3)th OTHER sprite in stage order (the menu
+            // lists every sprite but the holder).
+            Op::GoTo | Op::PointTowards => {
+                let pick = a(0) as usize;
+                let target: Option<(f32, f32)> = match pick {
+                    1 => Some((s.mouse_x, s.mouse_y)),
+                    2 => {
+                        let r1 = s.next_random();
+                        let r2 = s.next_random();
+                        let u = |r: u64| (r >> 11) as f32 / (1u64 << 53) as f32;
+                        Some((
+                            (u(r1) * 2.0 - 1.0) * s.half_w,
+                            (u(r2) * 2.0 - 1.0) * s.half_h,
+                        ))
+                    }
+                    k if k >= 3 => (0..s.sprites.len())
+                        .filter(|&i| i != me)
+                        .nth(k - 3)
+                        .map(|i| (s.sprites[i].x, s.sprites[i].y)),
+                    _ => None,
+                };
+                if let Some((tx, ty)) = target {
+                    if matches!(plan().op[usize::from(f.0)], Op::GoTo) {
+                        s.sprites[me].x = tx;
+                        s.sprites[me].y = ty;
+                    } else {
+                        let (dx, dy) = (tx - s.sprites[me].x, ty - s.sprites[me].y);
+                        // Scratch heading: 90 = right, 0 = up.
+                        s.sprites[me].direction = dx.atan2(dy).to_degrees();
+                    }
+                }
+                Ok(None)
+            }
+            Op::Ask => {
+                self.budget = 0;
+                Ok(None)
+            }
+            Op::EmptyText => Ok(Some(Value::Text(0))),
         }
     }
 }
@@ -1430,10 +1522,26 @@ pub struct Scene<'a> {
     pool: Option<&'a ogar_loco::ConstantPool>,
     /// The basin every script's `text` literals are read from.
     basin: Option<&'a ogar_loco::basin::BasinCodebooks>,
+    /// Per-sprite registers, when a project casts each target against its
+    /// OWN basin and pool (the sb3 shape): index = sprite; `None` falls back
+    /// to the scene-wide pair above. A clone reads its root's registers.
+    sprite_regs: Vec<
+        Option<(
+            &'a ogar_loco::basin::BasinCodebooks,
+            &'a ogar_loco::ConstantPool,
+        )>,
+    >,
     /// Which sprite each scheduled script controls. Defaults to the script's
     /// own index (one script per sprite, the templates' shape); a real
     /// project sets it with [`Scene::with_owners`].
     owners: Vec<usize>,
+    /// Each scheduled script's position in the ORIGINAL `scripts` list.
+    sched_orig: Vec<usize>,
+    /// Each procedure's defining script's position in the original list.
+    def_orig: Vec<usize>,
+    /// Whether [`Scene::with_owners`] was applied — procedure lookup is then
+    /// scoped by sprite.
+    owners_bound: bool,
     /// The baked participation masks — see [`Wake`].
     wake: WakeTable,
     /// Scratch space for the round's awake mask, reused every round.
@@ -1461,16 +1569,27 @@ impl<'a> Scene<'a> {
     pub fn new(stage: Stage, scripts: Vec<&'a [FunctionBody]>) -> Self {
         let (defs, scheduled): (Vec<_>, Vec<_>) = scripts
             .into_iter()
-            .partition(|s| Procedure::of_script(s).is_some());
-        let procs = defs.into_iter().filter_map(Procedure::of_script).collect();
+            .enumerate()
+            .partition(|(_, s)| Procedure::of_script(s).is_some());
+        let def_orig: Vec<usize> = defs.iter().map(|(i, _)| *i).collect();
+        let sched_orig: Vec<usize> = scheduled.iter().map(|(i, _)| *i).collect();
+        let procs: Vec<Procedure<'a>> = defs
+            .iter()
+            .filter_map(|(i, s)| Procedure::of_script(s).map(|p| Procedure { owner: *i, ..p }))
+            .collect();
+        let scheduled: Vec<&'a [FunctionBody]> = scheduled.into_iter().map(|(_, s)| s).collect();
         let wake = WakeTable::build(&scheduled);
         Self {
             stage,
-            owners: (0..scheduled.len()).collect(),
+            owners: sched_orig.clone(),
+            sched_orig,
+            def_orig,
+            owners_bound: false,
             scripts: scheduled,
             procs,
             pool: None,
             basin: None,
+            sprite_regs: Vec::new(),
             awake: Vec::with_capacity(wake.words),
             wake,
             trace: Vec::new(),
@@ -1493,15 +1612,42 @@ impl<'a> Scene<'a> {
         self
     }
 
-    /// Bind each scheduled script to the sprite it controls, by index into
-    /// the ORIGINAL `scripts` list handed to [`Scene::new`] (definition
-    /// scripts are skipped, as they are not scheduled). Missing or
-    /// out-of-range entries keep the default binding.
+    /// The registers one sprite's scripts were cast against — its own
+    /// `target_basin` and `LoweringContext` pool. Call once per sprite; a
+    /// sprite without an entry uses the scene-wide basin/pool.
+    #[must_use]
+    pub fn with_sprite_registers(
+        mut self,
+        sprite: usize,
+        basin: &'a ogar_loco::basin::BasinCodebooks,
+        pool: &'a ogar_loco::ConstantPool,
+    ) -> Self {
+        if self.sprite_regs.len() <= sprite {
+            self.sprite_regs.resize(sprite + 1, None);
+        }
+        self.sprite_regs[sprite] = Some((basin, pool));
+        self
+    }
+
+    /// Bind every script — scheduled or definition — to the sprite it
+    /// belongs to: `owners[k]` is the sprite of the k-th entry of the
+    /// ORIGINAL `scripts` list handed to [`Scene::new`]. Scripts past the
+    /// end of `owners` keep the default binding. Once bound, a procedure
+    /// call resolves within the caller's sprite (a PROCEDURE index is
+    /// minted per target).
     #[must_use]
     pub fn with_owners(mut self, owners: &[usize]) -> Self {
-        for (slot, o) in self.owners.iter_mut().zip(owners) {
-            *slot = *o;
+        for (k, slot) in self.owners.iter_mut().enumerate() {
+            if let Some(o) = owners.get(self.sched_orig[k]) {
+                *slot = *o;
+            }
         }
+        for (j, p) in self.procs.iter_mut().enumerate() {
+            if let Some(o) = owners.get(self.def_orig[j]) {
+                p.owner = *o;
+            }
+        }
+        self.owners_bound = true;
         self
     }
 
@@ -1602,13 +1748,27 @@ impl<'a> Scene<'a> {
         'a: 'p,
     {
         let script = self.scripts[i];
+        // A clone reads the registers of the sprite it was cloned from.
+        let root = self
+            .stage
+            .sprites
+            .get(sprite)
+            .and_then(|s| s.clone_of)
+            .unwrap_or(sprite);
+        let regs = self.sprite_regs.get(root).copied().flatten();
         let stage = core::mem::take(&mut self.stage);
-        let mut m = Machine::resuming(script, slice, stage, sprite).with_procs(procs);
-        if let Some(pool) = self.pool {
-            m = m.with_pool(pool);
-        }
-        if let Some(basin) = self.basin {
-            m = m.with_basin(basin);
+        let mut m = Machine::resuming(script, slice, stage, sprite)
+            .with_procs(procs)
+            .with_scoped_procs(self.owners_bound);
+        if let Some((basin, pool)) = regs {
+            m = m.with_basin(basin).with_pool(pool);
+        } else {
+            if let Some(pool) = self.pool {
+                m = m.with_pool(pool);
+            }
+            if let Some(basin) = self.basin {
+                m = m.with_basin(basin);
+            }
         }
         let outcome = m.run();
         self.stage = m.stage;
@@ -2791,5 +2951,68 @@ mod tests {
             "Paddle is OF_OBJECT index 3 → sprite 1"
         );
         assert_eq!(m.stage.sprites[0].y, 42.0, "the variable resolved by name");
+    }
+
+    /// A PROCEDURE index is minted per target: two sprites each own a
+    /// "procedure 1" with different bodies. With owners bound, each caller
+    /// reaches ITS sprite's definition — never the other's.
+    #[test]
+    fn procedure_calls_resolve_within_the_callers_sprite_once_owners_are_bound() {
+        let basin = basin_with(&[(28, &["step"])]);
+        let def = |dx: u8| {
+            rec(
+                "procedures_definition",
+                vec![("PROCCODE".into(), FieldValue::Code("step".into()))],
+                vec![],
+                vec![(
+                    "SUBSTACK".into(),
+                    rec(
+                        "motion_changexby",
+                        vec![],
+                        vec![("DX".into(), num(dx))],
+                        vec![],
+                        None,
+                    ),
+                )],
+                None,
+            )
+        };
+        let call = rec(
+            "procedures_call",
+            vec![
+                ("PROCCODE".into(), FieldValue::Code("step".into())),
+                ("ARGC".into(), FieldValue::Byte(0)),
+            ],
+            vec![],
+            vec![],
+            None,
+        );
+        let cast =
+            |r: &BlockRecord| blockly_abi::lower_program_in(LaneShape::Triples, r, &basin).unwrap();
+        // Original script order: [def A (+1), call A, def B (+100), call B]
+        let (da, ca, db, cb) = (cast(&def(1)), cast(&call), cast(&def(100)), cast(&call));
+        let stage = Stage {
+            sprites: vec![Sprite::default(), Sprite::default()],
+            ..Stage::default()
+        };
+        let mut scene = Scene::new(
+            stage,
+            vec![
+                da.functions.as_slice(),
+                ca.functions.as_slice(),
+                db.functions.as_slice(),
+                cb.functions.as_slice(),
+            ],
+        )
+        .with_owners(&[0, 0, 1, 1]);
+        scene.run(1, 100).unwrap();
+        assert_eq!(
+            scene.stage.sprites[0].x, 1.0,
+            "sprite 0's call reached ITS +1 definition"
+        );
+        assert_eq!(
+            scene.stage.sprites[1].x, 100.0,
+            "sprite 1's call reached ITS +100 definition"
+        );
     }
 }

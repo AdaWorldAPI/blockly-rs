@@ -427,6 +427,21 @@ fn read_sb3_block(
                     .sort_by_key(|(n, _)| order.iter().position(|o| o == n).unwrap_or(usize::MAX));
             }
         }
+        // An EMPTY boolean socket — `<not <>>`, `if <> then` — is `false` in
+        // Scratch. sb3 simply omits the input, and the core op would then
+        // pop nothing (measured: 13 `StackUnderflow NOT` on one real
+        // project). The literal is pushed here, at intake, in socket order.
+        for socket in boolean_sockets(opcode) {
+            if !rec.inputs.iter().any(|(n, _)| n == socket) {
+                let pos = boolean_sockets(opcode)
+                    .iter()
+                    .position(|s| s == socket)
+                    .unwrap_or(rec.inputs.len())
+                    .min(rec.inputs.len());
+                rec.inputs
+                    .insert(pos, ((*socket).to_string(), false_leaf(id, socket)));
+            }
+        }
 
         rec
     };
@@ -532,17 +547,44 @@ fn read_procedures_call(
         .with_field("PROCCODE", FieldValue::Code(proccode.to_string()))
         .with_field("ARGC", FieldValue::Byte(argc));
 
+    // Every declared argument is pushed: an empty one (`[1, null]`, or
+    // absent — an unfilled boolean argument) is `false`, so the call's
+    // operand count always equals `ARGC` and the callee's frame lines up
+    // with `argumentnames` (measured: 5 `StackUnderflow PROC_CALL` on one
+    // real project before this).
     let inputs_obj = obj.get("inputs").and_then(Value::as_object);
     for argid in &argumentids {
-        let Some(input_val) = inputs_obj.and_then(|m| m.get(argid)) else {
-            continue;
+        let child = match inputs_obj.and_then(|m| m.get(argid)) {
+            Some(input_val) => read_sb3_input(id, input_val, blocks, scope)?,
+            None => None,
         };
-        if let Some(child) = read_sb3_input(id, input_val, blocks, scope)? {
-            rec = rec.with_input(argid.clone(), child);
-        }
+        rec = rec.with_input(
+            argid.clone(),
+            child.unwrap_or_else(|| false_leaf(id, argid)),
+        );
     }
 
     Ok(rec)
+}
+
+/// The boolean sockets of the opcodes that have one, in socket order —
+/// the sockets sb3 omits when empty and Scratch reads as `false`.
+fn boolean_sockets(opcode: &str) -> &'static [&'static str] {
+    match opcode {
+        "operator_not" => &["OPERAND"],
+        "operator_and" | "operator_or" => &["OPERAND1", "OPERAND2"],
+        "control_if" | "control_if_else" | "control_wait_until" | "control_repeat_until" => {
+            &["CONDITION"]
+        }
+        _ => &[],
+    }
+}
+
+/// The `false` literal an empty boolean socket reads as: Blockly's
+/// `logic_boolean[FALSE]`, which resolves to the shared core's `FALSE`.
+fn false_leaf(id: &str, socket: &str) -> BlockRecord {
+    BlockRecord::leaf("logic_boolean", format!("{id}_{socket}_false"))
+        .with_field("BOOL", FieldValue::Code("FALSE".to_string()))
 }
 
 /// The statement-input names of an sb3 opcode, for the SUBSTACK naming
@@ -1198,9 +1240,14 @@ mod tests {
             ],
             "PROCCODE then ARGC, in that order"
         );
-        assert!(
-            call.inputs.is_empty(),
-            "declared id `a` has no `inputs` entry at all, so no input is emitted"
+        // Declared id `a` has no `inputs` entry at all: an unfilled argument
+        // is `false`, pushed so the operand count equals ARGC.
+        assert_eq!(call.inputs.len(), 1);
+        assert_eq!(call.inputs[0].0, "a");
+        assert_eq!(call.inputs[0].1.ty, "logic_boolean");
+        assert_eq!(
+            call.inputs[0].1.field("BOOL"),
+            Some(&FieldValue::Code("FALSE".into()))
         );
     }
 
@@ -1600,11 +1647,10 @@ mod tests {
             Some(&FieldValue::Byte(2)),
             "ARGC is the DECLARED count from argumentids"
         );
-        assert!(
-            empty.inputs.len() < 2,
-            "fewer populated inputs than ARGC — both declared arguments are `[1, null]`"
-        );
-        assert_eq!(empty.inputs.len(), 0);
+        // Both declared arguments are `[1, null]`: each is pushed as `false`,
+        // so the operand count EQUALS ARGC and the callee's frame lines up.
+        assert_eq!(empty.inputs.len(), 2, "one operand per declared argument");
+        assert!(empty.inputs.iter().all(|(_, b)| b.ty == "logic_boolean"));
     }
 
     #[test]
