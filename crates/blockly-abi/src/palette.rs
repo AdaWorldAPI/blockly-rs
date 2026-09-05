@@ -34,6 +34,7 @@
 //! same `0x1701` shape with different palettes.
 
 use ogar_loco::registry::{RegistryError, VocabularyRegistry};
+use ogar_loco::vocabulary::ValueCodebook;
 use ogar_loco::{FnIndex, Vocabulary};
 
 /// This palette's content concept — the first consumer slot in the
@@ -89,6 +90,14 @@ impl Vocabulary for BlocklyPalette {
     fn domain_body_refs(&self, f: FnIndex) -> u8 {
         crate::scratch::device_by_byte(f.0).map_or(0, |(_, _, refs)| refs)
     }
+
+    /// A device row carrying a dropdown declares the menu's codebook — the
+    /// declaration OGAR #295's `BasinCodebooks::resolve_operand` reads. The
+    /// table it names is built by [`crate::menus::basin_codebooks`].
+    fn domain_value_codebook(&self, f: FnIndex) -> Option<ValueCodebook> {
+        let (name, ..) = crate::scratch::device_by_byte(f.0)?;
+        crate::menus::menu_for_block(name).map(|(_, m)| crate::menus::value_codebook(m))
+    }
 }
 
 /// Plug this palette into a registry under [`PALETTE_CONCEPT`].
@@ -138,6 +147,46 @@ mod tests {
         let unminted = FnIndex(0xFF);
         assert!(crate::scratch::device_by_byte(0xFF).is_none());
         assert_eq!(v.stack_arity(unminted), None);
+    }
+
+    /// The declaration is load-bearing: a menu-bearing byte's operand resolves
+    /// end to end through the substrate's seam, and a byte with no menu
+    /// declares nothing — so the seam discriminates.
+    #[test]
+    fn a_menu_bearing_byte_declares_its_codebook_and_the_operand_resolves() {
+        use crate::menus;
+        use ogar_loco::Call;
+        let v = BlocklyPalette;
+        let (key_byte, ..) = crate::scratch::device("event_whenkeypressed").unwrap();
+        let declared = v
+            .value_codebook(FnIndex(key_byte))
+            .expect("declares KEY_OPTION");
+        assert_eq!(declared.name, "KEY_OPTION");
+
+        let basin = menus::basin_codebooks(
+            ogar_loco::pool::placeholder::CONST_UTF8_INLINE,
+            menus::PLACEHOLDER_DIGEST_CLASSID,
+        );
+        let up = menus::encode(menus::menu_by_id(declared.id).unwrap(), "up arrow").unwrap();
+        let call = Call::with_values(FnIndex(key_byte), [up, 0, 0]);
+        let entry = basin
+            .resolve_operand(&v, &call, 0)
+            .expect("the palette's declaration reaches the sealed table");
+        assert_eq!(&entry.bytes[..8], b"up arrow");
+        assert!(basin.covers(&v, FnIndex(key_byte)));
+
+        // Silence half: `motion_movesteps` has no dropdown, declares nothing,
+        // and the same byte in ITS operand slot resolves to nothing.
+        let mv = FnIndex(DEVICE_FAMILY_FLOOR);
+        assert_eq!(v.value_codebook(mv), None);
+        assert!(
+            basin
+                .resolve_operand(&v, &Call::with_values(mv, [up, 0, 0]), 0)
+                .is_none()
+        );
+        // And the shared core never declares (substrate rule), so
+        // `control_stop`'s STOP_OPTION is the palette's alone — see `menus`.
+        assert_eq!(v.value_codebook(FnIndex::STOP), None);
     }
 
     #[test]

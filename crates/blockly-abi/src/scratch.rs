@@ -29,7 +29,7 @@
 //! |---|---|---|
 //! | device families (motion/looks/sound/event/sensing, + clones, + stage monitors) | 94 | minted HERE, `0x90..=0xED` |
 //! | logic (operators / control / data / procedures) | 43 + 14 mathop codes | the SHARED CORE, zero mints |
-//! | dropdown menus | 15 | values, not operations |
+//! | dropdown menus | 13 shadow blocks + 15 inline fields | values — `0xEE..=0xFA` reporters whose immediate indexes a basin codebook (`crate::menus`) |
 //! | editor-only (prototype / declaration / argument editors) | 4 | not operations at all |
 //!
 //! That table is the sharing discipline paying off, measured rather than
@@ -39,10 +39,11 @@
 //! without reference to Scratch. Two frontends, one computational core; only
 //! the sprite-and-stage half is Scratch's own.
 //!
-//! The 94 device mints occupy `0x90..=0xED`, leaving 18 slots of the palette
-//! range spare for Scratch extensions (pen, music, video sensing), which are
-//! deliberately NOT minted here — they live in separate extension files and
-//! would be harvested the same way when a consumer needs them.
+//! The 94 device mints occupy `0x90..=0xED`; the 13 menu shadow blocks take
+//! `0xEE..=0xFA`, leaving 5 slots. Scratch extensions (pen, music, video
+//! sensing) are deliberately NOT minted here — and per OGAR #295 they never
+//! will be one-opcode-per-block: an extension is ONE `FnIndex` whose operand
+//! indexes a codebook, exactly as the menus below already are.
 
 use crate::codebook::{CodeRole, OpcodeMapping};
 use ogar_loco::FnIndex;
@@ -149,6 +150,22 @@ pub const SCRATCH_DEVICE: &[(&str, u8, u8, u8)] = &[
     ("data_hidevariable", 0xEB, 0, 0),
     ("data_showlist", 0xEC, 0, 0),
     ("data_hidelist", 0xED, 0, 0),
+    // Menu shadow blocks — values that arrive as nested reporters. Each is a
+    // 0-arity reporter whose immediate indexes its basin codebook
+    // (`crate::menus`), per OGAR #295: a menu is a value table, not N opcodes.
+    ("sensing_keyoptions", 0xEE, 0, 0),
+    ("event_touchingobjectmenu", 0xEF, 0, 0),
+    ("sensing_touchingobjectmenu", 0xF0, 0, 0),
+    ("sensing_distancetomenu", 0xF1, 0, 0),
+    ("motion_pointtowards_menu", 0xF2, 0, 0),
+    ("motion_goto_menu", 0xF3, 0, 0),
+    ("motion_glideto_menu", 0xF4, 0, 0),
+    ("sensing_of_object_menu", 0xF5, 0, 0),
+    ("looks_costume", 0xF6, 0, 0),
+    ("looks_backdrops", 0xF7, 0, 0),
+    ("sound_sounds_menu", 0xF8, 0, 0),
+    ("event_broadcast_menu", 0xF9, 0, 0),
+    ("control_create_clone_of_menu", 0xFA, 0, 0),
 ];
 
 /// Scratch operations that resolve to an EXISTING shared-core function.
@@ -244,8 +261,9 @@ pub fn device_by_byte(byte: u8) -> Option<(&'static str, u8, u8)> {
 
 /// Resolve a Scratch block type to its function.
 ///
-/// Returns `None` for menus, editor-only blocks, and the Scratch-internal
-/// counter blocks — never a guess. A `None` here is the same loud refusal the
+/// Returns `None` for editor-only blocks and the Scratch-internal counter
+/// blocks — never a guess. Menu shadow blocks DO resolve: they are device
+/// reporters whose immediate is a codebook index (`crate::menus`). A `None` here is the same loud refusal the
 /// Blockly codebook gives: the cast refuses rather than storing wrong bytes.
 #[must_use]
 pub fn resolve_scratch(ty: &str, code: Option<&str>) -> Option<OpcodeMapping> {
@@ -283,9 +301,11 @@ pub fn resolve_scratch(ty: &str, code: Option<&str>) -> Option<OpcodeMapping> {
 /// provenance fence exists to prevent, so tile colour is left to the page as
 /// a labelled presentation choice.
 ///
-/// Menus, editor-only blocks, and the Scratch-internal counter blocks are
-/// excluded: they are not operations, so offering them would put a block on
-/// the palette that the cast refuses on drag.
+/// Editor-only blocks and the Scratch-internal counter blocks are excluded:
+/// they are not operations, so offering them would put a block on the palette
+/// that the cast refuses on drag. Menu shadow blocks are excluded too — they
+/// are values seated INSIDE a consuming block's input (`menus::MENU_INPUTS`),
+/// never dragged on their own.
 pub const SCRATCH_CATEGORIES: &[(&str, &str, &[&str])] = &[
     (
         "Motion",
@@ -1107,6 +1127,56 @@ pub const SCRATCH_BLOCK_DEFS: &[BlockDef] = &[
     ("data_showlist", "data", Shape::Statement, &[], &[]),
     ("data_hidelist", "data", Shape::Statement, &[], &[]),
     ("procedures_call", "procedures", Shape::Statement, &[], &[]),
+    // Menu shadow blocks: reporters carrying one dropdown (see `crate::menus`).
+    ("sensing_keyoptions", "sensing", Shape::Reporter, &[], &[]),
+    (
+        "event_touchingobjectmenu",
+        "event",
+        Shape::Reporter,
+        &[],
+        &[],
+    ),
+    (
+        "sensing_touchingobjectmenu",
+        "sensing",
+        Shape::Reporter,
+        &[],
+        &[],
+    ),
+    (
+        "sensing_distancetomenu",
+        "sensing",
+        Shape::Reporter,
+        &[],
+        &[],
+    ),
+    (
+        "motion_pointtowards_menu",
+        "motion",
+        Shape::Reporter,
+        &[],
+        &[],
+    ),
+    ("motion_goto_menu", "motion", Shape::Reporter, &[], &[]),
+    ("motion_glideto_menu", "motion", Shape::Reporter, &[], &[]),
+    (
+        "sensing_of_object_menu",
+        "sensing",
+        Shape::Reporter,
+        &[],
+        &[],
+    ),
+    ("looks_costume", "looks", Shape::Reporter, &[], &[]),
+    ("looks_backdrops", "looks", Shape::Reporter, &[], &[]),
+    ("sound_sounds_menu", "sound", Shape::Reporter, &[], &[]),
+    ("event_broadcast_menu", "event", Shape::Reporter, &[], &[]),
+    (
+        "control_create_clone_of_menu",
+        "control",
+        Shape::Reporter,
+        &[],
+        &[],
+    ),
 ];
 
 #[cfg(test)]
@@ -1117,7 +1187,11 @@ mod tests {
     /// The device allocation is dense, in range, and collision-free.
     #[test]
     fn the_device_mint_is_dense_in_range_and_unique() {
-        assert_eq!(SCRATCH_DEVICE.len(), 94);
+        assert_eq!(
+            SCRATCH_DEVICE.len(),
+            94 + 13,
+            "94 operations + 13 menu shadow blocks"
+        );
         let floor = crate::palette::DEVICE_FAMILY_FLOOR;
         let mut bytes: Vec<u8> = SCRATCH_DEVICE.iter().map(|&(_, b, ..)| b).collect();
         let n = bytes.len();
@@ -1129,7 +1203,7 @@ mod tests {
             floor,
             "allocation must start at the floor"
         );
-        assert_eq!(*bytes.last().unwrap(), 0xED);
+        assert_eq!(*bytes.last().unwrap(), 0xFA);
         // Dense: no holes inside the allocated span.
         for (i, b) in bytes.iter().enumerate() {
             assert_eq!(*b, floor + i as u8, "hole in the device allocation");
@@ -1146,8 +1220,9 @@ mod tests {
                 "{name} is not in the domain range"
             );
         }
-        // …and 15 slots stay free for the extensions deliberately not minted.
-        assert_eq!(0xFFu16 - u16::from(*bytes.last().unwrap()), 18);
+        // …and 5 slots stay free. Extensions do not need them: per OGAR #295
+        // an extension is one opcode plus a codebook, never a block per slot.
+        assert_eq!(0xFFu16 - u16::from(*bytes.last().unwrap()), 5);
     }
 
     /// Scratch's LOGIC half needs no mint — the substrate already has it.
@@ -1237,9 +1312,10 @@ mod tests {
     /// Non-operations are refused, loudly, rather than given an opcode.
     #[test]
     fn menus_editors_and_internals_do_not_resolve() {
+        // Menu shadow blocks USED to be refused here. They now resolve — as
+        // reporters carrying a codebook index — so the two former entries
+        // moved to the can-fire half below (deliberate re-pin, OGAR #295).
         for ty in [
-            "motion_goto_menu",            // dropdown shadow — a value
-            "looks_costume",               // dropdown shadow — a value
             "procedures_prototype",        // editor-only
             "argument_editor_boolean",     // editor-only
             "control_get_counter",         // Scratch-internal legacy
@@ -1252,6 +1328,8 @@ mod tests {
         }
         // …and the can-fire half, so the refusal above carries information.
         assert!(resolve_scratch("motion_movesteps", None).is_some());
+        assert!(resolve_scratch("motion_goto_menu", None).is_some());
+        assert!(resolve_scratch("looks_costume", None).is_some());
         assert!(resolve_scratch("operator_mathop", Some("sqrt")).is_some());
         // A mathop with an unknown dropdown code is refused, not guessed.
         assert!(resolve_scratch("operator_mathop", Some("tesseract")).is_none());
@@ -1279,8 +1357,14 @@ mod tests {
                 "{ty} is on the palette but the cast refuses it"
             );
         }
-        // No device operation is hidden from the palette.
+        // No device operation is hidden from the palette. Menu shadow blocks
+        // are values seated inside an input, not tiles — and every one of
+        // them IS seated by some consumer (pinned in `menus`).
         for &(name, ..) in SCRATCH_DEVICE {
+            if crate::menus::is_menu_block(name) {
+                assert!(!offered.contains(&name), "{name} is a menu, not a tile");
+                continue;
+            }
             assert!(
                 offered.contains(&name),
                 "{name} is minted but invisible on the palette"

@@ -83,6 +83,7 @@ use ogar_loco::{BodyError, Call, FnIndex, FunctionBody, LaneShape};
 
 pub mod codebook;
 pub mod klickweg;
+pub mod menus;
 pub mod palette;
 pub mod program;
 pub mod projection;
@@ -640,6 +641,30 @@ pub(crate) fn call_for(
     };
 
     for (name, v) in &block.fields {
+        // A dropdown the menu table names is a CODEBOOK INDEX, whatever
+        // shape the shim guessed for it: Scratch codes are lowercase
+        // (`"up arrow"`, `"front"`) so the all-caps heuristic reads them as
+        // wide literals, and the digit keys `"0".."9"` arrive as bytes. The
+        // table, not the spelling, decides — and a code outside the static
+        // prefix is refused, never interned as text.
+        if let Some(menu) = menus::menu_for_field(&block.ty, name) {
+            let text: String = match v {
+                FieldValue::Code(c) | FieldValue::Wide(c) => c.clone(),
+                FieldValue::Byte(b) => b.to_string(),
+                FieldValue::Ref { id } => {
+                    return Err(CastError::UnresolvedRef {
+                        ty: block.ty.clone(),
+                        id: id.clone(),
+                    });
+                }
+            };
+            let idx = menus::encode(menu, &text).ok_or_else(|| CastError::UnencodedValueParam {
+                ty: block.ty.clone(),
+                code: text.clone(),
+            })?;
+            push(idx)?;
+            continue;
+        }
         match v {
             FieldValue::Byte(b) => push(*b)?,
             FieldValue::Wide(text) => match ctx.as_deref_mut() {
