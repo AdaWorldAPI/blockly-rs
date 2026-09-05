@@ -238,6 +238,22 @@ pub fn raise_body_pooled(
             .find(|&&(t, ..)| t == ty)
             .map_or((&[][..], &[][..]), |&(_, _, _, v, s)| (v, s));
 
+        // A list op's first operand is the handle `data_listcontents` pushed
+        // for its LIST field; fold it back into the field so the raised block
+        // is the block the user dragged, not the core's operand shape.
+        let mut fields: Vec<(String, FieldValue)> = Vec::new();
+        let mut operands = operands;
+        if crate::is_list_op(f)
+            && operands
+                .first()
+                .is_some_and(|o| o.ty == "data_listcontents")
+        {
+            let handle = operands.remove(0);
+            if let Some(list) = handle.field("LIST") {
+                fields.push(("LIST".to_string(), list.clone()));
+            }
+        }
+
         // Value operands and statement bodies go into SEPARATE fields —
         // `BlockRecord` keeps the two-quantity split in the type itself, and
         // merging them here would reintroduce exactly the conflation the ABI's
@@ -262,7 +278,6 @@ pub fn raise_body_pooled(
             }
         }
 
-        let mut fields: Vec<(String, FieldValue)> = Vec::new();
         if let Some(c) = code {
             fields.push(("OP".to_string(), FieldValue::Code(c.to_string())));
         }
@@ -280,7 +295,9 @@ pub fn raise_body_pooled(
         // A dropdown rides in the same slot, as a codebook index. Decoded
         // through the static prefix; a byte past it is a project's own entry
         // (a sprite name the palette cannot know) and is refused, not guessed.
-        if let Some((field, menu)) = crate::menus::menu_for_block(ty) {
+        if let Some((field, menu)) = crate::menus::menu_for_block(ty)
+            && !crate::is_list_op(f)
+        {
             let b = call.values.get(refs).copied().unwrap_or(0);
             // `0` is the empty selection (an unset menu, or a template's
             // unnamed variable), not an unknown option: it raises as `""`,
@@ -735,5 +752,61 @@ mod tests {
         let prog2 = lower_program_with_pool(LaneShape::Pairs, &raised, basin, &mut again).unwrap();
         assert_eq!(prog2.functions, prog.functions);
         assert_eq!(again.pool, ctx.pool);
+    }
+
+    /// A Scratch list op lowers to the HANDLE PUSH then the core op (the
+    /// core pops the list as an operand), raises back to the block with its
+    /// LIST field (the handle folded away), and re-lowers byte-identical.
+    #[test]
+    fn a_list_op_pushes_its_handle_first_and_round_trips_through_the_field() {
+        use ogar_loco::basin::BasinCodebooks;
+        let utf8 = ogar_loco::pool::placeholder::CONST_UTF8_INLINE;
+        let mut basin = BasinCodebooks::new();
+        let m = crate::menus::menu_by_id(26).unwrap();
+        let mut b =
+            crate::menus::builder(m, utf8, crate::menus::PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        b.intern(utf8, b"scores").unwrap();
+        basin.plug(b.seal()).unwrap();
+        let num =
+            |v: u8| BlockRecord::leaf("math_number", "n").with_field("NUM", FieldValue::Byte(v));
+        // add 5 to [scores]; replace item 1 of [scores] with 9
+        let script = BlockRecord::leaf("data_addtolist", "a")
+            .with_field("LIST", FieldValue::Code("scores".into()))
+            .with_input("ITEM", num(5))
+            .with_next(
+                BlockRecord::leaf("data_replaceitemoflist", "r")
+                    .with_field("LIST", FieldValue::Code("scores".into()))
+                    .with_input("INDEX", num(1))
+                    .with_input("ITEM", num(9)),
+            );
+        let prog = crate::lower_program_in(LaneShape::Pairs, &script, &basin).unwrap();
+        let calls = crate::raise_calls(prog.entry());
+        let handle = crate::scratch::device("data_listcontents").unwrap().0;
+        let list_idx = crate::menus::encode_in(&basin, m, "scores").unwrap();
+        // handle, 5, ADD, handle, 1, 9, SET
+        assert_eq!(calls[0].function.0, handle);
+        assert_eq!(calls[0].values[0], list_idx);
+        assert_eq!(calls[2].function, FnIndex::LIST_ADD);
+        assert_eq!(calls[2].values[0], 0, "the op itself carries no list byte");
+        assert_eq!(calls[3].function.0, handle);
+        assert_eq!(calls[6].function, FnIndex::LIST_SET);
+
+        let raised = raise_program_in(&prog.functions, &basin).unwrap().unwrap();
+        assert_eq!(raised.ty, "data_addtolist");
+        assert_eq!(
+            raised.field("LIST"),
+            Some(&FieldValue::Code("scores".into()))
+        );
+        assert_eq!(
+            raised.inputs.len(),
+            1,
+            "the handle is folded into the field, not an input"
+        );
+        let second = raised.next.as_ref().unwrap();
+        assert_eq!(second.ty, "data_replaceitemoflist");
+        assert_eq!(second.inputs.len(), 2);
+
+        let again = crate::lower_program_in(LaneShape::Pairs, &raised, &basin).unwrap();
+        assert_eq!(again.functions, prog.functions);
     }
 }

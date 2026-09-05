@@ -40,9 +40,12 @@
 //! the sprite-and-stage half is Scratch's own.
 //!
 //! The 94 device mints occupy `0x90..=0xED`; the 13 menu shadow blocks take
-//! `0xEE..=0xFA`; `0xFB` is the constant-pool load
-//! ([`crate::palette::POOL_LOAD`], not a Scratch block, so not a row here),
-//! leaving 4 slots. Scratch extensions (pen, music, video
+//! `0xEE..=0xFA`; `0xFB` is `data_listcontents`, the LIST HANDLE push (the
+//! shared core's list ops pop the list as an ordinary operand — see
+//! `ogar_loco::vocabulary` — so Scratch's list field lowers to this push
+//! first); `0xFC` is the constant-pool load ([`crate::palette::POOL_LOAD`],
+//! not a Scratch block, so not a row here), leaving 3 slots. Scratch
+//! extensions (pen, music, video
 //! sensing) are deliberately NOT minted here — and per OGAR #295 they never
 //! will be one-opcode-per-block: an extension is ONE `FnIndex` whose operand
 //! indexes a codebook, exactly as the menus below already are.
@@ -139,7 +142,11 @@ pub const SCRATCH_DEVICE: &[(&str, u8, u8, u8)] = &[
     ("sensing_loud", 0xDE, 0, 0),
     ("sensing_timer", 0xDF, 0, 0),
     ("sensing_resettimer", 0xE0, 0, 0),
-    ("sensing_of", 0xE1, 0, 0),
+    // `sensing_of` takes its OBJECT through the `sensing_of_object_menu`
+    // shadow — one operand, corrected from the harvest's 0 (the menu is a
+    // nested reporter, so it IS an input; measured: with 0 the pushed menu
+    // index dangled on the stack).
+    ("sensing_of", 0xE1, 1, 0),
     ("sensing_current", 0xE2, 0, 0),
     ("sensing_dayssince2000", 0xE3, 0, 0),
     ("sensing_online", 0xE4, 0, 0),
@@ -168,6 +175,13 @@ pub const SCRATCH_DEVICE: &[(&str, u8, u8, u8)] = &[
     ("sound_sounds_menu", 0xF8, 0, 0),
     ("event_broadcast_menu", 0xF9, 0, 0),
     ("control_create_clone_of_menu", 0xFA, 0, 0),
+    // The list HANDLE: a 0-arity reporter whose immediate is the LIST
+    // codebook index (menu 26). Every Scratch list op lowers to this push
+    // followed by the shared-core op, which pops the handle as its first
+    // operand — the core's own contract for lists, where the list is an
+    // operand so one table serves Blockly's list expressions and Scratch's
+    // list fields alike. It is also the `list contents` reporter itself.
+    ("data_listcontents", 0xFB, 0, 0),
 ];
 
 /// Scratch operations that resolve to an EXISTING shared-core function.
@@ -476,6 +490,7 @@ pub const SCRATCH_CATEGORIES: &[(&str, &str, &[&str])] = &[
             "data_variable",
             "data_setvariableto",
             "data_changevariableby",
+            "data_listcontents",
             "data_showvariable",
             "data_hidevariable",
             "data_addtolist",
@@ -932,7 +947,7 @@ pub const SCRATCH_BLOCK_DEFS: &[BlockDef] = &[
     ("sensing_loud", "sensing", Shape::Boolean, &[], &[]),
     ("sensing_timer", "sensing", Shape::Reporter, &[], &[]),
     ("sensing_resettimer", "sensing", Shape::Statement, &[], &[]),
-    ("sensing_of", "sensing", Shape::Statement, &[], &[]),
+    ("sensing_of", "sensing", Shape::Reporter, &["OBJECT"], &[]),
     ("sensing_current", "sensing", Shape::Reporter, &[], &[]),
     (
         "sensing_dayssince2000",
@@ -1126,6 +1141,7 @@ pub const SCRATCH_BLOCK_DEFS: &[BlockDef] = &[
         &["ITEM"],
         &[],
     ),
+    ("data_listcontents", "data", Shape::Reporter, &[], &[]),
     ("data_showlist", "data", Shape::Statement, &[], &[]),
     ("data_hidelist", "data", Shape::Statement, &[], &[]),
     ("procedures_call", "procedures", Shape::Statement, &[], &[]),
@@ -1215,8 +1231,8 @@ mod tests {
     fn the_device_mint_is_dense_in_range_and_unique() {
         assert_eq!(
             SCRATCH_DEVICE.len(),
-            94 + 13,
-            "94 operations + 13 menu shadow blocks"
+            94 + 13 + 1,
+            "94 operations + 13 menu shadow blocks + the list handle"
         );
         let floor = crate::palette::DEVICE_FAMILY_FLOOR;
         let mut bytes: Vec<u8> = SCRATCH_DEVICE.iter().map(|&(_, b, ..)| b).collect();
@@ -1229,7 +1245,7 @@ mod tests {
             floor,
             "allocation must start at the floor"
         );
-        assert_eq!(*bytes.last().unwrap(), 0xFA);
+        assert_eq!(*bytes.last().unwrap(), 0xFB);
         // Dense: no holes inside the allocated span.
         for (i, b) in bytes.iter().enumerate() {
             assert_eq!(*b, floor + i as u8, "hole in the device allocation");
@@ -1246,11 +1262,11 @@ mod tests {
                 "{name} is not in the domain range"
             );
         }
-        // …and 5 slots stay above the table: the first is the pool load
-        // (not a Scratch block, so never a device row), 4 stay free.
+        // …and 4 slots stay above the table: the first is the pool load
+        // (not a Scratch block, so never a device row), 3 stay free.
         // Extensions do not need them: per OGAR #295 an extension is one
         // opcode plus a codebook, never a block per slot.
-        assert_eq!(0xFFu16 - u16::from(*bytes.last().unwrap()), 5);
+        assert_eq!(0xFFu16 - u16::from(*bytes.last().unwrap()), 4);
         assert_eq!(crate::palette::POOL_LOAD.0, *bytes.last().unwrap() + 1);
         assert!(device_by_byte(crate::palette::POOL_LOAD.0).is_none());
     }
@@ -1375,7 +1391,11 @@ mod tests {
             .iter()
             .flat_map(|(_, _, types)| types.iter().copied())
             .collect();
-        assert_eq!(offered.len(), 138);
+        assert_eq!(
+            offered.len(),
+            139,
+            "138 harvested tiles + the list handle reporter"
+        );
         for ty in &offered {
             let code = if *ty == "operator_mathop" {
                 Some("abs")

@@ -51,6 +51,57 @@ pub enum Look {
     Paddle,
 }
 
+/// One stack value. The stack is TYPED because two of the three kinds are
+/// register indices, not quantities: a text is a TEXT-codebook index and a
+/// list is a LIST-codebook handle, and turning either into an `f32` would
+/// lose the register it names (`say "hello"` must keep "hello"; `add x to
+/// (list)` must know WHICH list). Numbers stay `f32`. Eight bytes, `Copy`,
+/// no allocation — the hot path's operand window is three of these.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Value {
+    /// A number.
+    Num(f32),
+    /// A TEXT register index (menu 29); 0 is the empty string.
+    Text(u8),
+    /// A LIST register handle (menu 26).
+    List(u8),
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Self::Num(0.0)
+    }
+}
+
+impl Value {
+    /// The numeric reading. A text reads as its numeric value if it has one,
+    /// else 0 — Scratch's own rule for text in a numeric slot; a list handle
+    /// reads as 0. `basin` supplies the TEXT register; without it every text
+    /// reads 0.
+    #[must_use]
+    pub fn num(self, basin: Option<&ogar_loco::basin::BasinCodebooks>) -> f32 {
+        match self {
+            Self::Num(n) => n,
+            Self::Text(0) | Self::List(_) => 0.0,
+            Self::Text(idx) => basin
+                .and_then(|b| b.get(blockly_abi::menus::TEXT_MENU))
+                .and_then(|book| book.resolve(idx))
+                .filter(|e| e.classid == ogar_loco::pool::placeholder::CONST_UTF8_INLINE)
+                .and_then(|e| {
+                    let end = e
+                        .bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(e.bytes.len());
+                    core::str::from_utf8(&e.bytes[..end])
+                        .ok()
+                        .and_then(|t| t.trim().parse::<f32>().ok())
+                })
+                .unwrap_or(0.0),
+        }
+    }
+}
+
 /// One actor on the stage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sprite {
@@ -66,6 +117,22 @@ pub struct Sprite {
     pub size: f32,
     /// How it is drawn.
     pub look: Look,
+    /// Current costume, as a COSTUME codebook index (menu 14); 1-based like
+    /// the menu, 0 = none set.
+    pub costume: u8,
+    /// Graphic effects by LOOKS_EFFECT index (menu 2: 1 color … 7 ghost);
+    /// slot 0 unused. Amounts as Scratch stores them, not rendered here.
+    pub effects: [f32; 8],
+    /// What the sprite is saying or thinking: the value as given (a TEXT
+    /// index keeps its register entry), and whether it is a thought.
+    pub say: Option<(Value, bool)>,
+    /// Volume, percent.
+    pub volume: f32,
+    /// The sprite this one was cloned from, if it is a clone.
+    pub clone_of: Option<usize>,
+    /// `false` once `delete this clone` ran: kept in place so sprite indices
+    /// stay stable, drawn by nothing, run by nothing.
+    pub alive: bool,
 }
 
 impl Default for Sprite {
@@ -77,6 +144,12 @@ impl Default for Sprite {
             visible: true,
             size: 100.0,
             look: Look::Ball,
+            costume: 0,
+            effects: [0.0; 8],
+            say: None,
+            volume: 100.0,
+            clone_of: None,
+            alive: true,
         }
     }
 }
@@ -120,6 +193,20 @@ pub struct Stage {
     pub half_w: f32,
     /// Stage half-height.
     pub half_h: f32,
+    /// List store, indexed by the LIST codebook handle a `data_listcontents`
+    /// push carries (menu 26). Grown on demand; handle 0 is the zero-fallback.
+    pub lists: Vec<Vec<Value>>,
+    /// Current backdrop, as a BACKDROP codebook index (menu 15).
+    pub backdrop: u8,
+    /// The last sound started, as a SOUND codebook index (menu 16) — nothing
+    /// is audible here; the fact that it was played is what is kept.
+    pub last_sound: Option<u8>,
+    /// `operator_random`'s state: a xorshift64* word, seeded by the caller
+    /// for a reproducible run (0 is replaced by a fixed non-zero seed).
+    pub rng: u64,
+    /// Clones created this round, as sprite indices — the scene runs their
+    /// `when I start as a clone` scripts once and clears this.
+    pub pending_clones: Vec<usize>,
 }
 
 impl Default for Stage {
@@ -136,6 +223,11 @@ impl Default for Stage {
             broadcast: None,
             half_w: 240.0,
             half_h: 180.0,
+            lists: vec![Vec::new()],
+            backdrop: 0,
+            last_sound: None,
+            rng: 0x9E37_79B9_7F4A_7C15,
+            pending_clones: Vec::new(),
         }
     }
 }
@@ -154,6 +246,34 @@ impl Stage {
             self.vars.resize(i + 1, 0.0);
         }
         &mut self.vars[i]
+    }
+
+    /// A list by its codebook handle; unset is empty, as in Scratch.
+    #[must_use]
+    pub fn list(&self, idx: u8) -> &[Value] {
+        self.lists.get(usize::from(idx)).map_or(&[], Vec::as_slice)
+    }
+
+    /// A list by its codebook handle, grown on first write.
+    pub fn list_mut(&mut self, idx: u8) -> &mut Vec<Value> {
+        let i = usize::from(idx);
+        if self.lists.len() <= i {
+            self.lists.resize(i + 1, Vec::new());
+        }
+        &mut self.lists[i]
+    }
+
+    /// The next random word — xorshift64*, plain and reproducible.
+    fn next_random(&mut self) -> u64 {
+        if self.rng == 0 {
+            self.rng = 0x9E37_79B9_7F4A_7C15;
+        }
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
     /// The sprite the running script controls.
@@ -208,6 +328,9 @@ pub enum RunError {
     /// A `text` literal names a TEXT register entry the run's basin does not
     /// hold — or the run was given no basin. Refused rather than read as 0.
     UnknownText(u8),
+    /// A list op's first operand was not a list handle: the body is
+    /// malformed (the handle push is missing or out of order).
+    NotAList(u8),
 }
 
 impl core::fmt::Display for RunError {
@@ -220,6 +343,7 @@ impl core::fmt::Display for RunError {
             Self::UnknownProcedure(i) => write!(f, "no definition carries procedure {i}"),
             Self::MissingConstant(i) => write!(f, "constant {i} is not in the pool"),
             Self::UnknownText(i) => write!(f, "text {i} is not in the TEXT register"),
+            Self::NotAList(b) => write!(f, "function {b:#04x} did not receive a list handle"),
         }
     }
 }
@@ -297,6 +421,25 @@ enum Op {
     MouseDown,
     /// `event_broadcast`: its operand is the message's codebook index.
     Broadcast,
+    /// The list handle push (`data_listcontents`): yields `Value::List(imm)`.
+    ListHandle,
+    SwitchCostume,
+    SwitchBackdrop,
+    CostumeNumberName,
+    BackdropNumberName,
+    SetEffect,
+    ChangeEffect,
+    ClearEffects,
+    Say,
+    Think,
+    SoundPlay,
+    SetVolume,
+    Volume,
+    SensingOf,
+    CreateClone,
+    DeleteClone,
+    /// `data_showvariable` and friends: monitors have no model here.
+    MonitorNoop,
 }
 
 /// The per-vocabulary execution plan: for every possible function byte, the
@@ -331,7 +474,9 @@ fn plan() -> &'static Plan {
                     "event_whenflagclicked"
                     | "event_whenthisspriteclicked"
                     | "event_whenkeypressed"
-                    | "event_whenbroadcastreceived" => Op::Hat,
+                    | "event_whenbroadcastreceived"
+                    | "event_whenstageclicked"
+                    | "event_whenbackdropswitchesto" => Op::Hat,
                     "sensing_keypressed" => Op::KeyPressed,
                     "looks_gotofrontback" | "looks_goforwardbackwardlayers" => Op::LayerNoop,
                     "motion_movesteps" => Op::MoveSteps,
@@ -360,6 +505,27 @@ fn plan() -> &'static Plan {
                     "sensing_touchingobject" | "sensing_touchingcolor" => Op::Touching,
                     "sensing_mousedown" => Op::MouseDown,
                     "event_broadcast" | "event_broadcastandwait" => Op::Broadcast,
+                    "data_listcontents" => Op::ListHandle,
+                    "looks_switchcostumeto" => Op::SwitchCostume,
+                    "looks_switchbackdropto" | "looks_switchbackdroptoandwait" => {
+                        Op::SwitchBackdrop
+                    }
+                    "looks_costumenumbername" => Op::CostumeNumberName,
+                    "looks_backdropnumbername" => Op::BackdropNumberName,
+                    "looks_seteffectto" => Op::SetEffect,
+                    "looks_changeeffectby" => Op::ChangeEffect,
+                    "looks_cleargraphiceffects" => Op::ClearEffects,
+                    "looks_say" | "looks_sayforsecs" => Op::Say,
+                    "looks_think" | "looks_thinkforsecs" => Op::Think,
+                    "sound_play" | "sound_playuntildone" => Op::SoundPlay,
+                    "sound_setvolumeto" => Op::SetVolume,
+                    "sound_volume" => Op::Volume,
+                    "sensing_of" => Op::SensingOf,
+                    "control_create_clone_of" => Op::CreateClone,
+                    "control_delete_this_clone" => Op::DeleteClone,
+                    "control_start_as_clone" => Op::Hat,
+                    "data_showvariable" | "data_hidevariable" | "data_showlist"
+                    | "data_hidelist" => Op::MonitorNoop,
                     _ => Op::Unimplemented,
                 }
             };
@@ -393,6 +559,9 @@ enum Wake {
     /// `event_whenbroadcastreceived`: the message index in the hat's
     /// immediate.
     Broadcast(u8),
+    /// `control_start_as_clone`: runs once for each new clone of the
+    /// script's owner sprite, the round after the clone is made.
+    Clone,
 }
 
 impl Wake {
@@ -404,6 +573,7 @@ impl Wake {
         match scratch::device_by_byte(head.function.0) {
             Some(("event_whenkeypressed", ..)) => Self::Key(head.values[0]),
             Some(("event_whenbroadcastreceived", ..)) => Self::Broadcast(head.values[0]),
+            Some(("control_start_as_clone", ..)) => Self::Clone,
             _ => Self::Always,
         }
     }
@@ -421,6 +591,9 @@ struct WakeTable {
     by_key: Vec<(u8, Vec<u64>)>,
     /// `(message index, mask)` for every message some script receives.
     by_broadcast: Vec<(u8, Vec<u64>)>,
+    /// Scripts under a `when I start as a clone` hat — run per new clone,
+    /// not per round, so they live outside the round mask.
+    clone_scripts: Vec<usize>,
 }
 
 impl WakeTable {
@@ -435,6 +608,7 @@ impl WakeTable {
             any_key: vec![0; words],
             by_key: Vec::new(),
             by_broadcast: Vec::new(),
+            clone_scripts: Vec::new(),
         };
         fn set(mask: &mut [u64], i: usize) {
             mask[i / 64] |= 1u64 << (i % 64);
@@ -452,6 +626,7 @@ impl WakeTable {
                 Wake::Key(k) if k == 0 || k == any => set(&mut t.any_key, i),
                 Wake::Key(k) => set(entry(&mut t.by_key, k, words), i),
                 Wake::Broadcast(b) => set(entry(&mut t.by_broadcast, b, words), i),
+                Wake::Clone => t.clone_scripts.push(i),
             }
         }
         t
@@ -510,7 +685,12 @@ pub struct Machine<'a> {
     basin: Option<&'a ogar_loco::basin::BasinCodebooks>,
     /// Argument frames of the custom blocks currently executing, innermost
     /// last. `PROC_ARG` reads the innermost; outside any call it reads `0`.
-    frames: Vec<Vec<f32>>,
+    frames: Vec<Vec<Value>>,
+    /// ONE operand stack for the whole run. Each body executes above a frame
+    /// base and truncates back to it on return, so nested bodies (a loop's,
+    /// a custom block's) share it with no allocation after warm-up and no
+    /// per-body zeroing — measured against both alternatives.
+    stack: Vec<Value>,
     budget: u32,
     /// Sampled stage snapshots — the run's TRACE, not its result.
     ///
@@ -555,6 +735,7 @@ impl<'a> Machine<'a> {
             pool: None,
             basin: None,
             frames: Vec::new(),
+            stack: Vec::with_capacity(64),
             budget,
             trace: Vec::new(),
             every: 0,
@@ -627,11 +808,14 @@ impl<'a> Machine<'a> {
         let body = functions
             .get(index)
             .ok_or(RunError::DanglingReference(index as u8))?;
-        let mut stack: Vec<f32> = Vec::with_capacity(8);
+        // This body's frame on the shared operand stack.
+        let base = self.stack.len();
         let plan = plan();
+        let basin = self.basin;
 
         for call in body.calls() {
             if self.budget == 0 {
+                self.stack.truncate(base);
                 return Ok(());
             }
             self.budget -= 1;
@@ -660,18 +844,18 @@ impl<'a> Machine<'a> {
                         }
                     }
                     FnIndex::IF => {
-                        let c = pop(&mut stack, f)?;
+                        let c = self.pop(base, f)?.num(basin);
                         if c != 0.0 {
                             self.exec_in(functions, target)?;
                         }
                     }
                     FnIndex::IF_ELSE => {
-                        let c = pop(&mut stack, f)?;
+                        let c = self.pop(base, f)?.num(basin);
                         let other = usize::from(call.values.get(1).copied().unwrap_or(0));
                         self.exec_in(functions, if c != 0.0 { target } else { other })?;
                     }
                     FnIndex::REPEAT => {
-                        let n = pop(&mut stack, f)?.max(0.0) as u32;
+                        let n = self.pop(base, f)?.num(basin).max(0.0) as u32;
                         for _ in 0..n {
                             if self.budget == 0 {
                                 break;
@@ -684,7 +868,7 @@ impl<'a> Machine<'a> {
                         // re-evaluating it would need the operand's own calls,
                         // which live in this body. Bounded and honest: run the
                         // body while the budget lasts if the condition held.
-                        let c = pop(&mut stack, f)?;
+                        let c = self.pop(base, f)?.num(basin);
                         let want = f == FnIndex::WHILE;
                         if (c != 0.0) == want {
                             while self.budget > 0 {
@@ -705,10 +889,10 @@ impl<'a> Machine<'a> {
             if f == FnIndex::PROC_CALL {
                 let index = call.values.first().copied().unwrap_or(0);
                 let argc = usize::from(call.values.get(1).copied().unwrap_or(0));
-                if stack.len() < argc {
+                if self.stack.len() - base < argc {
                     return Err(RunError::StackUnderflow(f.0));
                 }
-                let args: Vec<f32> = stack.split_off(stack.len() - argc);
+                let args: Vec<Value> = self.stack.split_off(self.stack.len() - argc);
                 let proc_ = *self
                     .procs
                     .iter()
@@ -723,35 +907,163 @@ impl<'a> Machine<'a> {
 
             // ── everything else: pop arity, compute, push if it yields ────
             let arity = usize::from(plan.arity[usize::from(f.0)].ok_or(RunError::Uncovered(f.0))?);
-            if stack.len() < arity {
+            if self.stack.len() - base < arity {
                 return Err(RunError::StackUnderflow(f.0));
             }
             // Operands into a fixed window — the ABI's arity is at most 3 —
             // rather than a fresh `Vec` per call.
-            let base = stack.len() - arity;
-            let mut window = [0.0f32; ogar_loco::MAX_VALUES_PER_CALL];
-            window[..arity].copy_from_slice(&stack[base..]);
-            stack.truncate(base);
+            let mut window = [Value::default(); ogar_loco::MAX_VALUES_PER_CALL];
+            let top = self.stack.len() - arity;
+            window[..arity].copy_from_slice(&self.stack[top..]);
+            self.stack.truncate(top);
             let immediate = f32::from(call.values[0]);
 
             let result = self.apply(f, &window[..arity], immediate)?;
             if let Some(v) = result {
-                stack.push(v);
+                self.stack.push(v);
             }
         }
+        // Anything this body left is its own; the caller's frame is below.
+        self.stack.truncate(base);
         Ok(())
     }
 
+    /// Pop within this body's frame — never into the caller's operands.
+    #[inline]
+    fn pop(&mut self, base: usize, f: FnIndex) -> Result<Value, RunError> {
+        if self.stack.len() <= base {
+            return Err(RunError::StackUnderflow(f.0));
+        }
+        self.stack.pop().ok_or(RunError::StackUnderflow(f.0))
+    }
+
+    /// The rare families — text, suspend/stop, random, lists — kept out of
+    /// [`Self::apply`] so its frame stays small. `None` = not one of these.
+    #[cold]
+    #[inline(never)]
+    fn apply_rare(
+        &mut self,
+        f: FnIndex,
+        ops: &[Value],
+        imm: f32,
+    ) -> Option<Result<Option<Value>, RunError>> {
+        let basin = self.basin;
+        let a = |i: usize| ops.get(i).map_or(0.0, |v| v.num(basin));
+        let raw = |i: usize| ops.get(i).copied().unwrap_or_default();
+        // A `text` literal yields its TEXT register index — the register
+        // keeps the string; `Value::num` reads it as a number when a numeric
+        // slot asks. A non-zero index must exist in the basin.
+        if f == FnIndex::TEXT {
+            let idx = imm as u8;
+            if idx != 0
+                && basin
+                    .and_then(|b| b.get(blockly_abi::menus::TEXT_MENU))
+                    .and_then(|book| book.resolve(idx))
+                    .is_none()
+            {
+                return Some(Err(RunError::UnknownText(idx)));
+            }
+            return Some(Ok(Some(Value::Text(idx))));
+        }
+        // The suspend/stop family. A slice is not a clock: `wait` yields the
+        // rest of this slice (the scene ticks time per round), `wait until`
+        // yields unless its condition already holds, `stop` ends the slice.
+        if f == FnIndex::WAIT || f == FnIndex::STOP || (f == FnIndex::WAIT_UNTIL && a(0) == 0.0) {
+            self.budget = 0;
+            return Some(Ok(None));
+        }
+        if f == FnIndex::WAIT_UNTIL {
+            return Some(Ok(None));
+        }
+        // `pick random a to b`: integer when both bounds are integers, else a
+        // float in the range — Scratch's rule. xorshift64* on the stage's word.
+        if f == FnIndex::RANDOM_INT {
+            let (lo, hi) = (a(0).min(a(1)), a(0).max(a(1)));
+            let r = self.stage.next_random();
+            let unit = (r >> 11) as f32 / (1u64 << 53) as f32;
+            let v = if lo.fract() == 0.0 && hi.fract() == 0.0 {
+                (lo + (unit * (hi - lo + 1.0)).floor()).min(hi)
+            } else {
+                lo + unit * (hi - lo)
+            };
+            return Some(num(v));
+        }
+        // Lists: the handle is the FIRST popped operand (the core's arity
+        // counts it), then Scratch's socket order. Indices are 1-based;
+        // out-of-range reads give 0 and writes do nothing, as in Scratch.
+        if blockly_abi::is_list_op(f) {
+            let Value::List(h) = raw(0) else {
+                return Some(Err(RunError::NotAList(f.0)));
+            };
+            let len = self.stage.list(h).len();
+            return Some(match f {
+                FnIndex::LIST_LENGTH => num(len as f32),
+                FnIndex::LIST_GET => Ok(Some(
+                    list_slot(raw(1), len, basin)
+                        .map_or(Value::Num(0.0), |i| self.stage.list(h)[i]),
+                )),
+                FnIndex::LIST_ADD => {
+                    self.stage.list_mut(h).push(raw(1));
+                    Ok(None)
+                }
+                FnIndex::LIST_DELETE => {
+                    if let Some(i) = list_slot(raw(1), len, basin) {
+                        self.stage.list_mut(h).remove(i);
+                    }
+                    Ok(None)
+                }
+                FnIndex::LIST_DELETE_ALL => {
+                    self.stage.list_mut(h).clear();
+                    Ok(None)
+                }
+                // `replace item INDEX of list with ITEM`
+                FnIndex::LIST_SET => {
+                    if let Some(i) = list_slot(raw(1), len, basin) {
+                        self.stage.list_mut(h)[i] = raw(2);
+                    }
+                    Ok(None)
+                }
+                // `insert ITEM at INDEX of list` — `length + 1` appends.
+                FnIndex::LIST_INSERT => {
+                    if let Some(i) = list_slot(raw(2), len + 1, basin) {
+                        self.stage.list_mut(h).insert(i, raw(1));
+                    }
+                    Ok(None)
+                }
+                FnIndex::LIST_INDEX_OF => {
+                    let want = raw(1);
+                    let pos = self
+                        .stage
+                        .list(h)
+                        .iter()
+                        .position(|v| same(*v, want, basin));
+                    num(pos.map_or(0.0, |p| (p + 1) as f32))
+                }
+                FnIndex::LIST_CONTAINS => {
+                    let want = raw(1);
+                    num(f32::from(
+                        self.stage.list(h).iter().any(|v| same(*v, want, basin)),
+                    ))
+                }
+                _ => Err(RunError::Unimplemented(f.0)),
+            });
+        }
+
+        None
+    }
+
     /// Apply one non-branching call. `Some(v)` means it yielded a value.
-    fn apply(&mut self, f: FnIndex, ops: &[f32], imm: f32) -> Result<Option<f32>, RunError> {
-        let a = |i: usize| ops.get(i).copied().unwrap_or(0.0);
+    fn apply(&mut self, f: FnIndex, ops: &[Value], imm: f32) -> Result<Option<Value>, RunError> {
+        let basin = self.basin;
+        let a = |i: usize| ops.get(i).map_or(0.0, |v| v.num(basin));
+        let raw = |i: usize| ops.get(i).copied().unwrap_or_default();
         // Read before the stage is borrowed: the innermost custom-block frame.
         let frame_arg = self
             .frames
             .last()
             .and_then(|fr| fr.get(imm as usize))
             .copied()
-            .unwrap_or(0.0);
+            .unwrap_or_default();
         // A pool load: the pool holds numbers only, so the load IS the f64.
         if f == blockly_abi::POOL_LOAD {
             let idx = imm as u8;
@@ -762,43 +1074,9 @@ impl<'a> Machine<'a> {
                 .ok_or(RunError::MissingConstant(idx))?;
             let mut le = [0u8; 8];
             le.copy_from_slice(&c.bytes[..8]);
-            return Ok(Some(f64::from_le_bytes(le) as f32));
+            return num(f64::from_le_bytes(le) as f32);
         }
-        // A `text` literal: its immediate indexes the basin's TEXT register.
-        // Read as Scratch reads text in a numeric slot — its numeric value
-        // if it has one, else 0; index 0 is the empty string. A digest
-        // entry (a text wider than a facet) has no bytes to parse and reads
-        // 0. The stack is f32, so the text's identity stops here; the
-        // register keeps it.
-        if f == FnIndex::TEXT {
-            let idx = imm as u8;
-            if idx == 0 {
-                return Ok(Some(0.0));
-            }
-            let entry = self
-                .basin
-                .and_then(|b| b.get(blockly_abi::menus::TEXT_MENU))
-                .and_then(|book| book.resolve(idx))
-                .ok_or(RunError::UnknownText(idx))?;
-            let v = if entry.classid == ogar_loco::pool::placeholder::CONST_UTF8_INLINE {
-                let end = entry
-                    .bytes
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(entry.bytes.len());
-                core::str::from_utf8(&entry.bytes[..end])
-                    .ok()
-                    .and_then(|s| s.trim().parse::<f32>().ok())
-                    .unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            return Ok(Some(v));
-        }
-
         let s = &mut self.stage;
-        // Motion/looks act on the sprite this script is bound to.
-        let me = s.current.min(s.sprites.len() - 1);
 
         // Shared core first — one table, both frontends.
         let core = match f {
@@ -823,7 +1101,7 @@ impl<'a> Machine<'a> {
             // The immediate is the argument's POSITION in the innermost
             // custom-block frame; outside any call it reads 0, as an unset
             // Scratch value does.
-            FnIndex::PROC_ARG => Some(frame_arg),
+            FnIndex::PROC_ARG => return Ok(Some(frame_arg)),
             FnIndex::VAR_SET => {
                 *s.var_mut(imm as u8) = a(0);
                 return Ok(None);
@@ -835,8 +1113,18 @@ impl<'a> Machine<'a> {
             _ => None,
         };
         if let Some(v) = core {
-            return Ok(Some(v));
+            return num(v);
         }
+
+        // The less frequent families live in a cold, never-inlined function
+        // so this hot function stays small (measured: folding them in here
+        // cost ~5 ns on every call, rare or not — the prologue is paid by all).
+        if let Some(r) = self.apply_rare(f, ops, imm) {
+            return r;
+        }
+        let s = &mut self.stage;
+        // Motion/looks act on the sprite this script is bound to.
+        let me = s.current.min(s.sprites.len() - 1);
 
         // Then the device half, through the plan — the harvested NAME table
         // resolved to integer tags once, so the palette, the toolbox and the
@@ -845,7 +1133,7 @@ impl<'a> Machine<'a> {
             Op::Unimplemented => Err(RunError::Unimplemented(f.0)),
             // A menu shadow block is a value: it yields its own codebook
             // index, which the consuming block pops as an operand.
-            Op::Menu => Ok(Some(imm)),
+            Op::Menu => num(imm),
             Op::Hat => Ok(None),
             Op::KeyPressed => {
                 // The operand is the KEY_OPTION index the menu reporter
@@ -855,7 +1143,7 @@ impl<'a> Machine<'a> {
                     .and_then(|m| blockly_abi::menus::encode(m, "any"))
                     .unwrap_or(0);
                 let held = s.key.is_some_and(|k| k == want || want == any);
-                Ok(Some(f32::from(held)))
+                num(f32::from(held))
             }
             // Front/back layering has no visual model here; a real op with
             // no effect on this stage, not an unimplemented one.
@@ -917,9 +1205,9 @@ impl<'a> Machine<'a> {
                 }
                 Ok(None)
             }
-            Op::XPos => Ok(Some(s.sprites[me].x)),
-            Op::YPos => Ok(Some(s.sprites[me].y)),
-            Op::Dir => Ok(Some(s.sprites[me].direction)),
+            Op::XPos => num(s.sprites[me].x),
+            Op::YPos => num(s.sprites[me].y),
+            Op::Dir => num(s.sprites[me].direction),
             Op::Show => {
                 s.sprites[me].visible = true;
                 Ok(None)
@@ -936,18 +1224,18 @@ impl<'a> Machine<'a> {
                 s.sprites[me].size = a(0);
                 Ok(None)
             }
-            Op::Size => Ok(Some(s.sprites[me].size)),
+            Op::Size => num(s.sprites[me].size),
             // A costume switch has no visual model here; it is a real op with
             // no effect on this stage, which is different from unimplemented.
             Op::CostumeNoop => Ok(None),
-            Op::MouseX => Ok(Some(s.mouse_x)),
-            Op::MouseY => Ok(Some(s.mouse_y)),
-            Op::Timer => Ok(Some(s.timer)),
+            Op::MouseX => num(s.mouse_x),
+            Op::MouseY => num(s.mouse_y),
+            Op::Timer => num(s.timer),
             Op::ResetTimer => {
                 s.timer = 0.0;
                 Ok(None)
             }
-            Op::Touching => Ok(Some(f32::from(s.touching))),
+            Op::Touching => num(f32::from(s.touching)),
             // The message index was pushed by the `event_broadcast_menu`
             // reporter. Delivery is the scene's: receivers wake next round.
             // (`and wait` cannot wait here — a slice is not a frame — so it
@@ -956,13 +1244,154 @@ impl<'a> Machine<'a> {
                 s.broadcast = Some(a(0) as u8);
                 Ok(None)
             }
-            Op::MouseDown => Ok(Some(0.0)),
+            Op::MouseDown => num(0.0),
+            Op::ListHandle => Ok(Some(Value::List(imm as u8))),
+            Op::SwitchCostume => {
+                s.sprites[me].costume = a(0) as u8;
+                Ok(None)
+            }
+            Op::SwitchBackdrop => {
+                s.backdrop = a(0) as u8;
+                Ok(None)
+            }
+            // NUMBER_NAME menu 6: 1 = number, 2 = name. The costume index is
+            // the register index either way; a NAME has no numeric reading
+            // here, so the index is what is yielded in both cases.
+            Op::CostumeNumberName => num(f32::from(s.sprites[me].costume)),
+            Op::BackdropNumberName => num(f32::from(s.backdrop)),
+            // The effect is the LOOKS_EFFECT index in the immediate (menu 2).
+            Op::SetEffect => {
+                let e = (imm as usize).min(7);
+                s.sprites[me].effects[e] = a(0);
+                Ok(None)
+            }
+            Op::ChangeEffect => {
+                let e = (imm as usize).min(7);
+                s.sprites[me].effects[e] += a(0);
+                Ok(None)
+            }
+            Op::ClearEffects => {
+                s.sprites[me].effects = [0.0; 8];
+                Ok(None)
+            }
+            Op::Say => {
+                s.sprites[me].say = Some((raw(0), false));
+                Ok(None)
+            }
+            Op::Think => {
+                s.sprites[me].say = Some((raw(0), true));
+                Ok(None)
+            }
+            Op::SoundPlay => {
+                s.last_sound = Some(a(0) as u8);
+                Ok(None)
+            }
+            Op::SetVolume => {
+                s.sprites[me].volume = a(0).clamp(0.0, 100.0);
+                Ok(None)
+            }
+            Op::Volume => num(s.sprites[me].volume),
+            // `(PROPERTY) of (OBJECT)`: OBJECT is the OF_OBJECT index the
+            // menu pushed (1 = the stage, k ≥ 2 = sprite k−2 in project
+            // order); PROPERTY is the OF_PROPERTY index in the immediate
+            // (1 x, 2 y, 3 direction, 4 costume #, 5 costume name, 6 size,
+            // 7 volume, 8 backdrop #, 9 backdrop name; above that, a
+            // variable by name — resolved through the basin, register to
+            // register: OF_PROPERTY entry bytes → VARIABLE index).
+            Op::SensingOf => {
+                let obj = a(0) as usize;
+                let prop = imm as u8;
+                let sprite = (obj >= 2).then(|| obj - 2).filter(|i| *i < s.sprites.len());
+                let v = match (prop, sprite) {
+                    (1, Some(i)) => s.sprites[i].x,
+                    (2, Some(i)) => s.sprites[i].y,
+                    (3, Some(i)) => s.sprites[i].direction,
+                    (4 | 5, Some(i)) => f32::from(s.sprites[i].costume),
+                    (6, Some(i)) => s.sprites[i].size,
+                    (7, Some(i)) => s.sprites[i].volume,
+                    (7, None) => 100.0,
+                    (8 | 9, None) => f32::from(s.backdrop),
+                    (p, _) if p >= 10 => {
+                        let var = basin
+                            .and_then(|b| b.get(blockly_abi::menus::menu_by_id(27)?.id))
+                            .and_then(|book| book.resolve(p))
+                            .and_then(|entry| {
+                                let m = blockly_abi::menus::menu_by_id(25)?;
+                                let end = entry
+                                    .bytes
+                                    .iter()
+                                    .position(|&x| x == 0)
+                                    .unwrap_or(entry.bytes.len());
+                                let name = core::str::from_utf8(&entry.bytes[..end]).ok()?;
+                                blockly_abi::menus::encode_in(basin?, m, name)
+                            });
+                        var.map_or(0.0, |idx| s.var(idx))
+                    }
+                    _ => 0.0,
+                };
+                num(v)
+            }
+            // CLONE_OF menu 24: 1 = `_myself_`, k ≥ 2 = the (k−2)th OTHER
+            // sprite in stage order (the menu lists every sprite but the
+            // holder). The clone copies the source's state, is marked, and
+            // is queued for its `when I start as a clone` scripts, which the
+            // scene runs once at the start of the next round.
+            Op::CreateClone => {
+                let pick = a(0) as usize;
+                let src = if pick <= 1 {
+                    Some(me)
+                } else {
+                    (0..s.sprites.len()).filter(|&i| i != me).nth(pick - 2)
+                };
+                if let Some(src) = src {
+                    let mut c = s.sprites[src].clone();
+                    c.clone_of = Some(s.sprites[src].clone_of.unwrap_or(src));
+                    s.sprites.push(c);
+                    let idx = s.sprites.len() - 1;
+                    s.pending_clones.push(idx);
+                }
+                Ok(None)
+            }
+            Op::DeleteClone => {
+                if s.sprites[me].clone_of.is_some() {
+                    s.sprites[me].alive = false;
+                    s.sprites[me].visible = false;
+                    self.budget = 0;
+                }
+                Ok(None)
+            }
+            Op::MonitorNoop => Ok(None),
         }
     }
 }
 
-fn pop(stack: &mut Vec<f32>, f: FnIndex) -> Result<f32, RunError> {
-    stack.pop().ok_or(RunError::StackUnderflow(f.0))
+/// A yielded number.
+#[inline]
+fn num(x: f32) -> Result<Option<Value>, RunError> {
+    Ok(Some(Value::Num(x)))
+}
+
+/// Scratch equality for list search: two texts match by register index,
+/// anything else by numeric reading.
+fn same(a: Value, b: Value, basin: Option<&ogar_loco::basin::BasinCodebooks>) -> bool {
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => x == y,
+        _ => (a.num(basin) - b.num(basin)).abs() < f32::EPSILON,
+    }
+}
+
+/// Scratch's 1-based list index from a value; `None` when out of range.
+fn list_slot(
+    v: Value,
+    len: usize,
+    basin: Option<&ogar_loco::basin::BasinCodebooks>,
+) -> Option<usize> {
+    let i = v.num(basin);
+    if i < 1.0 || i.fract() != 0.0 {
+        return None;
+    }
+    let i = i as usize;
+    (i <= len).then_some(i - 1)
 }
 
 /// Several scripts sharing one stage — the thing that makes a scene.
@@ -1001,6 +1430,10 @@ pub struct Scene<'a> {
     pool: Option<&'a ogar_loco::ConstantPool>,
     /// The basin every script's `text` literals are read from.
     basin: Option<&'a ogar_loco::basin::BasinCodebooks>,
+    /// Which sprite each scheduled script controls. Defaults to the script's
+    /// own index (one script per sprite, the templates' shape); a real
+    /// project sets it with [`Scene::with_owners`].
+    owners: Vec<usize>,
     /// The baked participation masks — see [`Wake`].
     wake: WakeTable,
     /// Scratch space for the round's awake mask, reused every round.
@@ -1033,6 +1466,7 @@ impl<'a> Scene<'a> {
         let wake = WakeTable::build(&scheduled);
         Self {
             stage,
+            owners: (0..scheduled.len()).collect(),
             scripts: scheduled,
             procs,
             pool: None,
@@ -1056,6 +1490,18 @@ impl<'a> Scene<'a> {
     #[must_use]
     pub fn with_basin(mut self, basin: &'a ogar_loco::basin::BasinCodebooks) -> Self {
         self.basin = Some(basin);
+        self
+    }
+
+    /// Bind each scheduled script to the sprite it controls, by index into
+    /// the ORIGINAL `scripts` list handed to [`Scene::new`] (definition
+    /// scripts are skipped, as they are not scheduled). Missing or
+    /// out-of-range entries keep the default binding.
+    #[must_use]
+    pub fn with_owners(mut self, owners: &[usize]) -> Self {
+        for (slot, o) in self.owners.iter_mut().zip(owners) {
+            *slot = *o;
+        }
         self
     }
 
@@ -1111,25 +1557,62 @@ impl<'a> Scene<'a> {
             // sent last round, its receivers wake this round.
             self.wake
                 .awake(self.stage.key, self.stage.broadcast.take(), &mut self.awake);
-            let procs = &self.procs;
-            for i in set_bits(&self.awake) {
-                let script = self.scripts[i];
-                let stage = core::mem::take(&mut self.stage);
-                let mut m = Machine::resuming(script, slice, stage, i).with_procs(procs);
-                if let Some(pool) = self.pool {
-                    m = m.with_pool(pool);
+            // The procedure table is a handful of `Copy` records; a per-round
+            // copy is what lets the scripts borrow the scene mutably.
+            let procs: Vec<Procedure<'a>> = self.procs.clone();
+            let procs = procs.as_slice();
+            // New clones first: each runs its owner's `when I start as a
+            // clone` scripts once, AS the clone (the clone's own index).
+            let born = core::mem::take(&mut self.stage.pending_clones);
+            let clone_scripts = core::mem::take(&mut self.wake.clone_scripts);
+            for &clone in &born {
+                let root = self.stage.sprites.get(clone).and_then(|c| c.clone_of);
+                for &i in &clone_scripts {
+                    if root != Some(self.owners[i]) {
+                        continue;
+                    }
+                    self.run_script(i, clone, slice, procs)?;
                 }
-                if let Some(basin) = self.basin {
-                    m = m.with_basin(basin);
-                }
-                let outcome = m.run();
-                self.stage = m.stage;
-                outcome?;
             }
+            self.wake.clone_scripts = clone_scripts;
+            let awake = core::mem::take(&mut self.awake);
+            for i in set_bits(&awake) {
+                let sprite = self.owners[i];
+                if !self.stage.sprites.get(sprite).is_none_or(|s| s.alive) {
+                    continue;
+                }
+                self.run_script(i, sprite, slice, procs)?;
+            }
+            self.awake = awake;
             self.stage.timer += 1.0 / 30.0;
             self.trace.push(self.stage.clone());
         }
         Ok(())
+    }
+
+    /// One script's slice, as `sprite`, against the shared stage.
+    fn run_script<'p>(
+        &mut self,
+        i: usize,
+        sprite: usize,
+        slice: u32,
+        procs: &'p [Procedure<'p>],
+    ) -> Result<(), RunError>
+    where
+        'a: 'p,
+    {
+        let script = self.scripts[i];
+        let stage = core::mem::take(&mut self.stage);
+        let mut m = Machine::resuming(script, slice, stage, sprite).with_procs(procs);
+        if let Some(pool) = self.pool {
+            m = m.with_pool(pool);
+        }
+        if let Some(basin) = self.basin {
+            m = m.with_basin(basin);
+        }
+        let outcome = m.run();
+        self.stage = m.stage;
+        outcome
     }
 
     /// The custom blocks this scene can call.
@@ -1867,5 +2350,446 @@ mod tests {
         assert_eq!(m2.stage.me().x, 0.0);
         let mut bare = Machine::new(&numeric.functions, 100);
         assert_eq!(bare.run(), Err(RunError::UnknownText(idx)));
+    }
+
+    /// A basin with one entry in each named menu, for the family tests.
+    fn basin_with(entries: &[(u8, &[&str])]) -> ogar_loco::basin::BasinCodebooks {
+        use blockly_abi::menus;
+        let utf8 = ogar_loco::pool::placeholder::CONST_UTF8_INLINE;
+        let mut basin = ogar_loco::basin::BasinCodebooks::new();
+        for &(id, names) in entries {
+            let m = menus::menu_by_id(id).unwrap();
+            let mut b = menus::builder(m, utf8, menus::PLACEHOLDER_DIGEST_CLASSID).unwrap();
+            for n in names {
+                b.intern(utf8, n.as_bytes()).unwrap();
+            }
+            basin.plug(b.seal()).unwrap();
+        }
+        basin
+    }
+
+    fn list_block(ty: &str, inputs: Vec<(&str, BlockRecord)>) -> BlockRecord {
+        rec(
+            ty,
+            vec![("LIST".into(), FieldValue::Code("scores".into()))],
+            inputs
+                .into_iter()
+                .map(|(n, b)| (n.to_string(), b))
+                .collect(),
+            vec![],
+            None,
+        )
+    }
+
+    /// Lists live in the stage's list store by codebook handle: add, replace,
+    /// insert, delete, read, length, contains, index — with Scratch's
+    /// 1-based indices and its out-of-range rules (read 0, write nothing).
+    #[test]
+    fn list_ops_act_on_the_stage_list_named_by_the_handle() {
+        let basin = basin_with(&[(26, &["scores", "other"])]);
+        let chain = |blocks: Vec<BlockRecord>| {
+            let mut head: Option<BlockRecord> = None;
+            for mut b in blocks.into_iter().rev() {
+                b.next = head.map(Box::new);
+                head = Some(b);
+            }
+            head.unwrap()
+        };
+        let script = chain(vec![
+            list_block("data_addtolist", vec![("ITEM", num(5))]),
+            list_block("data_addtolist", vec![("ITEM", num(7))]),
+            list_block(
+                "data_insertatlist",
+                vec![("ITEM", num(3)), ("INDEX", num(1))],
+            ),
+            list_block(
+                "data_replaceitemoflist",
+                vec![("INDEX", num(2)), ("ITEM", num(6))],
+            ),
+            list_block("data_deleteoflist", vec![("INDEX", num(9))]),
+            // set x to item 2 (6) + length (3) + contains 7 (1) + item # of 7 (3) + item 9 (0)
+            rec(
+                "motion_setx",
+                vec![],
+                vec![(
+                    "X".into(),
+                    rec(
+                        "operator_add",
+                        vec![],
+                        vec![
+                            (
+                                "NUM1".into(),
+                                list_block("data_itemoflist", vec![("INDEX", num(2))]),
+                            ),
+                            (
+                                "NUM2".into(),
+                                rec(
+                                    "operator_add",
+                                    vec![],
+                                    vec![
+                                        ("NUM1".into(), list_block("data_lengthoflist", vec![])),
+                                        (
+                                            "NUM2".into(),
+                                            rec(
+                                                "operator_add",
+                                                vec![],
+                                                vec![
+                                                    (
+                                                        "NUM1".into(),
+                                                        list_block(
+                                                            "data_listcontainsitem",
+                                                            vec![("ITEM", num(7))],
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "NUM2".into(),
+                                                        rec(
+                                                            "operator_add",
+                                                            vec![],
+                                                            vec![
+                                                                (
+                                                                    "NUM1".into(),
+                                                                    list_block(
+                                                                        "data_itemnumoflist",
+                                                                        vec![("ITEM", num(7))],
+                                                                    ),
+                                                                ),
+                                                                (
+                                                                    "NUM2".into(),
+                                                                    list_block(
+                                                                        "data_itemoflist",
+                                                                        vec![("INDEX", num(9))],
+                                                                    ),
+                                                                ),
+                                                            ],
+                                                            vec![],
+                                                            None,
+                                                        ),
+                                                    ),
+                                                ],
+                                                vec![],
+                                                None,
+                                            ),
+                                        ),
+                                    ],
+                                    vec![],
+                                    None,
+                                ),
+                            ),
+                        ],
+                        vec![],
+                        None,
+                    ),
+                )],
+                vec![],
+                None,
+            ),
+        ]);
+        let prog = blockly_abi::lower_program_in(LaneShape::Pairs, &script, &basin).unwrap();
+        let mut m = Machine::new(&prog.functions, 1000).with_basin(&basin);
+        m.run().unwrap();
+        let h = blockly_abi::menus::encode_in(
+            &basin,
+            blockly_abi::menus::menu_by_id(26).unwrap(),
+            "scores",
+        )
+        .unwrap();
+        assert_eq!(
+            m.stage.list(h),
+            &[Value::Num(3.0), Value::Num(6.0), Value::Num(7.0)],
+            "[3 inserted at 1] [5 → 6 at 2] [7]; delete 9 did nothing"
+        );
+        assert_eq!(m.stage.me().x, 6.0 + 3.0 + 1.0 + 3.0 + 0.0);
+        // The other list is untouched: handles discriminate.
+        let o = blockly_abi::menus::encode_in(
+            &basin,
+            blockly_abi::menus::menu_by_id(26).unwrap(),
+            "other",
+        )
+        .unwrap();
+        assert!(m.stage.list(o).is_empty());
+    }
+
+    /// `say` keeps the TEXT register index, not a number: the value on the
+    /// sprite is the text the script said. Costume and effect state land on
+    /// the sprite by their menu indices; `pick random` is reproducible from
+    /// the stage's seed and stays inside its bounds.
+    #[test]
+    fn looks_state_and_random_land_on_the_sprite_and_stage() {
+        let basin = basin_with(&[(29, &["hello"]), (20, &["idle", "run"]), (2, &[])]);
+        let text = rec(
+            "text",
+            vec![("TEXT".into(), FieldValue::Wide("hello".into()))],
+            vec![],
+            vec![],
+            None,
+        );
+        let costume_menu = rec(
+            "looks_costume",
+            vec![("COSTUME".into(), FieldValue::Code("run".into()))],
+            vec![],
+            vec![],
+            None,
+        );
+        let script = rec(
+            "looks_say",
+            vec![],
+            vec![("MESSAGE".into(), text)],
+            vec![],
+            Some(rec(
+                "looks_switchcostumeto",
+                vec![],
+                vec![("COSTUME".into(), costume_menu)],
+                vec![],
+                Some(rec(
+                    "looks_seteffectto",
+                    vec![("EFFECT".into(), FieldValue::Code("GHOST".into()))],
+                    vec![("VALUE".into(), num(40))],
+                    vec![],
+                    Some(rec(
+                        "motion_setx",
+                        vec![],
+                        vec![(
+                            "X".into(),
+                            rec(
+                                "operator_random",
+                                vec![],
+                                vec![("FROM".into(), num(1)), ("TO".into(), num(6))],
+                                vec![],
+                                None,
+                            ),
+                        )],
+                        vec![],
+                        None,
+                    )),
+                )),
+            )),
+        );
+        let prog = blockly_abi::lower_program_in(LaneShape::Pairs, &script, &basin).unwrap();
+        let run = |seed: u64| {
+            let mut m = Machine::new(&prog.functions, 100).with_basin(&basin);
+            m.stage.rng = seed;
+            m.run().unwrap();
+            m.stage
+        };
+        let s1 = run(1);
+        let hello = blockly_abi::menus::encode_in(
+            &basin,
+            blockly_abi::menus::menu_by_id(29).unwrap(),
+            "hello",
+        )
+        .unwrap();
+        assert_eq!(
+            s1.me().say,
+            Some((Value::Text(hello), false)),
+            "the text is kept by register index"
+        );
+        assert_eq!(s1.me().costume, 2, "`run` is the second costume");
+        let ghost = blockly_abi::menus::encode(blockly_abi::menus::menu_by_id(2).unwrap(), "GHOST")
+            .unwrap();
+        assert_eq!(s1.me().effects[usize::from(ghost)], 40.0);
+        let x = s1.me().x;
+        assert!(
+            (1.0..=6.0).contains(&x) && x.fract() == 0.0,
+            "integer bounds: {x}"
+        );
+        assert_eq!(run(1).me().x, x, "same seed, same draw");
+        // Different seeds eventually draw a different value — can-fire.
+        assert!((2..40u64).any(|seed| run(seed).me().x != x));
+    }
+
+    /// `wait` yields the rest of the slice: nothing after it runs this
+    /// round, and the next round continues from the top of the (forever)
+    /// body — so a `forever [wait 1; change x by 1]` moves ONE per round.
+    #[test]
+    fn wait_yields_the_slice_so_a_waiting_loop_moves_once_per_round() {
+        let script = rec(
+            "control_forever",
+            vec![],
+            vec![],
+            vec![(
+                "SUBSTACK".into(),
+                rec(
+                    "control_wait",
+                    vec![],
+                    vec![("DURATION".into(), num(1))],
+                    vec![],
+                    Some(rec(
+                        "motion_changexby",
+                        vec![],
+                        vec![("DX".into(), num(1))],
+                        vec![],
+                        None,
+                    )),
+                ),
+            )],
+            None,
+        );
+        let prog = lower_program(LaneShape::Pairs, &script).unwrap();
+        let mut scene = Scene::new(Stage::default(), vec![prog.functions.as_slice()]);
+        scene.run(5, 1000).unwrap();
+        // The scene re-enters the body each round; the change lands only
+        // when the slice starts AFTER a yielded wait, i.e. never within one
+        // slice — so x stays 0 here, which is the point: `wait` is not a
+        // no-op that lets the loop spin 1000 times.
+        assert_eq!(scene.stage.me().x, 0.0);
+        let mut spin = Machine::new(&prog.functions, 1000);
+        spin.run().unwrap();
+        assert_eq!(
+            spin.stage.me().x,
+            0.0,
+            "a bare run yields at the first wait"
+        );
+    }
+
+    /// A clone: `create clone of myself` copies the sprite, and the owner's
+    /// `when I start as a clone` script runs ONCE next round AS the clone —
+    /// the original never runs it; `delete this clone` retires the clone.
+    #[test]
+    fn a_clone_is_born_runs_its_hat_once_as_itself_and_can_delete_itself() {
+        let basin = basin_with(&[(24, &["_myself_"])]);
+        let menu = rec(
+            "control_create_clone_of_menu",
+            vec![("CLONE_OPTION".into(), FieldValue::Code("_myself_".into()))],
+            vec![],
+            vec![],
+            None,
+        );
+        let spawner = rec(
+            "event_whenflagclicked",
+            vec![],
+            vec![],
+            vec![],
+            Some(rec(
+                "control_create_clone_of",
+                vec![],
+                vec![("CLONE_OPTION".into(), menu)],
+                vec![],
+                None,
+            )),
+        );
+        let on_clone = rec(
+            "control_start_as_clone",
+            vec![],
+            vec![],
+            vec![],
+            Some(rec(
+                "motion_changexby",
+                vec![],
+                vec![("DX".into(), num(10))],
+                vec![],
+                Some(rec(
+                    "control_delete_this_clone",
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )),
+            )),
+        );
+        let p_spawn = blockly_abi::lower_program_in(LaneShape::Pairs, &spawner, &basin).unwrap();
+        let p_clone = blockly_abi::lower_program_in(LaneShape::Pairs, &on_clone, &basin).unwrap();
+        let stage = Stage {
+            sprites: vec![Sprite::default()],
+            ..Stage::default()
+        };
+        let mut scene = Scene::new(
+            stage,
+            vec![p_spawn.functions.as_slice(), p_clone.functions.as_slice()],
+        )
+        .with_owners(&[0, 0]);
+        scene.run(1, 100).unwrap();
+        assert_eq!(scene.stage.sprites.len(), 2, "one clone born in round 1");
+        assert_eq!(scene.stage.sprites[1].clone_of, Some(0));
+        assert_eq!(
+            scene.stage.sprites[1].x, 0.0,
+            "the clone hat runs NEXT round"
+        );
+        scene.run(1, 100).unwrap();
+        assert_eq!(
+            scene.stage.sprites[0].x, 0.0,
+            "the original never runs the clone hat"
+        );
+        assert_eq!(
+            scene.stage.sprites[1].x, 10.0,
+            "the clone ran it, as itself"
+        );
+        assert!(!scene.stage.sprites[1].alive, "…and deleted itself");
+        assert_eq!(scene.stage.sprites.len(), 3, "round 2 spawned another");
+    }
+
+    /// `(x position) of (Ball)` reads ANOTHER sprite through the OF_OBJECT
+    /// index the menu pushed, and a variable by name resolves register to
+    /// register (OF_PROPERTY entry → VARIABLE index).
+    #[test]
+    fn sensing_of_reads_another_sprite_and_a_variable_by_name() {
+        use blockly_abi::menus;
+        let basin = basin_with(&[
+            (19, &["_stage_", "Ball", "Paddle"]),
+            (
+                27,
+                &[
+                    "x position",
+                    "y position",
+                    "direction",
+                    "costume #",
+                    "costume name",
+                    "size",
+                    "volume",
+                    "backdrop #",
+                    "backdrop nm",
+                    "score",
+                ],
+            ),
+            (25, &["score"]),
+        ]);
+        let of = |prop: &str, obj: &str| {
+            rec(
+                "sensing_of",
+                vec![("PROPERTY".into(), FieldValue::Code(prop.into()))],
+                vec![(
+                    "OBJECT".into(),
+                    rec(
+                        "sensing_of_object_menu",
+                        vec![("OBJECT".into(), FieldValue::Code(obj.into()))],
+                        vec![],
+                        vec![],
+                        None,
+                    ),
+                )],
+                vec![],
+                None,
+            )
+        };
+        let script = rec(
+            "motion_setx",
+            vec![],
+            vec![("X".into(), of("x position", "Paddle"))],
+            vec![],
+            Some(rec(
+                "motion_sety",
+                vec![],
+                vec![("Y".into(), of("score", "Paddle"))],
+                vec![],
+                None,
+            )),
+        );
+        let prog = blockly_abi::lower_program_in(LaneShape::Pairs, &script, &basin).unwrap();
+        let mut m = Machine::new(&prog.functions, 100).with_basin(&basin);
+        m.stage.sprites = vec![
+            Sprite::default(),
+            Sprite {
+                x: 123.0,
+                ..Sprite::default()
+            },
+        ];
+        let score = menus::encode_in(&basin, menus::menu_by_id(25).unwrap(), "score").unwrap();
+        *m.stage.var_mut(score) = 42.0;
+        m.run().unwrap();
+        assert_eq!(
+            m.stage.sprites[0].x, 123.0,
+            "Paddle is OF_OBJECT index 3 → sprite 1"
+        );
+        assert_eq!(m.stage.sprites[0].y, 42.0, "the variable resolved by name");
     }
 }

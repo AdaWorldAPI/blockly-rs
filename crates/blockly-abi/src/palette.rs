@@ -76,10 +76,10 @@ pub const fn render_classid(app_prefix: u16) -> u32 {
 /// [`Constant::classid`](ogar_loco::Constant::classid), so the pool, not the
 /// body, says whether index 3 reads as an `f64` or as UTF-8.
 ///
-/// Sits just above the last device mint (`0xFA`), inside the palette's own
-/// range; it is not a Scratch block and has no toolbox entry, so it is not a
-/// row of [`crate::scratch::SCRATCH_DEVICE`].
-pub const POOL_LOAD: FnIndex = FnIndex(0xFB);
+/// Sits just above the last device mint (`0xFB`, the list handle), inside
+/// the palette's own range; it is not a Scratch block and has no toolbox
+/// entry, so it is not a row of [`crate::scratch::SCRATCH_DEVICE`].
+pub const POOL_LOAD: FnIndex = FnIndex(0xFC);
 
 /// The Blockly/Scratch palette as an `ogar-loco` [`Vocabulary`].
 ///

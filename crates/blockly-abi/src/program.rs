@@ -150,6 +150,10 @@ fn lower_block_into(
     basin: &ogar_loco::basin::BasinCodebooks,
     mut ctx: Option<&mut LoweringContext>,
 ) -> Result<(), CastError> {
+    // The list handle first — see `lower_block` / `list_handle_of`.
+    if let Some(handle) = crate::list_handle_of(block) {
+        body.push(call_for(&handle, None, basin)?)?;
+    }
     for (_, operand) in &block.inputs {
         lower_block_into(shape, operand, body, functions, basin, ctx.as_deref_mut())?;
     }

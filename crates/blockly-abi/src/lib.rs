@@ -595,6 +595,11 @@ fn lower_block(
     body: &mut FunctionBody,
     mut ctx: Option<&mut LoweringContext>,
 ) -> Result<(), CastError> {
+    // A Scratch list op names its list in a FIELD; the core pops it as an
+    // operand, so the handle is pushed first.
+    if let Some(handle) = list_handle_of(block) {
+        body.push(call_for(&handle, None, menus::static_basin())?)?;
+    }
     // Operands first — this IS the stack discipline, and it is Blockly's own
     // nesting rather than a convention imposed on it.
     for (_, operand) in &block.inputs {
@@ -603,6 +608,39 @@ fn lower_block(
     let call = call_for(block, ctx, menus::static_basin())?;
     body.push(call)?;
     Ok(())
+}
+
+/// Whether `f` is a shared-core list operation Scratch reaches through a
+/// `LIST` field — the ops whose first popped operand is the list handle.
+#[must_use]
+pub const fn is_list_op(f: FnIndex) -> bool {
+    matches!(
+        f,
+        FnIndex::LIST_LENGTH
+            | FnIndex::LIST_INDEX_OF
+            | FnIndex::LIST_GET
+            | FnIndex::LIST_SET
+            | FnIndex::LIST_INSERT
+            | FnIndex::LIST_ADD
+            | FnIndex::LIST_DELETE
+            | FnIndex::LIST_DELETE_ALL
+            | FnIndex::LIST_CONTAINS
+    )
+}
+
+/// For a Scratch list op carrying a `LIST` field: the `data_listcontents`
+/// leaf that pushes its handle — lowered BEFORE the op's operands, so the
+/// core pops the list first, exactly as its arity table counts it.
+pub(crate) fn list_handle_of(block: &BlockRecord) -> Option<BlockRecord> {
+    let mapping = scratch::resolve_scratch(&block.ty, None)?;
+    if !is_list_op(mapping.function) {
+        return None;
+    }
+    let list = block.field("LIST")?.clone();
+    Some(
+        BlockRecord::leaf("data_listcontents", format!("{}_list", block.id))
+            .with_field("LIST", list),
+    )
 }
 
 /// The single call one block lowers to — its function index plus its immediate.
@@ -662,6 +700,11 @@ pub(crate) fn call_for(
     };
 
     for (name, v) in &block.fields {
+        // A list op's LIST field was already spent as the pushed handle
+        // (`list_handle_of`); it is not an immediate of the op itself.
+        if name == "LIST" && is_list_op(mapping.function) {
+            continue;
+        }
         // A dropdown the menu table names is a CODEBOOK INDEX, whatever
         // shape the shim guessed for it: Scratch codes are lowercase
         // (`"up arrow"`, `"front"`) so the all-caps heuristic reads them as
