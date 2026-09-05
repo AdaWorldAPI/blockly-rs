@@ -65,6 +65,22 @@ pub const fn render_classid(app_prefix: u16) -> u32 {
     ((PALETTE_CONCEPT as u32) << 16) | (app_prefix as u32)
 }
 
+/// The constant-pool load: a 0-arity reporter whose immediate is an index
+/// into the program's [`ConstantPool`](ogar_loco::ConstantPool).
+///
+/// Why a separate byte and not `NUMBER`'s own immediate: `NUMBER` already
+/// spends its byte as the VALUE (`math_number[7]` is `NUMBER 7`), so a pool
+/// index in the same slot would be indistinguishable from a small literal —
+/// `NUMBER 200` could mean two hundred or "constant #200". One byte, one
+/// reading. The value's TYPE is not in the call either; it is the interned
+/// [`Constant::classid`](ogar_loco::Constant::classid), so the pool, not the
+/// body, says whether index 3 reads as an `f64` or as UTF-8.
+///
+/// Sits just above the last device mint (`0xFA`), inside the palette's own
+/// range; it is not a Scratch block and has no toolbox entry, so it is not a
+/// row of [`crate::scratch::SCRATCH_DEVICE`].
+pub const POOL_LOAD: FnIndex = FnIndex(0xFB);
+
 /// The Blockly/Scratch palette as an `ogar-loco` [`Vocabulary`].
 ///
 /// Operations below [`DEVICE_FAMILY_FLOOR`] belong to the shared
@@ -84,6 +100,9 @@ pub struct BlocklyPalette;
 
 impl Vocabulary for BlocklyPalette {
     fn domain_stack_arity(&self, f: FnIndex) -> Option<u8> {
+        if f == POOL_LOAD {
+            return Some(0);
+        }
         crate::scratch::device_by_byte(f.0).map(|(_, arity, _)| arity)
     }
 

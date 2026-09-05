@@ -30,7 +30,7 @@
 
 use crate::{BlockRecord, FieldValue};
 use ogar_loco::vocabulary::shared_core;
-use ogar_loco::{FnIndex, FunctionBody};
+use ogar_loco::{ConstantPool, FnIndex, FunctionBody};
 
 /// Why a stored program could not be raised back to blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +47,10 @@ pub enum RaiseError {
     /// A menu-bearing function carries an index outside the menu's static
     /// prefix — a project-interned entry this raise has no table for.
     UnknownOption(u8, u8),
+    /// A [`POOL_LOAD`](crate::POOL_LOAD) names a constant the pool does not
+    /// hold — or no pool was supplied at all. Refused rather than raised as
+    /// the bare index: `1000000` and "constant #3" are not the same block.
+    MissingConstant(u8),
 }
 
 impl core::fmt::Display for RaiseError {
@@ -56,6 +60,7 @@ impl core::fmt::Display for RaiseError {
             Self::Uncovered(b) => write!(f, "function {b:#04x} has no covered arity"),
             Self::StackUnderflow(b) => write!(f, "function {b:#04x} wanted absent operands"),
             Self::DanglingReference(i) => write!(f, "body reference {i} names no function"),
+            Self::MissingConstant(i) => write!(f, "constant {i} is not in the pool"),
             Self::UnknownOption(b, i) => {
                 write!(
                     f,
@@ -108,6 +113,8 @@ pub fn pushes(f: FnIndex) -> bool {
     match f {
         FnIndex::PROC_ARG => return true,
         FnIndex::PROC_CALL | FnIndex::PROC_DEF => return false,
+        // The pool load is a leaf value, like the literal it stands for.
+        crate::POOL_LOAD => return true,
         _ => {}
     }
     if let Some((name, ..)) = crate::scratch::device_by_byte(f.0) {
@@ -145,6 +152,26 @@ pub fn raise_body_in(
     index: usize,
     basin: &ogar_loco::basin::BasinCodebooks,
 ) -> Result<Option<BlockRecord>, RaiseError> {
+    raise_body_pooled(functions, index, basin, None)
+}
+
+/// [`raise_body_in`] with the program's constant pool, so a
+/// [`POOL_LOAD`](crate::POOL_LOAD) raises back to the literal block it came
+/// from: an `f64` constant to `math_number` (`NUM` as [`FieldValue::Wide`]),
+/// a UTF-8 constant to `text` (`TEXT` as `Wide`) — the same records the sb3
+/// reader and the editor produce, so the round trip re-lowers byte-identical
+/// with an identical pool.
+///
+/// # Errors
+///
+/// See [`RaiseError`]; [`RaiseError::MissingConstant`] when a load names an
+/// index the pool does not hold, or `pool` is `None` and the body has a load.
+pub fn raise_body_pooled(
+    functions: &[FunctionBody],
+    index: usize,
+    basin: &ogar_loco::basin::BasinCodebooks,
+    pool: Option<&ConstantPool>,
+) -> Result<Option<BlockRecord>, RaiseError> {
     let body = functions
         .get(index)
         .ok_or(RaiseError::DanglingReference(index as u8))?;
@@ -154,6 +181,47 @@ pub fn raise_body_in(
 
     for (ci, call) in crate::raise_calls(body).iter().enumerate() {
         let f = call.function;
+
+        // A pool load is the literal it stands for. The constant's classid —
+        // not anything in the call — decides which block: an `f64` is a
+        // `math_number`, UTF-8 is a `text`. Any other classid is refused
+        // (this crate mints neither, so it cannot name the block).
+        if f == crate::POOL_LOAD {
+            let idx = call.values.first().copied().unwrap_or(0);
+            let c = pool
+                .and_then(|p| p.resolve(idx))
+                .ok_or(RaiseError::MissingConstant(idx))?;
+            let (ty, field, text) = match c.classid {
+                ogar_loco::pool::placeholder::CONST_F64 => {
+                    let mut le = [0u8; 8];
+                    le.copy_from_slice(&c.bytes[..8]);
+                    ("math_number", "NUM", f64::from_le_bytes(le).to_string())
+                }
+                ogar_loco::pool::placeholder::CONST_UTF8_INLINE => {
+                    let end = c
+                        .bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(c.bytes.len());
+                    let s = core::str::from_utf8(&c.bytes[..end])
+                        .map_err(|_| RaiseError::MissingConstant(idx))?;
+                    ("text", "TEXT", s.to_string())
+                }
+                _ => return Err(RaiseError::MissingConstant(idx)),
+            };
+            stack.push(BlockRecord {
+                ty: ty.to_string(),
+                id: format!("r{index}_{ci}"),
+                fields: vec![(field.to_string(), FieldValue::Wide(text))],
+                inputs: Vec::new(),
+                statements: Vec::new(),
+                next: None,
+                extra_state: None,
+                disabled: false,
+            });
+            continue;
+        }
+
         let (ty, code) = block_for(f).ok_or(RaiseError::UnknownFunction(f.0))?;
 
         let refs = usize::from(shared_core::body_refs(f));
@@ -200,7 +268,7 @@ pub fn raise_body_in(
             let name = stmt_names
                 .get(r)
                 .map_or_else(|| format!("S{r}"), |n| (*n).to_string());
-            if let Some(sub) = raise_body_in(functions, target, basin)? {
+            if let Some(sub) = raise_body_pooled(functions, target, basin, pool)? {
                 statements.push((name, sub));
             }
         }
@@ -303,6 +371,20 @@ pub fn raise_program_in(
     basin: &ogar_loco::basin::BasinCodebooks,
 ) -> Result<Option<BlockRecord>, RaiseError> {
     raise_body_in(functions, 0, basin)
+}
+
+/// [`raise_program_in`] with the program's constant pool — see
+/// [`raise_body_pooled`].
+///
+/// # Errors
+///
+/// See [`RaiseError`].
+pub fn raise_program_pooled(
+    functions: &[FunctionBody],
+    basin: &ogar_loco::basin::BasinCodebooks,
+    pool: &ConstantPool,
+) -> Result<Option<BlockRecord>, RaiseError> {
+    raise_body_pooled(functions, 0, basin, Some(pool))
 }
 
 #[cfg(test)]
@@ -597,5 +679,60 @@ mod tests {
             block_for(FnIndex(0x90)).map(|(t, _)| t),
             Some("motion_movesteps")
         );
+    }
+
+    /// A wide literal round-trips THROUGH THE POOL: raise with the pool,
+    /// re-lower against a fresh context, and both the bodies and the pool
+    /// come back identical. Without the pool the raise refuses rather than
+    /// handing back the bare index as a number.
+    #[test]
+    fn a_pooled_literal_raises_to_its_literal_and_re_lowers_identically() {
+        use crate::{LoweringContext, lower_program_with_pool};
+        let script = BlockRecord::leaf("motion_setx", "s")
+            .with_input(
+                "X",
+                BlockRecord::leaf("math_number", "n")
+                    .with_field("NUM", FieldValue::Wide("1000000".into())),
+            )
+            .with_next(BlockRecord::leaf("looks_say", "say").with_input(
+                "MESSAGE",
+                BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide("hello".into())),
+            ));
+        let basin = crate::menus::static_basin();
+        let mut ctx = LoweringContext::placeholder();
+        let prog = lower_program_with_pool(LaneShape::Pairs, &script, basin, &mut ctx).unwrap();
+        assert_eq!(ctx.pool.len(), 2);
+        // The literal blocks became pool loads — never NUMBER/TEXT carrying an index.
+        let calls = crate::raise_calls(prog.entry());
+        assert_eq!(calls[0].function, crate::POOL_LOAD);
+        assert_eq!(calls[2].function, crate::POOL_LOAD);
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.function != ogar_loco::FnIndex::NUMBER)
+        );
+
+        // No pool: refused, with the index named.
+        assert_eq!(
+            raise_program_in(&prog.functions, basin),
+            Err(RaiseError::MissingConstant(calls[0].values[0]))
+        );
+
+        let raised = raise_program_pooled(&prog.functions, basin, &ctx.pool)
+            .unwrap()
+            .unwrap();
+        // The literal text is back, as the wide field it was.
+        let n = &raised.inputs[0].1;
+        assert_eq!(n.ty, "math_number");
+        assert_eq!(n.field("NUM"), Some(&FieldValue::Wide("1000000".into())));
+        let t = &raised.next.as_ref().unwrap().inputs[0].1;
+        assert_eq!(t.ty, "text");
+        assert_eq!(t.field("TEXT"), Some(&FieldValue::Wide("hello".into())));
+
+        // …and re-lowering reproduces the SAME bytes and the SAME pool.
+        let mut again = LoweringContext::placeholder();
+        let prog2 = lower_program_with_pool(LaneShape::Pairs, &raised, basin, &mut again).unwrap();
+        assert_eq!(prog2.functions, prog.functions);
+        assert_eq!(again.pool, ctx.pool);
     }
 }

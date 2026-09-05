@@ -649,7 +649,10 @@ fn number_leaf(id: &str, s: &str) -> BlockRecord {
     if s.parse::<f64>().is_ok() {
         BlockRecord::leaf("math_number", id).with_field("NUM", crate::byte_or_wide(s.to_string()))
     } else {
-        BlockRecord::leaf("text", id).with_field("TEXT", crate::byte_or_wide(s.to_string()))
+        // A text primitive is a LITERAL, never a dropdown code: `"GO"` is the
+        // word go, and the all-caps classifier would have read it as a
+        // selector (measured: 46 refused scripts on one real project).
+        BlockRecord::leaf("text", id).with_field("TEXT", FieldValue::Wide(s.to_string()))
     }
 }
 

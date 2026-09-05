@@ -104,6 +104,10 @@ fn measure_target(project: &Sb3Project, target: &Sb3Target, out: &mut Counts) {
         out.stages += 1;
     }
     let basin = target_basin(project, target);
+    // ONE constant pool per target — the unit `blockly_run::Scene::with_pool`
+    // takes — so a target whose scripts need more than 255 distinct wide
+    // literals shows up here as `ConstantPool` refusals, honestly.
+    let mut ctx = blockly_abi::LoweringContext::placeholder();
     // `block_count` is sb3's own object count (shadows included, inline
     // primitives excluded); the block totals below count `BlockRecord` nodes
     // so that "in ok" and "total" are the same unit.
@@ -112,7 +116,12 @@ fn measure_target(project: &Sb3Project, target: &Sb3Target, out: &mut Counts) {
         out.scripts += 1;
         out.blocks_total += records(script);
         collect_opcodes(script, &mut out.opcodes);
-        match blockly_abi::lower_program_in(ogar_loco::LaneShape::Triples, script, &basin) {
+        match blockly_abi::lower_program_with_pool(
+            ogar_loco::LaneShape::Triples,
+            script,
+            &basin,
+            &mut ctx,
+        ) {
             Ok(_) => {
                 out.scripts_ok += 1;
                 out.blocks_ok += records(script);
@@ -182,7 +191,13 @@ fn dump_target(target: &Sb3Target, project: &Sb3Project) {
     println!("-- dump target `{}`", target.name);
     let basin = target_basin(project, target);
     for (i, script) in target.scripts.iter().enumerate() {
-        match blockly_abi::lower_program_in(ogar_loco::LaneShape::Triples, script, &basin) {
+        let mut ctx = blockly_abi::LoweringContext::placeholder();
+        match blockly_abi::lower_program_with_pool(
+            ogar_loco::LaneShape::Triples,
+            script,
+            &basin,
+            &mut ctx,
+        ) {
             Ok(_) => println!("   [{i}] {} ok", script.ty),
             Err(e) => println!("   [{i}] {} REFUSED: {e:?}", script.ty),
         }

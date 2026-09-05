@@ -94,9 +94,9 @@ pub mod scratch;
 pub use codebook::{OpcodeMapping, resolve_opcode};
 pub use klickweg::{BlockAddress, address_of};
 pub use palette::{
-    BlocklyPalette, DEVICE_FAMILY_FLOOR, PALETTE_CONCEPT, plug_into, render_classid,
+    BlocklyPalette, DEVICE_FAMILY_FLOOR, PALETTE_CONCEPT, POOL_LOAD, plug_into, render_classid,
 };
-pub use program::{lower_program, lower_program_in};
+pub use program::{lower_program, lower_program_in, lower_program_with_pool};
 pub use projection::{ProjectionError, parse_text, render_text};
 pub use registry::registry;
 
@@ -341,8 +341,9 @@ pub enum CastError {
         /// The dropdown code that accompanied it, if any.
         code: Option<String>,
     },
-    /// A field value exceeds one immediate byte and needs the constant pool,
-    /// which is a named follow-up rather than a shipped surface.
+    /// A field value exceeds one immediate byte and needs the constant pool —
+    /// cast with [`lower_program_with_pool`] (or [`lower_script_with_pool`])
+    /// to intern it.
     WideLiteral {
         /// The block whose field is too wide.
         ty: String,
@@ -615,7 +616,7 @@ pub(crate) fn call_for(
     // the SAME operation they resolve to the same byte, which is the point of
     // the shared core and is pinned by
     // `scratch::tests::blockly_and_scratch_lower_the_same_operation_to_the_same_byte`.
-    let mapping = codebook::resolve(&block.ty, code)
+    let mut mapping = codebook::resolve(&block.ty, code)
         .or_else(|| scratch::resolve_scratch(&block.ty, code))
         .ok_or_else(|| CastError::UnknownOpcode {
             ty: block.ty.clone(),
@@ -702,6 +703,15 @@ pub(crate) fn call_for(
                         value: text.clone(),
                         source: e,
                     })?;
+                    // A literal block becomes the POOL LOAD, not `NUMBER` /
+                    // `TEXT` with a pool index in the value slot: those two
+                    // already spend the slot as the value itself, so the
+                    // same bytes would read as a small literal. The load's
+                    // immediate is the index; the constant's classid says
+                    // how it reads.
+                    if mapping.function == FnIndex::NUMBER || mapping.function == FnIndex::TEXT {
+                        mapping.function = palette::POOL_LOAD;
+                    }
                     push(idx)?;
                 }
             },

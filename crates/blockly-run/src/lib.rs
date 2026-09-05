@@ -196,6 +196,9 @@ pub enum RunError {
     /// A custom-block call names a procedure index no definition in the scene
     /// carries. Refused rather than skipped, for the same reason.
     UnknownProcedure(u8),
+    /// A pool load names a constant the run's pool does not hold — or the run
+    /// was given no pool. Refused rather than read as the bare index.
+    MissingConstant(u8),
 }
 
 impl core::fmt::Display for RunError {
@@ -206,6 +209,7 @@ impl core::fmt::Display for RunError {
             Self::DanglingReference(i) => write!(f, "body reference {i} names no function"),
             Self::Unimplemented(b) => write!(f, "function {b:#04x} is not implemented"),
             Self::UnknownProcedure(i) => write!(f, "no definition carries procedure {i}"),
+            Self::MissingConstant(i) => write!(f, "constant {i} is not in the pool"),
         }
     }
 }
@@ -301,6 +305,10 @@ fn plan() -> &'static Plan {
             let f = FnIndex(b);
             arity[usize::from(b)] = shared_core::stack_arity(f)
                 .or_else(|| scratch::device_by_byte(b).map(|(_, a, _)| a));
+            // The pool load is a leaf: nothing popped, one value pushed.
+            if f == blockly_abi::POOL_LOAD {
+                arity[usize::from(b)] = Some(0);
+            }
             let Some((name, ..)) = scratch::device_by_byte(b) else {
                 continue;
             };
@@ -353,6 +361,9 @@ pub struct Machine<'a> {
     functions: &'a [FunctionBody],
     /// Custom blocks callable from this run, by index.
     procs: &'a [Procedure<'a>],
+    /// The constant pool `POOL_LOAD` reads. `None` = every load is refused,
+    /// which is what a program with no wide literal never notices.
+    pool: Option<&'a ogar_loco::ConstantPool>,
     /// Argument frames of the custom blocks currently executing, innermost
     /// last. `PROC_ARG` reads the innermost; outside any call it reads `0`.
     frames: Vec<Vec<f32>>,
@@ -397,6 +408,7 @@ impl<'a> Machine<'a> {
             stage: Stage::default(),
             functions,
             procs: &[],
+            pool: None,
             frames: Vec::new(),
             budget,
             trace: Vec::new(),
@@ -409,6 +421,14 @@ impl<'a> Machine<'a> {
     #[must_use]
     pub fn with_procs(mut self, procs: &'a [Procedure<'a>]) -> Self {
         self.procs = procs;
+        self
+    }
+
+    /// Read wide literals from this pool — the one the program was cast
+    /// against with `lower_program_with_pool`.
+    #[must_use]
+    pub fn with_pool(mut self, pool: &'a ogar_loco::ConstantPool) -> Self {
+        self.pool = Some(pool);
         self
     }
 
@@ -579,6 +599,38 @@ impl<'a> Machine<'a> {
             .and_then(|fr| fr.get(imm as usize))
             .copied()
             .unwrap_or(0.0);
+        // A pool load: the constant's classid says how its bytes read. An
+        // `f64` is the number; UTF-8 reads as Scratch reads text in a numeric
+        // slot — its numeric value if it has one, else 0. The stack is f32,
+        // so a text constant's identity is not carried past this point.
+        if f == blockly_abi::POOL_LOAD {
+            let idx = imm as u8;
+            let c = self
+                .pool
+                .and_then(|p| p.resolve(idx))
+                .ok_or(RunError::MissingConstant(idx))?;
+            let v = match c.classid {
+                ogar_loco::pool::placeholder::CONST_F64 => {
+                    let mut le = [0u8; 8];
+                    le.copy_from_slice(&c.bytes[..8]);
+                    f64::from_le_bytes(le) as f32
+                }
+                ogar_loco::pool::placeholder::CONST_UTF8_INLINE => {
+                    let end = c
+                        .bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(c.bytes.len());
+                    core::str::from_utf8(&c.bytes[..end])
+                        .ok()
+                        .and_then(|s| s.trim().parse::<f32>().ok())
+                        .unwrap_or(0.0)
+                }
+                _ => return Err(RunError::MissingConstant(idx)),
+            };
+            return Ok(Some(v));
+        }
+
         let s = &mut self.stage;
         // Motion/looks act on the sprite this script is bound to.
         let me = s.current.min(s.sprites.len() - 1);
@@ -770,6 +822,10 @@ pub struct Scene<'a> {
     /// Custom blocks: definition scripts are NOT scheduled — a definition
     /// runs when called — they are the scene's procedure table.
     procs: Vec<Procedure<'a>>,
+    /// The ONE constant pool every scheduled script and procedure reads —
+    /// the unit is the sprite: cast all of a sprite's scripts against one
+    /// `LoweringContext` and hand its pool here.
+    pool: Option<&'a ogar_loco::ConstantPool>,
     trace: Vec<Stage>,
     /// Simulated pointer travel, in stage units per round.
     ///
@@ -799,10 +855,18 @@ impl<'a> Scene<'a> {
             stage,
             scripts: scheduled,
             procs,
+            pool: None,
             trace: Vec::new(),
             mouse_sweep: 0.0,
             key_period: 0,
         }
+    }
+
+    /// Read wide literals from this pool in every script the scene runs.
+    #[must_use]
+    pub fn with_pool(mut self, pool: &'a ogar_loco::ConstantPool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// Alternate the held key between `up arrow` and `down arrow` every
@@ -855,6 +919,9 @@ impl<'a> Scene<'a> {
             for (i, script) in self.scripts.iter().enumerate() {
                 let stage = core::mem::take(&mut self.stage);
                 let mut m = Machine::resuming(script, slice, stage, i).with_procs(procs);
+                if let Some(pool) = self.pool {
+                    m = m.with_pool(pool);
+                }
                 let outcome = m.run();
                 self.stage = m.stage;
                 outcome?;
@@ -1353,5 +1420,43 @@ mod tests {
         )
         .expect("casts");
         assert!(Machine::new(&ok.functions, 100).run().is_ok());
+    }
+
+    /// A wide literal is READ FROM THE POOL at run time: `set x to 1000000`
+    /// lands the sprite at a million, not at the pool index. The same body
+    /// run without its pool is refused, not run with the index as the value.
+    #[test]
+    fn a_pooled_literal_is_read_from_the_pool_and_a_missing_pool_is_refused() {
+        use blockly_abi::{LoweringContext, lower_program_with_pool};
+        let script = rec(
+            "motion_setx",
+            vec![],
+            vec![(
+                "X".into(),
+                rec(
+                    "math_number",
+                    vec![("NUM".into(), FieldValue::Wide("1000000".into()))],
+                    vec![],
+                    vec![],
+                    None,
+                ),
+            )],
+            vec![],
+            None,
+        );
+        let basin = blockly_abi::menus::static_basin();
+        let mut ctx = LoweringContext::placeholder();
+        let prog = lower_program_with_pool(LaneShape::Pairs, &script, basin, &mut ctx).unwrap();
+        let idx = blockly_abi::raise_calls(prog.entry())[0].values[0];
+        assert_ne!(idx, 0);
+
+        let mut m = Machine::new(&prog.functions, 100).with_pool(&ctx.pool);
+        m.run().unwrap();
+        assert_eq!(m.stage.me().x, 1_000_000.0);
+        // Anti-vacuity: a run that read the INDEX would have landed here.
+        assert_ne!(m.stage.me().x, f32::from(idx));
+
+        let mut bare = Machine::new(&prog.functions, 100);
+        assert_eq!(bare.run(), Err(RunError::MissingConstant(idx)));
     }
 }

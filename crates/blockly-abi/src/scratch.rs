@@ -40,7 +40,9 @@
 //! the sprite-and-stage half is Scratch's own.
 //!
 //! The 94 device mints occupy `0x90..=0xED`; the 13 menu shadow blocks take
-//! `0xEE..=0xFA`, leaving 5 slots. Scratch extensions (pen, music, video
+//! `0xEE..=0xFA`; `0xFB` is the constant-pool load
+//! ([`crate::palette::POOL_LOAD`], not a Scratch block, so not a row here),
+//! leaving 4 slots. Scratch extensions (pen, music, video
 //! sensing) are deliberately NOT minted here — and per OGAR #295 they never
 //! will be one-opcode-per-block: an extension is ONE `FnIndex` whose operand
 //! indexes a codebook, exactly as the menus below already are.
@@ -1244,9 +1246,13 @@ mod tests {
                 "{name} is not in the domain range"
             );
         }
-        // …and 5 slots stay free. Extensions do not need them: per OGAR #295
-        // an extension is one opcode plus a codebook, never a block per slot.
+        // …and 5 slots stay above the table: the first is the pool load
+        // (not a Scratch block, so never a device row), 4 stay free.
+        // Extensions do not need them: per OGAR #295 an extension is one
+        // opcode plus a codebook, never a block per slot.
         assert_eq!(0xFFu16 - u16::from(*bytes.last().unwrap()), 5);
+        assert_eq!(crate::palette::POOL_LOAD.0, *bytes.last().unwrap() + 1);
+        assert!(device_by_byte(crate::palette::POOL_LOAD.0).is_none());
     }
 
     /// Scratch's LOGIC half needs no mint — the substrate already has it.
