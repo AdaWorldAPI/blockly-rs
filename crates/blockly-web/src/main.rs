@@ -52,6 +52,9 @@ struct RunQuery {
     mouse_y: Option<f32>,
     /// Whether `sensing_touchingobject` answers true.
     touching: Option<bool>,
+    /// The key held for the whole run, as its harvested `KEY_OPTION` code
+    /// (`"up arrow"`, `"space"`, …). Unknown or absent = no key.
+    key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +146,27 @@ async fn api_scratch_defs() -> Json<serde_json::Value> {
             for (i, name) in stmts.iter().enumerate() {
                 message.push_str(&format!(" %{}", values.len() + i + 1));
                 args.push(serde_json::json!({"type": "input_statement", "name": name}));
+            }
+            // A dropdown — inline field or menu shadow block — offers the
+            // harvested static options. The page shows `[label, code]` pairs
+            // whose code is what the cast turns into a codebook index; a
+            // dynamic menu (sprite / costume names) has no static options and
+            // is offered empty until a project interns its own.
+            if let Some((field, menu)) = blockly_abi::menus::menu_for_block(ty) {
+                let options: Vec<_> = menu
+                    .options
+                    .iter()
+                    .map(|o| serde_json::json!([o, o]))
+                    .collect();
+                let options = if options.is_empty() {
+                    vec![serde_json::json!(["—", ""])]
+                } else {
+                    options
+                };
+                message.push_str(&format!(" %{}", args.len() + 1));
+                args.push(serde_json::json!({
+                    "type": "field_dropdown", "name": field, "options": options
+                }));
             }
             let mut d = serde_json::json!({
                 "type": ty,
@@ -270,6 +294,10 @@ async fn api_run(Query(q): Query<RunQuery>, body: String) -> Html<String> {
     let mut scene = blockly_run::Scene::new(blockly_run::Stage::pong(), bodies)
         .with_mouse_sweep(q.mouse_y.unwrap_or(120.0));
     scene.stage.touching = q.touching.unwrap_or(false);
+    scene.stage.key = q
+        .key
+        .as_deref()
+        .and_then(|k| blockly_abi::menus::encode(blockly_abi::menus::menu_by_id(1)?, k));
 
     // A refusal is INFORMATION: the scene still renders what it reached, and
     // the note names the operation that stopped it.
@@ -292,7 +320,27 @@ async fn api_run(Query(q): Query<RunQuery>, body: String) -> Html<String> {
 fn blocks(types: &[&str]) -> Vec<serde_json::Value> {
     types
         .iter()
-        .map(|t| serde_json::json!({"kind": "block", "type": t}))
+        .map(|t| {
+            let mut b = serde_json::json!({"kind": "block", "type": t});
+            // Seat the menu shadow a consuming block's input expects, so a
+            // dragged `sensing_keypressed` arrives with its `sensing_keyoptions`
+            // already in place — the shape Scratch itself presents.
+            let shadows: serde_json::Map<String, serde_json::Value> =
+                blockly_abi::menus::MENU_INPUTS
+                    .iter()
+                    .filter(|&&(c, ..)| c == *t)
+                    .map(|&(_, input, menu_block)| {
+                        (
+                            input.to_string(),
+                            serde_json::json!({"shadow": {"type": menu_block}}),
+                        )
+                    })
+                    .collect();
+            if !shadows.is_empty() {
+                b["inputs"] = serde_json::Value::Object(shadows);
+            }
+            b
+        })
         .collect()
 }
 

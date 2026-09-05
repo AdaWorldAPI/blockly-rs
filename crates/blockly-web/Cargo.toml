@@ -20,6 +20,11 @@ blockly-shim = { path = "../blockly-shim" }
 blockly-run = { path = "../blockly-run" }
 
 askama = "0.12"
+# Required alongside askama: `ogar-render-askama` now declares `askama_axum`,
+# which turns on `askama/with-axum` graph-wide, and the derive then expands to
+# `::askama_axum` in EVERY crate that derives `Template` (see that crate's
+# Cargo.toml). Without this line the bin fails with E0433 on the derive.
+askama_axum = "0.4"
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

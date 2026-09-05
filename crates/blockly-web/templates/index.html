@@ -42,6 +42,8 @@
     <input id="budget" type="number" value="240" min="2" max="2000" step="20" style="width:6em">
   </label>
   <label title="What sensing_touchingobject answers"><input id="touching" type="checkbox"> touching</label>
+  <label title="The key held for the whole run — sensing_keypressed reads it">key
+    <select id="key"><option value="">none</option><option>space</option><option>up arrow</option><option>down arrow</option><option>left arrow</option><option>right arrow</option><option>any</option></select></label>
   <button id="loadPong" type="button" title="A built-in reference program, compiled into blockly-shim and cast in its tests">load Pong</button>
   <label>lane shape
     <select id="shape">
@@ -192,6 +194,7 @@ async function runProgram() {
     shape: document.getElementById("shape").value,
     rounds: document.getElementById("budget").value,
     touching: document.getElementById("touching").checked,
+    key: document.getElementById("key").value,
     mouse_y: "40",
   });
   const res = await fetch("/api/run?" + q, {

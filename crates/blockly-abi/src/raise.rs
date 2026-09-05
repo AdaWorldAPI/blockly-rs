@@ -44,6 +44,9 @@ pub enum RaiseError {
     StackUnderflow(u8),
     /// A body reference names a function the program does not contain.
     DanglingReference(u8),
+    /// A menu-bearing function carries an index outside the menu's static
+    /// prefix — a project-interned entry this raise has no table for.
+    UnknownOption(u8, u8),
 }
 
 impl core::fmt::Display for RaiseError {
@@ -53,6 +56,12 @@ impl core::fmt::Display for RaiseError {
             Self::Uncovered(b) => write!(f, "function {b:#04x} has no covered arity"),
             Self::StackUnderflow(b) => write!(f, "function {b:#04x} wanted absent operands"),
             Self::DanglingReference(i) => write!(f, "body reference {i} names no function"),
+            Self::UnknownOption(b, i) => {
+                write!(
+                    f,
+                    "function {b:#04x} carries option {i}, outside its static menu"
+                )
+            }
         }
     }
 }
@@ -176,6 +185,14 @@ pub fn raise_body(
             // The literal rides in the value byte AFTER any body refs.
             let n = call.values.get(refs).copied().unwrap_or(0);
             fields.push(("NUM".to_string(), FieldValue::Byte(n)));
+        }
+        // A dropdown rides in the same slot, as a codebook index. Decoded
+        // through the static prefix; a byte past it is a project's own entry
+        // (a sprite name the palette cannot know) and is refused, not guessed.
+        if let Some((field, menu)) = crate::menus::menu_for_block(ty) {
+            let b = call.values.get(refs).copied().unwrap_or(0);
+            let code = crate::menus::decode(menu, b).ok_or(RaiseError::UnknownOption(f.0, b))?;
+            fields.push((field.to_string(), FieldValue::Code(code.to_string())));
         }
 
         let record = BlockRecord {
@@ -333,6 +350,84 @@ mod tests {
             disabled: false,
         };
         round_trips(&forever, LaneShape::Pairs);
+    }
+
+    /// A dropdown round-trips as a codebook index — inline field AND shadow
+    /// block — and comes back as the harvested code, not a number.
+    #[test]
+    fn dropdowns_round_trip_as_codebook_indices() {
+        let leaf = |ty: &str, id: &str, field: &str, code: &str| crate::BlockRecord {
+            ty: ty.into(),
+            id: id.into(),
+            fields: vec![(field.into(), crate::FieldValue::Code(code.into()))],
+            inputs: vec![],
+            statements: vec![],
+            next: None,
+            extra_state: None,
+            disabled: false,
+        };
+        // when [up arrow] key pressed → if <key [space] pressed?> then go to front
+        let pressed = crate::BlockRecord {
+            ty: "sensing_keypressed".into(),
+            id: "kp".into(),
+            fields: vec![],
+            inputs: vec![(
+                "KEY_OPTION".into(),
+                leaf("sensing_keyoptions", "ko", "KEY_OPTION", "space"),
+            )],
+            statements: vec![],
+            next: None,
+            extra_state: None,
+            disabled: false,
+        };
+        let front = leaf("looks_gotofrontback", "fb", "FRONT_BACK", "back");
+        let cond = crate::BlockRecord {
+            ty: "control_if".into(),
+            id: "if".into(),
+            fields: vec![],
+            inputs: vec![("CONDITION".into(), pressed)],
+            statements: vec![("SUBSTACK".into(), front)],
+            next: None,
+            extra_state: None,
+            disabled: false,
+        };
+        let mut hat = leaf("event_whenkeypressed", "hat", "KEY_OPTION", "up arrow");
+        hat.next = Some(Box::new(cond));
+        round_trips(&hat, LaneShape::Pairs);
+
+        // And the raised tree carries the CODES, not bytes — the JSON a page
+        // renders must name the option the user chose.
+        let prog = crate::lower_program(LaneShape::Pairs, &hat).unwrap();
+        let raised = raise_program(&prog.functions).unwrap().unwrap();
+        assert_eq!(raised.ty, "event_whenkeypressed");
+        assert_eq!(
+            raised.field("KEY_OPTION"),
+            Some(&crate::FieldValue::Code("up arrow".into()))
+        );
+        let back = raised.next.as_ref().unwrap().statements[0]
+            .1
+            .field("FRONT_BACK");
+        assert_eq!(back, Some(&crate::FieldValue::Code("back".into())));
+        // The stored byte really is the codebook index, not a literal.
+        assert_eq!(
+            crate::raise_calls(&prog.functions[0])[0].values[0],
+            2,
+            "up arrow = index 2"
+        );
+
+        // An index past the static prefix is refused, not invented.
+        let body = ogar_loco::FunctionBody::from_calls(
+            LaneShape::Pairs,
+            &[ogar_loco::Call::with_values(
+                FnIndex(crate::scratch::device("event_whenkeypressed").unwrap().0),
+                [200, 0, 0],
+            )],
+        )
+        .unwrap();
+        assert!(matches!(
+            raise_body(&[body], 0),
+            Err(RaiseError::UnknownOption(_, 200))
+        ));
     }
 
     /// The raise refuses rather than inventing a block.

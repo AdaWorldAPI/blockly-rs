@@ -103,6 +103,11 @@ pub struct Stage {
     pub timer: f32,
     /// Whether `sensing_touchingobject` should answer true.
     pub touching: bool,
+    /// The key currently held, as a `KEY_OPTION` codebook index
+    /// (`blockly_abi::menus::encode`), or `None` for no key. `sensing_keypressed`
+    /// compares its operand — the index a `sensing_keyoptions` reporter pushed
+    /// — against this; the `any` option matches any held key.
+    pub key: Option<u8>,
     /// Stage half-width — the edge `if on edge, bounce` reflects against.
     pub half_w: f32,
     /// Stage half-height.
@@ -119,6 +124,7 @@ impl Default for Stage {
             mouse_y: 0.0,
             timer: 0.0,
             touching: false,
+            key: None,
             half_w: 240.0,
             half_h: 180.0,
         }
@@ -403,8 +409,29 @@ impl<'a> Machine<'a> {
         let Some((name, ..)) = scratch::device_by_byte(f.0) else {
             return Err(RunError::Unimplemented(f.0));
         };
+        // A menu shadow block is a value: it yields its own codebook index,
+        // which the consuming block pops as an operand (OGAR #295 — a menu is
+        // one function plus a table, and the table's index is the value).
+        if blockly_abi::menus::is_menu_block(name) {
+            return Ok(Some(imm));
+        }
         match name {
-            "event_whenflagclicked" | "event_whenthisspriteclicked" => Ok(None),
+            "event_whenflagclicked" | "event_whenthisspriteclicked" | "event_whenkeypressed" => {
+                Ok(None)
+            }
+            "sensing_keypressed" => {
+                // The operand is the KEY_OPTION index the menu reporter
+                // pushed; `any` is the harvested option 6.
+                let want = a(0) as u8;
+                let any = blockly_abi::menus::menu_by_id(1)
+                    .and_then(|m| blockly_abi::menus::encode(m, "any"))
+                    .unwrap_or(0);
+                let held = s.key.is_some_and(|k| k == want || want == any);
+                Ok(Some(f32::from(held)))
+            }
+            // Front/back layering has no visual model here; a real op with
+            // no effect on this stage, not an unimplemented one.
+            "looks_gotofrontback" | "looks_goforwardbackwardlayers" => Ok(None),
             "motion_movesteps" => {
                 let r = s.sprites[me].direction.to_radians();
                 s.sprites[me].x += a(0) * r.sin();
@@ -683,6 +710,110 @@ mod tests {
         let mut m2 = Machine::new(&idle.functions, 1000);
         m2.run().expect("runs");
         assert_eq!(m2.stage.sprites[0].x, 0.0);
+    }
+
+    /// A keyboard paddle: the key arrives as a CODEBOOK INDEX through a menu
+    /// reporter, and the run reads it — can-fire, can-stay-silent, and the
+    /// `any` option, on the same program.
+    #[test]
+    fn a_key_option_menu_drives_the_sprite_through_its_codebook_index() {
+        use blockly_abi::menus;
+        let code = |ty: &str, field: &str, c: &str| {
+            rec(
+                ty,
+                vec![(field.into(), FieldValue::Code(c.into()))],
+                vec![],
+                vec![],
+                None,
+            )
+        };
+        // if <key [up arrow] pressed?> then change y by 10
+        let prog = lower_program(
+            LaneShape::Pairs,
+            &rec(
+                "control_if",
+                vec![],
+                vec![(
+                    "CONDITION".into(),
+                    rec(
+                        "sensing_keypressed",
+                        vec![],
+                        vec![(
+                            "KEY_OPTION".into(),
+                            code("sensing_keyoptions", "KEY_OPTION", "up arrow"),
+                        )],
+                        vec![],
+                        None,
+                    ),
+                )],
+                vec![(
+                    "SUBSTACK".into(),
+                    rec(
+                        "motion_changeyby",
+                        vec![],
+                        vec![("DY".into(), num(10))],
+                        vec![],
+                        None,
+                    ),
+                )],
+                None,
+            ),
+        )
+        .expect("a menu shadow block casts");
+        let keys = menus::menu_by_id(1).unwrap();
+        let up = menus::encode(keys, "up arrow").unwrap();
+        let down = menus::encode(keys, "down arrow").unwrap();
+
+        let run_with = |key: Option<u8>| {
+            let mut m = Machine::new(&prog.functions, 1000);
+            m.stage.key = key;
+            m.run().expect("runs");
+            m.stage.sprites[0].y
+        };
+        assert_eq!(run_with(Some(up)), 10.0, "held key matches: moves");
+        assert_eq!(run_with(None), 0.0, "no key: stays");
+        assert_eq!(run_with(Some(down)), 0.0, "a different key: stays");
+
+        // `any` matches whatever is held — and only when something is.
+        let any_prog = lower_program(
+            LaneShape::Pairs,
+            &rec(
+                "control_if",
+                vec![],
+                vec![(
+                    "CONDITION".into(),
+                    rec(
+                        "sensing_keypressed",
+                        vec![],
+                        vec![(
+                            "KEY_OPTION".into(),
+                            code("sensing_keyoptions", "KEY_OPTION", "any"),
+                        )],
+                        vec![],
+                        None,
+                    ),
+                )],
+                vec![(
+                    "SUBSTACK".into(),
+                    rec(
+                        "motion_changeyby",
+                        vec![],
+                        vec![("DY".into(), num(10))],
+                        vec![],
+                        None,
+                    ),
+                )],
+                None,
+            ),
+        )
+        .unwrap();
+        let mut m = Machine::new(&any_prog.functions, 1000);
+        m.stage.key = Some(down);
+        m.run().unwrap();
+        assert_eq!(m.stage.sprites[0].y, 10.0);
+        let mut m = Machine::new(&any_prog.functions, 1000);
+        m.run().unwrap();
+        assert_eq!(m.stage.sprites[0].y, 0.0);
     }
 
     /// `forever` terminates on the budget, and the budget bounds the RUN only.
