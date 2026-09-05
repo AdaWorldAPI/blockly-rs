@@ -205,8 +205,14 @@ pub fn raise_body_in(
         // (a sprite name the palette cannot know) and is refused, not guessed.
         if let Some((field, menu)) = crate::menus::menu_for_block(ty) {
             let b = call.values.get(refs).copied().unwrap_or(0);
-            let code =
-                crate::menus::decode_in(basin, menu, b).ok_or(RaiseError::UnknownOption(f.0, b))?;
+            // `0` is the empty selection (an unset menu, or a template's
+            // unnamed variable), not an unknown option: it raises as `""`,
+            // which the cast encodes back to `0`.
+            let code = if b == 0 {
+                String::new()
+            } else {
+                crate::menus::decode_in(basin, menu, b).ok_or(RaiseError::UnknownOption(f.0, b))?
+            };
             fields.push((field.to_string(), FieldValue::Code(code)));
         }
 

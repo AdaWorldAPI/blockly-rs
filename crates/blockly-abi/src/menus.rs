@@ -287,6 +287,15 @@ pub const SCRATCH_MENUS: &[Menu] = &[
         name: "LIST",
         options: &[],
     },
+    // `sensing_of`'s PROPERTY: the sprite/stage attributes plus the target's
+    // variables. scratch-blocks builds this list at runtime (GUI side), so
+    // it is registered empty here; a project interns the attribute names it
+    // uses — observed in real project files, never copied from AGPL code.
+    Menu {
+        id: 27,
+        name: "OF_PROPERTY",
+        options: &[],
+    },
 ];
 
 /// Blocks carrying an INLINE dropdown: `(block type, field name, menu id)`.
@@ -329,6 +338,13 @@ pub const MENU_FIELDS: &[(&str, &str, u8)] = &[
     ("data_listcontainsitem", "LIST", 26),
     ("data_showlist", "LIST", 26),
     ("data_hidelist", "LIST", 26),
+    // Three inline dropdowns whose option sets are the PROJECT's, found by
+    // measuring cast coverage on real projects (`sb3_coverage`): a
+    // `field_variable` of broadcast type, the backdrop list, and
+    // `sensing_of`'s attribute list.
+    ("event_whenbroadcastreceived", "BROADCAST_OPTION", 23),
+    ("event_whenbackdropswitchesto", "BACKDROP", 21),
+    ("sensing_of", "PROPERTY", 27),
 ];
 
 /// Menu SHADOW blocks — a dropdown that arrives as a nested reporter:
@@ -429,6 +445,12 @@ fn entry_code(entry: &ogar_loco::pool::Constant) -> Option<String> {
 /// after the static prefix (a sprite name) resolves to its table index.
 #[must_use]
 pub fn encode_in(basin: &BasinCodebooks, menu: &Menu, code: &str) -> Option<u8> {
+    // An EMPTY selection is the zero-fallback, by construction: Scratch
+    // saves an unset costume / sound menu as `""`, and `0` means "no option"
+    // on every codebook. The raise gives `""` back for a `0`.
+    if code.is_empty() {
+        return Some(0);
+    }
     if let Some(i) = encode(menu, code) {
         return Some(i);
     }
@@ -753,6 +775,11 @@ mod tests {
         // entry, and a short prefix of the long name does not either.
         assert_eq!(encode_in(&wide, goto, "Pseudorandom Cycles"), None);
         assert_eq!(encode_in(&wide, goto, "Pseudorandom"), None);
+        // The empty selection is index 0 on ANY menu, static or dynamic, and
+        // is never a real entry: decoding 0 yields no option.
+        assert_eq!(encode_in(&wide, goto, ""), Some(0));
+        assert_eq!(encode_in(static_basin(), keys, ""), Some(0));
+        assert_eq!(decode_in(&wide, goto, 0), None);
     }
 
     #[test]
