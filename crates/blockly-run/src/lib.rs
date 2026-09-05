@@ -205,6 +205,9 @@ pub enum RunError {
     /// A pool load names a constant the run's pool does not hold — or the run
     /// was given no pool. Refused rather than read as the bare index.
     MissingConstant(u8),
+    /// A `text` literal names a TEXT register entry the run's basin does not
+    /// hold — or the run was given no basin. Refused rather than read as 0.
+    UnknownText(u8),
 }
 
 impl core::fmt::Display for RunError {
@@ -216,6 +219,7 @@ impl core::fmt::Display for RunError {
             Self::Unimplemented(b) => write!(f, "function {b:#04x} is not implemented"),
             Self::UnknownProcedure(i) => write!(f, "no definition carries procedure {i}"),
             Self::MissingConstant(i) => write!(f, "constant {i} is not in the pool"),
+            Self::UnknownText(i) => write!(f, "text {i} is not in the TEXT register"),
         }
     }
 }
@@ -502,6 +506,8 @@ pub struct Machine<'a> {
     /// The constant pool `POOL_LOAD` reads. `None` = every load is refused,
     /// which is what a program with no wide literal never notices.
     pool: Option<&'a ogar_loco::ConstantPool>,
+    /// The basin `text` literals (and any project dropdown) are read from.
+    basin: Option<&'a ogar_loco::basin::BasinCodebooks>,
     /// Argument frames of the custom blocks currently executing, innermost
     /// last. `PROC_ARG` reads the innermost; outside any call it reads `0`.
     frames: Vec<Vec<f32>>,
@@ -547,6 +553,7 @@ impl<'a> Machine<'a> {
             functions,
             procs: &[],
             pool: None,
+            basin: None,
             frames: Vec::new(),
             budget,
             trace: Vec::new(),
@@ -567,6 +574,14 @@ impl<'a> Machine<'a> {
     #[must_use]
     pub fn with_pool(mut self, pool: &'a ogar_loco::ConstantPool) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Read `text` literals from this basin's TEXT register — the basin the
+    /// program was cast against.
+    #[must_use]
+    pub fn with_basin(mut self, basin: &'a ogar_loco::basin::BasinCodebooks) -> Self {
+        self.basin = Some(basin);
         self
     }
 
@@ -737,34 +752,46 @@ impl<'a> Machine<'a> {
             .and_then(|fr| fr.get(imm as usize))
             .copied()
             .unwrap_or(0.0);
-        // A pool load: the constant's classid says how its bytes read. An
-        // `f64` is the number; UTF-8 reads as Scratch reads text in a numeric
-        // slot — its numeric value if it has one, else 0. The stack is f32,
-        // so a text constant's identity is not carried past this point.
+        // A pool load: the pool holds numbers only, so the load IS the f64.
         if f == blockly_abi::POOL_LOAD {
             let idx = imm as u8;
             let c = self
                 .pool
                 .and_then(|p| p.resolve(idx))
+                .filter(|c| c.classid == ogar_loco::pool::placeholder::CONST_F64)
                 .ok_or(RunError::MissingConstant(idx))?;
-            let v = match c.classid {
-                ogar_loco::pool::placeholder::CONST_F64 => {
-                    let mut le = [0u8; 8];
-                    le.copy_from_slice(&c.bytes[..8]);
-                    f64::from_le_bytes(le) as f32
-                }
-                ogar_loco::pool::placeholder::CONST_UTF8_INLINE => {
-                    let end = c
-                        .bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(c.bytes.len());
-                    core::str::from_utf8(&c.bytes[..end])
-                        .ok()
-                        .and_then(|s| s.trim().parse::<f32>().ok())
-                        .unwrap_or(0.0)
-                }
-                _ => return Err(RunError::MissingConstant(idx)),
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&c.bytes[..8]);
+            return Ok(Some(f64::from_le_bytes(le) as f32));
+        }
+        // A `text` literal: its immediate indexes the basin's TEXT register.
+        // Read as Scratch reads text in a numeric slot — its numeric value
+        // if it has one, else 0; index 0 is the empty string. A digest
+        // entry (a text wider than a facet) has no bytes to parse and reads
+        // 0. The stack is f32, so the text's identity stops here; the
+        // register keeps it.
+        if f == FnIndex::TEXT {
+            let idx = imm as u8;
+            if idx == 0 {
+                return Ok(Some(0.0));
+            }
+            let entry = self
+                .basin
+                .and_then(|b| b.get(blockly_abi::menus::TEXT_MENU))
+                .and_then(|book| book.resolve(idx))
+                .ok_or(RunError::UnknownText(idx))?;
+            let v = if entry.classid == ogar_loco::pool::placeholder::CONST_UTF8_INLINE {
+                let end = entry
+                    .bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(entry.bytes.len());
+                core::str::from_utf8(&entry.bytes[..end])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .unwrap_or(0.0)
+            } else {
+                0.0
             };
             return Ok(Some(v));
         }
@@ -972,6 +999,8 @@ pub struct Scene<'a> {
     /// the unit is the sprite: cast all of a sprite's scripts against one
     /// `LoweringContext` and hand its pool here.
     pool: Option<&'a ogar_loco::ConstantPool>,
+    /// The basin every script's `text` literals are read from.
+    basin: Option<&'a ogar_loco::basin::BasinCodebooks>,
     /// The baked participation masks — see [`Wake`].
     wake: WakeTable,
     /// Scratch space for the round's awake mask, reused every round.
@@ -1007,6 +1036,7 @@ impl<'a> Scene<'a> {
             scripts: scheduled,
             procs,
             pool: None,
+            basin: None,
             awake: Vec::with_capacity(wake.words),
             wake,
             trace: Vec::new(),
@@ -1019,6 +1049,13 @@ impl<'a> Scene<'a> {
     #[must_use]
     pub fn with_pool(mut self, pool: &'a ogar_loco::ConstantPool) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Read `text` literals from this basin's TEXT register in every script.
+    #[must_use]
+    pub fn with_basin(mut self, basin: &'a ogar_loco::basin::BasinCodebooks) -> Self {
+        self.basin = Some(basin);
         self
     }
 
@@ -1081,6 +1118,9 @@ impl<'a> Scene<'a> {
                 let mut m = Machine::resuming(script, slice, stage, i).with_procs(procs);
                 if let Some(pool) = self.pool {
                     m = m.with_pool(pool);
+                }
+                if let Some(basin) = self.basin {
+                    m = m.with_basin(basin);
                 }
                 let outcome = m.run();
                 self.stage = m.stage;
@@ -1781,5 +1821,51 @@ mod tests {
         scene.run(3, 100).unwrap();
         assert_eq!(scene.stage.sprites[1].x, 4.0);
         assert_eq!(scene.stage.sprites[2].x, 0.0);
+    }
+
+    /// A `text` literal is read from the TEXT REGISTER, not from any pool:
+    /// `set x to "12.5"` lands at 12.5; a word reads 0 as Scratch reads it;
+    /// without the basin the run refuses rather than reading the index.
+    #[test]
+    fn a_text_literal_is_read_from_the_register_and_refused_without_it() {
+        use blockly_abi::menus;
+        use ogar_loco::basin::BasinCodebooks;
+        let utf8 = ogar_loco::pool::placeholder::CONST_UTF8_INLINE;
+        let mut basin = BasinCodebooks::new();
+        let m = menus::menu_by_id(menus::TEXT_MENU).unwrap();
+        let mut b = menus::builder(m, utf8, menus::PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        b.intern(utf8, b"12.5").unwrap();
+        b.intern(utf8, b"hello").unwrap();
+        basin.plug(b.seal()).unwrap();
+        let text = |t: &str| {
+            rec(
+                "text",
+                vec![("TEXT".into(), FieldValue::Wide(t.into()))],
+                vec![],
+                vec![],
+                None,
+            )
+        };
+        let setx = |v: BlockRecord| rec("motion_setx", vec![], vec![("X".into(), v)], vec![], None);
+        let numeric =
+            blockly_abi::lower_program_in(LaneShape::Pairs, &setx(text("12.5")), &basin).unwrap();
+        let word =
+            blockly_abi::lower_program_in(LaneShape::Pairs, &setx(text("hello")), &basin).unwrap();
+        let idx = blockly_abi::raise_calls(numeric.entry())[0].values[0];
+        assert_ne!(idx, 0);
+
+        let mut m1 = Machine::new(&numeric.functions, 100).with_basin(&basin);
+        m1.run().unwrap();
+        assert_eq!(m1.stage.me().x, 12.5);
+        assert_ne!(
+            m1.stage.me().x,
+            f32::from(idx),
+            "the index is not the value"
+        );
+        let mut m2 = Machine::new(&word.functions, 100).with_basin(&basin);
+        m2.run().unwrap();
+        assert_eq!(m2.stage.me().x, 0.0);
+        let mut bare = Machine::new(&numeric.functions, 100);
+        assert_eq!(bare.run(), Err(RunError::UnknownText(idx)));
     }
 }

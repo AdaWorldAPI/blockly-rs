@@ -813,6 +813,16 @@ pub fn target_basin(project: &Sb3Project, target: &Sb3Target) -> BasinCodebooks 
             // further change needed. Definition order, this target only
             // (a custom block is not shared across sprites).
             "PROCEDURE" => target.proccodes.clone(),
+            // Every `text` literal in this target's scripts, first seen
+            // first — the register a string lives in. Wide ones intern as
+            // digests below, like a long sprite name.
+            "TEXT" => {
+                let mut v: Vec<String> = Vec::new();
+                for s in &target.scripts {
+                    collect_text_literals(s, &mut v);
+                }
+                v
+            }
             _ => Vec::new(),
         };
         for name in &names {
@@ -831,6 +841,27 @@ pub fn target_basin(project: &Sb3Project, target: &Sb3Target) -> BasinCodebooks 
         let _ = basin.plug(b.seal());
     }
     basin
+}
+
+/// Every distinct non-empty `text` literal under `block`, in first-seen
+/// order (the empty string is index 0 of every menu already).
+fn collect_text_literals(block: &BlockRecord, out: &mut Vec<String>) {
+    if block.ty == "text"
+        && let Some(FieldValue::Wide(t) | FieldValue::Code(t)) = block.field("TEXT")
+        && !t.is_empty()
+        && !out.contains(t)
+    {
+        out.push(t.clone());
+    }
+    for (_, b) in &block.inputs {
+        collect_text_literals(b, out);
+    }
+    for (_, b) in &block.statements {
+        collect_text_literals(b, out);
+    }
+    if let Some(n) = &block.next {
+        collect_text_literals(n, out);
+    }
 }
 
 /// The fixed attribute names a `sensing_of` PROPERTY dropdown offers before

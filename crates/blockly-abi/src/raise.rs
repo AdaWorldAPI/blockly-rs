@@ -94,6 +94,8 @@ pub fn block_for(f: FnIndex) -> Option<(&'static str, Option<&'static str>)> {
     // Literals and the few shapes Scratch reaches through a Blockly block.
     match f {
         FnIndex::NUMBER => Some(("math_number", None)),
+        // Its immediate is a TEXT register index, decoded like any dropdown.
+        FnIndex::TEXT => Some(("text", None)),
         _ => None,
     }
 }
@@ -182,37 +184,24 @@ pub fn raise_body_pooled(
     for (ci, call) in crate::raise_calls(body).iter().enumerate() {
         let f = call.function;
 
-        // A pool load is the literal it stands for. The constant's classid —
-        // not anything in the call — decides which block: an `f64` is a
-        // `math_number`, UTF-8 is a `text`. Any other classid is refused
-        // (this crate mints neither, so it cannot name the block).
+        // A pool load is the NUMBER it stands for — the pool holds numbers
+        // only (strings are register entries, raised through the TEXT menu
+        // like any dropdown), so any other classid is refused.
         if f == crate::POOL_LOAD {
             let idx = call.values.first().copied().unwrap_or(0);
             let c = pool
                 .and_then(|p| p.resolve(idx))
                 .ok_or(RaiseError::MissingConstant(idx))?;
-            let (ty, field, text) = match c.classid {
-                ogar_loco::pool::placeholder::CONST_F64 => {
-                    let mut le = [0u8; 8];
-                    le.copy_from_slice(&c.bytes[..8]);
-                    ("math_number", "NUM", f64::from_le_bytes(le).to_string())
-                }
-                ogar_loco::pool::placeholder::CONST_UTF8_INLINE => {
-                    let end = c
-                        .bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(c.bytes.len());
-                    let s = core::str::from_utf8(&c.bytes[..end])
-                        .map_err(|_| RaiseError::MissingConstant(idx))?;
-                    ("text", "TEXT", s.to_string())
-                }
-                _ => return Err(RaiseError::MissingConstant(idx)),
-            };
+            if c.classid != ogar_loco::pool::placeholder::CONST_F64 {
+                return Err(RaiseError::MissingConstant(idx));
+            }
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&c.bytes[..8]);
+            let text = f64::from_le_bytes(le).to_string();
             stack.push(BlockRecord {
-                ty: ty.to_string(),
+                ty: "math_number".to_string(),
                 id: format!("r{index}_{ci}"),
-                fields: vec![(field.to_string(), FieldValue::Wide(text))],
+                fields: vec![("NUM".to_string(), FieldValue::Wide(text))],
                 inputs: Vec::new(),
                 statements: Vec::new(),
                 next: None,
@@ -698,14 +687,25 @@ mod tests {
                 "MESSAGE",
                 BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide("hello".into())),
             ));
-        let basin = crate::menus::static_basin();
+        // The number goes to the pool; the string is a TEXT REGISTER entry.
+        let mut basin = ogar_loco::basin::BasinCodebooks::new();
+        let m = crate::menus::menu_by_id(crate::menus::TEXT_MENU).unwrap();
+        let utf8 = ogar_loco::pool::placeholder::CONST_UTF8_INLINE;
+        let mut b =
+            crate::menus::builder(m, utf8, crate::menus::PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        b.intern(utf8, b"hello").unwrap();
+        basin.plug(b.seal()).unwrap();
+        let basin = &basin;
         let mut ctx = LoweringContext::placeholder();
         let prog = lower_program_with_pool(LaneShape::Pairs, &script, basin, &mut ctx).unwrap();
-        assert_eq!(ctx.pool.len(), 2);
-        // The literal blocks became pool loads — never NUMBER/TEXT carrying an index.
+        assert_eq!(ctx.pool.len(), 1, "numbers only in the pool");
         let calls = crate::raise_calls(prog.entry());
         assert_eq!(calls[0].function, crate::POOL_LOAD);
-        assert_eq!(calls[2].function, crate::POOL_LOAD);
+        assert_eq!(
+            calls[2].function,
+            ogar_loco::FnIndex::TEXT,
+            "text is a register index, not a load"
+        );
         assert!(
             calls
                 .iter()
@@ -721,13 +721,14 @@ mod tests {
         let raised = raise_program_pooled(&prog.functions, basin, &ctx.pool)
             .unwrap()
             .unwrap();
-        // The literal text is back, as the wide field it was.
+        // The number is back as the wide field it was; the text is back by
+        // name from the register.
         let n = &raised.inputs[0].1;
         assert_eq!(n.ty, "math_number");
         assert_eq!(n.field("NUM"), Some(&FieldValue::Wide("1000000".into())));
         let t = &raised.next.as_ref().unwrap().inputs[0].1;
         assert_eq!(t.ty, "text");
-        assert_eq!(t.field("TEXT"), Some(&FieldValue::Wide("hello".into())));
+        assert_eq!(t.field("TEXT"), Some(&FieldValue::Code("hello".into())));
 
         // …and re-lowering reproduces the SAME bytes and the SAME pool.
         let mut again = LoweringContext::placeholder();

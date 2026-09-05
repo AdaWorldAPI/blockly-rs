@@ -304,7 +304,21 @@ pub const SCRATCH_MENUS: &[Menu] = &[
         name: "PROCEDURE",
         options: &[],
     },
+    // Text literals. A string lives in exactly ONE place in this stack: a
+    // codebook register. A `text` block's field is therefore an entry in
+    // the project's TEXT codebook, indexed like any dropdown — never a byte
+    // string in a body, never a UTF-8 constant beside one. The constant
+    // pool carries numbers only. Names wider than a facet intern as
+    // digests, the same posture as a long sprite name.
+    Menu {
+        id: TEXT_MENU,
+        name: "TEXT",
+        options: &[],
+    },
 ];
+
+/// The id of the `TEXT` literal codebook (menu 29).
+pub const TEXT_MENU: u8 = 29;
 
 /// Blocks carrying an INLINE dropdown: `(block type, field name, menu id)`.
 ///
@@ -359,6 +373,8 @@ pub const MENU_FIELDS: &[(&str, &str, u8)] = &[
     // second field, `ARGC`, is a plain byte, not a menu.
     ("procedures_definition", "PROCCODE", 28),
     ("procedures_call", "PROCCODE", 28),
+    // The literal `text` block: its field is a TEXT register entry.
+    ("text", "TEXT", TEXT_MENU),
 ];
 
 /// Menu SHADOW blocks — a dropdown that arrives as a nested reporter:
