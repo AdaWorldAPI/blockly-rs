@@ -43,8 +43,9 @@
   </label>
   <label title="What sensing_touchingobject answers"><input id="touching" type="checkbox"> touching</label>
   <label title="The key held for the whole run — sensing_keypressed reads it">key
-    <select id="key"><option value="">none</option><option>space</option><option>up arrow</option><option>down arrow</option><option>left arrow</option><option>right arrow</option><option>any</option></select></label>
+    <select id="key"><option value="">sweep ↑/↓</option><option>space</option><option>up arrow</option><option>down arrow</option><option>left arrow</option><option>right arrow</option><option>any</option></select></label>
   <button id="loadPong" type="button" title="A built-in reference program, compiled into blockly-shim and cast in its tests">load Pong</button>
+  <button id="loadPongKeys" type="button" title="Pong with a keyboard paddle — the keys are KEY_OPTION codebook indices, not opcodes">load Pong (keys)</button>
   <label>lane shape
     <select id="shape">
       <option value="pairs" selected>Pairs — 6×(fn:val), 180 calls</option>
@@ -207,13 +208,15 @@ async function runProgram() {
   el.innerHTML = await res.text();
 }
 document.getElementById("run").addEventListener("click", runProgram);
-document.getElementById("loadPong").addEventListener("click", async () => {
+async function loadTemplate(name) {
   const sel = document.getElementById("dialect");
   if (sel.value !== "scratch") { sel.value = "scratch"; await boot(); }
-  const ws = await (await fetch("/api/template?name=pong")).json();
+  const ws = await (await fetch("/api/template?name=" + name)).json();
   Blockly.serialization.workspaces.load(ws, workspace);
   recast();
-});
+}
+document.getElementById("loadPong").addEventListener("click", () => loadTemplate("pong"));
+document.getElementById("loadPongKeys").addEventListener("click", () => loadTemplate("pong-keys"));
 boot();
 </script>
 </body>

@@ -294,10 +294,16 @@ async fn api_run(Query(q): Query<RunQuery>, body: String) -> Html<String> {
     let mut scene = blockly_run::Scene::new(blockly_run::Stage::pong(), bodies)
         .with_mouse_sweep(q.mouse_y.unwrap_or(120.0));
     scene.stage.touching = q.touching.unwrap_or(false);
-    scene.stage.key = q
-        .key
-        .as_deref()
-        .and_then(|k| blockly_abi::menus::encode(blockly_abi::menus::menu_by_id(1)?, k));
+    // A held key when the page names one; otherwise a simulated up/down
+    // alternation, so a keyboard paddle has something to react to — the same
+    // "an input must be supplied" rule as the mouse sweep.
+    match q.key.as_deref().filter(|k| !k.is_empty()) {
+        Some(k) => {
+            scene.stage.key =
+                blockly_abi::menus::encode(blockly_abi::menus::menu_by_id(1).expect("menu 1"), k);
+        }
+        None => scene = scene.with_key_sweep(30),
+    }
 
     // A refusal is INFORMATION: the scene still renders what it reached, and
     // the note names the operation that stopped it.

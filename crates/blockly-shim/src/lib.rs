@@ -528,7 +528,21 @@ pub mod templates {
     /// The JSON is the AUTHORING form, kept so a template stays readable and
     /// diffable in review. The artefact the demo serves is
     /// [`PONG_NODES`] — see [`raise_nodes`].
-    pub const ALL: &[(&str, &str)] = &[("pong", PONG)];
+    pub const ALL: &[(&str, &str)] = &[("pong", PONG), ("pong-keys", PONG_KEYS)];
+
+    /// **Pong, keyboard edition** — the same ball and score scripts, but the
+    /// paddle reads the keyboard: `forever { if <key [up arrow] pressed?>
+    /// change y by 6; if <key [down arrow] pressed?> change y by (0 - 6) }`.
+    ///
+    /// The keys arrive as `sensing_keyoptions` menu shadows — codebook
+    /// indices into `KEY_OPTION`, not opcodes (OGAR #295 via
+    /// `blockly_abi::menus`). `0 - 6` because a template literal is one
+    /// immediate byte; a negative number would need the constant pool, and
+    /// the subtraction says the same thing in shared-core bytes.
+    pub const PONG_KEYS: &str = include_str!("../templates/pong-keys.json");
+
+    /// Pong (keyboard edition) as its stored nodes.
+    pub const PONG_KEYS_NODES: &[u8] = include_bytes!("../templates/pong-keys.nodes");
 
     /// Pong as its STORED NODES — the program, not the projection.
     ///
@@ -542,7 +556,7 @@ pub mod templates {
     pub const PONG_NODES: &[u8] = include_bytes!("../templates/pong.nodes");
 
     /// Every built-in template in stored-node form.
-    pub const ALL_NODES: &[(&str, &[u8])] = &[("pong", PONG_NODES)];
+    pub const ALL_NODES: &[(&str, &[u8])] = &[("pong", PONG_NODES), ("pong-keys", PONG_KEYS_NODES)];
 
     /// Raise stored nodes back into top-level scripts.
     ///
@@ -839,26 +853,32 @@ mod baked_nodes {
     /// silently diverge from the form a human reviews.
     #[test]
     fn the_baked_nodes_reproduce_the_authoring_json_byte_for_byte() {
-        let from_json = super::from_workspace_json(templates::PONG).unwrap();
-        let from_nodes = templates::raise_nodes(templates::PONG_NODES).expect("raises");
+        // Every template, not just the first: a second template whose bake
+        // was forgotten would otherwise pass here.
+        assert_eq!(templates::ALL.len(), templates::ALL_NODES.len());
+        for ((name, json), (nname, nodes)) in templates::ALL.iter().zip(templates::ALL_NODES) {
+            assert_eq!(name, nname, "ALL and ALL_NODES are out of order");
+            let from_json = super::from_workspace_json(json).unwrap();
+            let from_nodes = templates::raise_nodes(nodes).expect("raises");
 
-        assert_eq!(
-            from_json.len(),
-            from_nodes.len(),
-            "script count differs between the JSON and the baked nodes"
-        );
+            assert_eq!(
+                from_json.len(),
+                from_nodes.len(),
+                "{name}: script count differs between the JSON and the baked nodes"
+            );
 
-        for (i, (j, n)) in from_json.iter().zip(from_nodes.iter()).enumerate() {
-            let a = lower_program(LaneShape::Pairs, j).expect("json casts");
-            let b = lower_program(LaneShape::Pairs, n).expect("raised casts");
-            assert_eq!(a.functions.len(), b.functions.len(), "script {i}");
-            for (f, (x, y)) in a.functions.iter().zip(b.functions.iter()).enumerate() {
-                assert_eq!(
-                    x.as_body_bytes(),
-                    y.as_body_bytes(),
-                    "script {i} function {f}: the bake and the JSON disagree — \
-                     re-run `cargo run -p blockly-shim --example bake_template`"
-                );
+            for (i, (j, n)) in from_json.iter().zip(from_nodes.iter()).enumerate() {
+                let a = lower_program(LaneShape::Pairs, j).expect("json casts");
+                let b = lower_program(LaneShape::Pairs, n).expect("raised casts");
+                assert_eq!(a.functions.len(), b.functions.len(), "{name} script {i}");
+                for (f, (x, y)) in a.functions.iter().zip(b.functions.iter()).enumerate() {
+                    assert_eq!(
+                        x.as_body_bytes(),
+                        y.as_body_bytes(),
+                        "{name} script {i} function {f}: the bake and the JSON disagree — \
+                         re-run `cargo run -p blockly-shim --example bake_template`"
+                    );
+                }
             }
         }
     }
@@ -1133,5 +1153,69 @@ mod pong_scene {
             paddle_distinct > 5,
             "the paddle barely moves: {paddle_distinct} distinct positions"
         );
+    }
+
+    /// Pong (keyboard edition): the paddle is driven by KEY_OPTION codebook
+    /// indices — it climbs while `up arrow` is held, descends under `down
+    /// arrow`, and does NOT move when no key is held. The menu shadow blocks
+    /// in the stored nodes are what make this program expressible at all.
+    #[test]
+    fn pong_keys_paddle_follows_the_held_key_and_rests_without_one() {
+        let scripts = templates::raise_nodes(templates::PONG_KEYS_NODES).expect("raises");
+        let progs: Vec<_> = scripts
+            .iter()
+            .map(|s| lower_program(LaneShape::Pairs, s).expect("casts"))
+            .collect();
+        let bodies = || -> Vec<&[ogar_loco::FunctionBody]> {
+            progs.iter().map(|p| p.functions.as_slice()).collect()
+        };
+        // The paddle script really carries the menus: two keyoptions reporters.
+        let key_byte = blockly_abi::scratch::device("sensing_keyoptions")
+            .unwrap()
+            .0;
+        let menus_in_paddle = progs[1]
+            .functions
+            .iter()
+            .flat_map(|f| blockly_abi::raise_calls(f))
+            .filter(|c| c.function.0 == key_byte)
+            .count();
+        assert_eq!(menus_in_paddle, 2, "up and down keyoptions");
+
+        // Under the sweep the paddle goes BOTH ways.
+        let mut scene = Scene::new(Stage::pong(), bodies()).with_key_sweep(20);
+        scene.run(120, 40).expect("runs");
+        let ys: Vec<f32> = scene.trace().iter().map(|s| s.sprites[1].y).collect();
+        // Judged frame to frame, not by the extremes: the sweep is symmetric,
+        // so a paddle that climbs for 20 rounds and descends for 20 returns
+        // to where it started, and "min < 0" would have called that frozen.
+        let rises = ys.windows(2).filter(|w| w[1] > w[0]).count();
+        let falls = ys.windows(2).filter(|w| w[1] < w[0]).count();
+        assert!(rises > 10, "paddle never climbed: {ys:?}");
+        assert!(falls > 10, "paddle never descended: {ys:?}");
+        let max = ys.iter().copied().fold(f32::MIN, f32::max);
+        assert!(max > 30.0, "paddle barely climbed: max {max}");
+
+        // Held `down arrow` only: monotone descent, never up.
+        let down =
+            blockly_abi::menus::encode(blockly_abi::menus::menu_by_id(1).unwrap(), "down arrow");
+        let mut held = Scene::new(Stage::pong(), bodies());
+        held.stage.key = down;
+        held.run(30, 40).expect("runs");
+        let hy: Vec<f32> = held.trace().iter().map(|s| s.sprites[1].y).collect();
+        assert!(
+            hy.windows(2).all(|w| w[1] <= w[0]),
+            "went up under down arrow: {hy:?}"
+        );
+        assert!(hy.last().unwrap() < &-10.0);
+
+        // Silence half: no key, the paddle rests at 0 while the ball still moves.
+        let mut idle = Scene::new(Stage::pong(), bodies());
+        idle.run(60, 40).expect("runs");
+        assert!(
+            idle.trace().iter().all(|s| s.sprites[1].y == 0.0),
+            "paddle moved with no key"
+        );
+        let bx: Vec<i32> = idle.trace().iter().map(|s| s.sprites[0].x as i32).collect();
+        assert!(bx.iter().any(|x| *x != bx[0]), "the ball froze too");
     }
 }
