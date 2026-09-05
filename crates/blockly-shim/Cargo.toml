@@ -20,6 +20,20 @@ ogar-loco = { workspace = true }
 # the dependency cannot leak into `blockly-abi` by accident — it would take a
 # manifest edit, not an import.
 serde_json = "1"
+# Raw assets (costume bitmaps/vectors, sound files) are NOT program data:
+# they never enter a node or a register, only the intake boundary handles
+# them, keyed by their sb3 `md5ext`. Both stores are optional so the lean
+# membrane stays lean; the `AssetStore` seam itself is always present.
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+object_store = { version = "0.13", features = ["aws"], optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+
+[features]
+# Read a whole `.sb3` archive: project.json + the asset files, into a store.
+sb3-archive = ["dep:zip"]
+# An S3-compatible asset store (Tigris on Railway) from the standard `AWS_*`
+# variables — the same names lance-graph's hydration reads.
+s3 = ["dep:object_store", "dep:tokio"]
 
 [dev-dependencies]
 blockly-run = { path = "../blockly-run" }

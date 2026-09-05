@@ -150,6 +150,11 @@ pub struct Sb3Target {
     pub costumes: Vec<String>,
     /// Sound names, in project order.
     pub sounds: Vec<String>,
+    /// The costume FILES behind the names (`md5ext` keys into the asset
+    /// store), same order as [`Sb3Target::costumes`].
+    pub costume_assets: Vec<Sb3Asset>,
+    /// The sound files behind [`Sb3Target::sounds`], same order.
+    pub sound_assets: Vec<Sb3Asset>,
     /// Number of OBJECT blocks in this target's `blocks` map — shadows
     /// included, loose-reporter arrays excluded. Used for coverage
     /// arithmetic by a caller comparing what was read against what was
@@ -198,6 +203,8 @@ fn read_target(t: &Value) -> Result<Sb3Target, Sb3Error> {
     let broadcasts = single_strings(t.get("broadcasts"));
     let costumes = names_of(t.get("costumes"));
     let sounds = names_of(t.get("sounds"));
+    let costume_assets = assets_of(t.get("costumes"));
+    let sound_assets = assets_of(t.get("sounds"));
 
     let Some(blocks_obj) = t.get("blocks").and_then(Value::as_object) else {
         return Ok(Sb3Target {
@@ -210,6 +217,8 @@ fn read_target(t: &Value) -> Result<Sb3Target, Sb3Error> {
             proccodes: Vec::new(),
             costumes,
             sounds,
+            costume_assets: costume_assets.clone(),
+            sound_assets: sound_assets.clone(),
             block_count: 0,
         });
     };
@@ -255,6 +264,8 @@ fn read_target(t: &Value) -> Result<Sb3Target, Sb3Error> {
         proccodes,
         costumes,
         sounds,
+        costume_assets,
+        sound_assets,
         block_count,
     })
 }
@@ -276,6 +287,36 @@ fn single_strings(v: Option<&Value>) -> Vec<String> {
     };
     obj.values()
         .filter_map(|n| n.as_str().map(str::to_string))
+        .collect()
+}
+
+/// One raw asset an sb3 references: a costume or a sound FILE. Never
+/// program data — the name is what the register interns; the file lives in
+/// an [`crate::assets::AssetStore`] under its content key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sb3Asset {
+    /// The name the register interns (`Sb3Target::costumes` / `sounds`).
+    pub name: String,
+    /// The content key: `<md5 of the bytes>.<ext>`, sb3's own file name
+    /// inside the archive and the key it is stored under.
+    pub md5ext: String,
+    /// `png` / `svg` / `wav` / `mp3` — sb3's `dataFormat`.
+    pub format: String,
+}
+
+/// `[{name, md5ext, dataFormat}, ..]` -> assets, in order.
+fn assets_of(v: Option<&Value>) -> Vec<Sb3Asset> {
+    let Some(arr) = v.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|o| {
+            Some(Sb3Asset {
+                name: o.get("name")?.as_str()?.to_string(),
+                md5ext: o.get("md5ext")?.as_str()?.to_string(),
+                format: o.get("dataFormat")?.as_str()?.to_string(),
+            })
+        })
         .collect()
 }
 

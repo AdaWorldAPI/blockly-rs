@@ -45,6 +45,7 @@
 use blockly_abi::{BlockRecord, FieldValue};
 use serde_json::Value;
 
+pub mod assets;
 pub mod sb3;
 
 /// Why a saved workspace could not be read.
