@@ -567,6 +567,11 @@ pub struct Scene<'a> {
     /// supply an input, and this makes that explicit rather than pretending
     /// the stage moves it.
     mouse_sweep: f32,
+    /// Simulated keyboard: alternate `up arrow` / `down arrow` every this
+    /// many rounds. Same reasoning as the mouse — a key-driven paddle under a
+    /// constant (or absent) key is a frozen paddle. Zero = leave `stage.key`
+    /// as the caller set it.
+    key_period: u32,
 }
 
 impl<'a> Scene<'a> {
@@ -578,7 +583,17 @@ impl<'a> Scene<'a> {
             scripts,
             trace: Vec::new(),
             mouse_sweep: 0.0,
+            key_period: 0,
         }
+    }
+
+    /// Alternate the held key between `up arrow` and `down arrow` every
+    /// `period` rounds while the scene runs. Zero (the default) leaves the
+    /// key wherever the caller put it.
+    #[must_use]
+    pub fn with_key_sweep(mut self, period: u32) -> Self {
+        self.key_period = period;
+        self
     }
 
     /// Sweep the simulated pointer up and down while the scene runs.
@@ -606,6 +621,17 @@ impl<'a> Scene<'a> {
             if self.mouse_sweep != 0.0 {
                 let phase = f32::from(u16::try_from(round % 1000).unwrap_or(0));
                 self.stage.mouse_y = (phase * 0.07).sin() * self.mouse_sweep;
+            }
+            // `checked_div` is the "sweep off" test: a zero period divides
+            // to `None` and the key is left where the caller put it.
+            if let Some(phase) = round.checked_div(self.key_period) {
+                let keys = blockly_abi::menus::menu_by_id(1).expect("KEY_OPTION is menu 1");
+                let code = if phase.is_multiple_of(2) {
+                    "up arrow"
+                } else {
+                    "down arrow"
+                };
+                self.stage.key = blockly_abi::menus::encode(keys, code);
             }
             for (i, script) in self.scripts.iter().enumerate() {
                 let stage = core::mem::take(&mut self.stage);

@@ -1,0 +1,251 @@
+{
+  "blocks": {
+    "languageVersion": 0,
+    "blocks": [
+      {
+        "type": "event_whenflagclicked",
+        "id": "ball_hat",
+        "next": {
+          "block": {
+            "type": "control_forever",
+            "id": "ball_loop",
+            "inputs": {
+              "SUBSTACK": {
+                "block": {
+                  "type": "motion_movesteps",
+                  "id": "mv",
+                  "inputs": {
+                    "STEPS": {
+                      "block": {
+                        "type": "math_number",
+                        "id": "n_sp",
+                        "fields": {
+                          "NUM": 4
+                        }
+                      }
+                    }
+                  },
+                  "next": {
+                    "block": {
+                      "type": "motion_ifonedgebounce",
+                      "id": "bounce",
+                      "next": {
+                        "block": {
+                          "type": "control_if",
+                          "id": "hit",
+                          "inputs": {
+                            "CONDITION": {
+                              "block": {
+                                "type": "sensing_touchingobject",
+                                "id": "touch",
+                                "inputs": {
+                                  "TOUCHINGOBJECTMENU": {
+                                    "block": {
+                                      "type": "math_number",
+                                      "id": "n_pad",
+                                      "fields": {
+                                        "NUM": 1
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "SUBSTACK": {
+                              "block": {
+                                "type": "motion_turnright",
+                                "id": "spin",
+                                "inputs": {
+                                  "DEGREES": {
+                                    "block": {
+                                      "type": "math_number",
+                                      "id": "n_180",
+                                      "fields": {
+                                        "NUM": 180
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "event_whenflagclicked",
+        "id": "pad_hat",
+        "next": {
+          "block": {
+            "type": "control_forever",
+            "id": "pad_loop",
+            "inputs": {
+              "SUBSTACK": {
+                "block": {
+                  "type": "control_if",
+                  "id": "pad_up",
+                  "inputs": {
+                    "CONDITION": {
+                      "block": {
+                        "type": "sensing_keypressed",
+                        "id": "pad_up_kp",
+                        "inputs": {
+                          "KEY_OPTION": {
+                            "shadow": {
+                              "type": "sensing_keyoptions",
+                              "id": "pad_up_ko",
+                              "fields": {
+                                "KEY_OPTION": "up arrow"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "SUBSTACK": {
+                      "block": {
+                        "type": "motion_changeyby",
+                        "id": "pad_up_dy",
+                        "inputs": {
+                          "DY": {
+                            "block": {
+                              "type": "math_number",
+                              "id": "n_up",
+                              "fields": {
+                                "NUM": 6
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "next": {
+                    "block": {
+                      "type": "control_if",
+                      "id": "pad_down",
+                      "inputs": {
+                        "CONDITION": {
+                          "block": {
+                            "type": "sensing_keypressed",
+                            "id": "pad_down_kp",
+                            "inputs": {
+                              "KEY_OPTION": {
+                                "shadow": {
+                                  "type": "sensing_keyoptions",
+                                  "id": "pad_down_ko",
+                                  "fields": {
+                                    "KEY_OPTION": "down arrow"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "SUBSTACK": {
+                          "block": {
+                            "type": "motion_changeyby",
+                            "id": "pad_down_dy",
+                            "inputs": {
+                              "DY": {
+                                "block": {
+                                  "type": "operator_subtract",
+                                  "id": "neg6",
+                                  "inputs": {
+                                    "NUM1": {
+                                      "block": {
+                                        "type": "math_number",
+                                        "id": "n_zero",
+                                        "fields": {
+                                          "NUM": 0
+                                        }
+                                      }
+                                    },
+                                    "NUM2": {
+                                      "block": {
+                                        "type": "math_number",
+                                        "id": "n_six",
+                                        "fields": {
+                                          "NUM": 6
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "event_whenflagclicked",
+        "id": "sc_hat",
+        "next": {
+          "block": {
+            "type": "control_forever",
+            "id": "sc_loop",
+            "inputs": {
+              "SUBSTACK": {
+                "block": {
+                  "type": "control_if",
+                  "id": "goal",
+                  "inputs": {
+                    "CONDITION": {
+                      "block": {
+                        "type": "sensing_touchingobject",
+                        "id": "goal_t",
+                        "inputs": {
+                          "TOUCHINGOBJECTMENU": {
+                            "block": {
+                              "type": "math_number",
+                              "id": "n_goal",
+                              "fields": {
+                                "NUM": 2
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "SUBSTACK": {
+                      "block": {
+                        "type": "data_changevariableby",
+                        "id": "bump",
+                        "inputs": {
+                          "VALUE": {
+                            "block": {
+                              "type": "math_number",
+                              "id": "n_one",
+                              "fields": {
+                                "NUM": 1
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}
