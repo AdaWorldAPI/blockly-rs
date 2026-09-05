@@ -296,6 +296,14 @@ pub const SCRATCH_MENUS: &[Menu] = &[
         name: "OF_PROPERTY",
         options: &[],
     },
+    // Custom blocks: a target's procedure signatures (`proccode`, e.g.
+    // `"walk %n steps"`). A definition and every call of it carry the SAME
+    // index, which is how a call finds its body at run time.
+    Menu {
+        id: 28,
+        name: "PROCEDURE",
+        options: &[],
+    },
 ];
 
 /// Blocks carrying an INLINE dropdown: `(block type, field name, menu id)`.
@@ -345,6 +353,12 @@ pub const MENU_FIELDS: &[(&str, &str, u8)] = &[
     ("event_whenbroadcastreceived", "BROADCAST_OPTION", 23),
     ("event_whenbackdropswitchesto", "BACKDROP", 21),
     ("sensing_of", "PROPERTY", 27),
+    // Custom blocks. `PROC_DEF` carries its body as a reference in the first
+    // immediate, so the procedure index sits AFTER it (values[1]) — which is
+    // why a definition needs the Triples shape, as `if/else` does. A call's
+    // second field, `ARGC`, is a plain byte, not a menu.
+    ("procedures_definition", "PROCCODE", 28),
+    ("procedures_call", "PROCCODE", 28),
 ];
 
 /// Menu SHADOW blocks — a dropdown that arrives as a nested reporter:

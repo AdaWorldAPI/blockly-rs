@@ -102,6 +102,14 @@ pub fn block_for(f: FnIndex) -> Option<(&'static str, Option<&'static str>)> {
 #[must_use]
 pub fn pushes(f: FnIndex) -> bool {
     use crate::scratch::Shape;
+    // Custom blocks: an argument reporter is a leaf value; a call and a
+    // definition are statements. Stated here because the shared core marks
+    // `PROC_CALL` variadic and leaves its push answer to the vocabulary.
+    match f {
+        FnIndex::PROC_ARG => return true,
+        FnIndex::PROC_CALL | FnIndex::PROC_DEF => return false,
+        _ => {}
+    }
     if let Some((name, ..)) = crate::scratch::device_by_byte(f.0) {
         return crate::scratch::SCRATCH_BLOCK_DEFS
             .iter()
@@ -149,11 +157,17 @@ pub fn raise_body_in(
         let (ty, code) = block_for(f).ok_or(RaiseError::UnknownFunction(f.0))?;
 
         let refs = usize::from(shared_core::body_refs(f));
-        let arity = usize::from(
-            shared_core::stack_arity(f)
-                .or_else(|| crate::scratch::device_by_byte(f.0).map(|(_, a, _)| a))
-                .ok_or(RaiseError::Uncovered(f.0))?,
-        );
+        // A custom-block call is variadic: its arity is the call's OWN second
+        // immediate (`ARGC`), which is why the shared core refuses to table it.
+        let arity = if f == FnIndex::PROC_CALL {
+            usize::from(call.values.get(1).copied().unwrap_or(0))
+        } else {
+            usize::from(
+                shared_core::stack_arity(f)
+                    .or_else(|| crate::scratch::device_by_byte(f.0).map(|(_, a, _)| a))
+                    .ok_or(RaiseError::Uncovered(f.0))?,
+            )
+        };
 
         if stack.len() < arity {
             return Err(RaiseError::StackUnderflow(f.0));
@@ -200,6 +214,12 @@ pub fn raise_body_in(
             let n = call.values.get(refs).copied().unwrap_or(0);
             fields.push(("NUM".to_string(), FieldValue::Byte(n)));
         }
+        // An argument reporter's immediate is its POSITION in the enclosing
+        // definition's argument list; the name lives with the definition.
+        if f == FnIndex::PROC_ARG {
+            let n = call.values.first().copied().unwrap_or(0);
+            fields.push(("VALUE".to_string(), FieldValue::Byte(n)));
+        }
         // A dropdown rides in the same slot, as a codebook index. Decoded
         // through the static prefix; a byte past it is a project's own entry
         // (a sprite name the palette cannot know) and is refused, not guessed.
@@ -214,6 +234,11 @@ pub fn raise_body_in(
                 crate::menus::decode_in(basin, menu, b).ok_or(RaiseError::UnknownOption(f.0, b))?
             };
             fields.push((field.to_string(), FieldValue::Code(code)));
+        }
+        // …and a call's declared argument count, the byte after its index.
+        if f == FnIndex::PROC_CALL {
+            let argc = call.values.get(1).copied().unwrap_or(0);
+            fields.push(("ARGC".to_string(), FieldValue::Byte(argc)));
         }
 
         let record = BlockRecord {
@@ -461,6 +486,95 @@ mod tests {
             raise_body(&[body], 0),
             Err(RaiseError::UnknownOption(_, 200))
         ));
+    }
+
+    /// A custom block round-trips: the definition's body is a referenced
+    /// function, its procedure index sits AFTER the reference, the call's
+    /// arity is its own second immediate, and the argument reporter is a
+    /// position. All three would silently drift under Pairs or with the
+    /// field written over the reference slot — the re-lowered bytes catch it.
+    #[test]
+    fn a_custom_block_definition_and_call_round_trip() {
+        use crate::menus;
+        use ogar_loco::basin::BasinCodebooks;
+        let procs = menus::SCRATCH_MENUS
+            .iter()
+            .find(|m| m.name == "PROCEDURE")
+            .unwrap();
+        let mut b = menus::builder(
+            procs,
+            ogar_loco::pool::placeholder::CONST_UTF8_INLINE,
+            menus::PLACEHOLDER_DIGEST_CLASSID,
+        )
+        .unwrap();
+        let walk = b
+            .intern(ogar_loco::pool::placeholder::CONST_UTF8_INLINE, b"walk %n")
+            .unwrap();
+        let mut basin = BasinCodebooks::new();
+        basin.plug(b.seal()).unwrap();
+
+        let rec = |ty: &str, id: &str| crate::BlockRecord {
+            ty: ty.into(),
+            id: id.into(),
+            fields: vec![],
+            inputs: vec![],
+            statements: vec![],
+            next: None,
+            extra_state: None,
+            disabled: false,
+        };
+        // define walk %n: change x by (n)
+        let mut arg = rec("argument_reporter_string_number", "arg");
+        arg.fields
+            .push(("VALUE".into(), crate::FieldValue::Byte(0)));
+        let mut body = rec("motion_changexby", "dx");
+        body.inputs.push(("DX".into(), arg));
+        let mut def = rec("procedures_definition", "def");
+        def.fields
+            .push(("PROCCODE".into(), crate::FieldValue::Code("walk %n".into())));
+        def.statements.push(("SUBSTACK".into(), body));
+        // call walk(7)
+        let mut seven = rec("math_number", "n7");
+        seven
+            .fields
+            .push(("NUM".into(), crate::FieldValue::Byte(7)));
+        let mut call = rec("procedures_call", "call");
+        call.fields
+            .push(("PROCCODE".into(), crate::FieldValue::Code("walk %n".into())));
+        call.fields
+            .push(("ARGC".into(), crate::FieldValue::Byte(1)));
+        call.inputs.push(("input0".into(), seven));
+        let mut hat = rec("event_whenflagclicked", "hat");
+        hat.next = Some(Box::new(call));
+
+        for script in [&def, &hat] {
+            let original =
+                crate::lower_program_in(LaneShape::Triples, script, &basin).expect("casts");
+            let raised = raise_program_in(&original.functions, &basin)
+                .expect("raises")
+                .expect("non-empty");
+            let again =
+                crate::lower_program_in(LaneShape::Triples, &raised, &basin).expect("re-casts");
+            assert_eq!(original.functions.len(), again.functions.len());
+            for (a, b) in original.functions.iter().zip(again.functions.iter()) {
+                assert_eq!(a.as_body_bytes(), b.as_body_bytes(), "{}", script.ty);
+            }
+        }
+        // The bytes mean what the design says: body ref FIRST, index second.
+        let d = crate::lower_program_in(LaneShape::Triples, &def, &basin).unwrap();
+        let head = crate::raise_calls(&d.functions[0])[0].clone();
+        assert_eq!(head.function, FnIndex::PROC_DEF);
+        assert_eq!(head.values[0], 1, "body is function 1");
+        assert_eq!(head.values[1], walk, "procedure index after the reference");
+        let c = crate::lower_program_in(LaneShape::Triples, &hat, &basin).unwrap();
+        let calls = crate::raise_calls(&c.functions[0]);
+        let pc = calls
+            .iter()
+            .find(|c| c.function == FnIndex::PROC_CALL)
+            .unwrap();
+        assert_eq!((pc.values[0], pc.values[1]), (walk, 1));
+        // Under Pairs the definition cannot carry both and is refused.
+        assert!(crate::lower_program_in(LaneShape::Pairs, &def, &basin).is_err());
     }
 
     /// The raise refuses rather than inventing a block.

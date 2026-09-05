@@ -1127,6 +1127,30 @@ pub const SCRATCH_BLOCK_DEFS: &[BlockDef] = &[
     ("data_showlist", "data", Shape::Statement, &[], &[]),
     ("data_hidelist", "data", Shape::Statement, &[], &[]),
     ("procedures_call", "procedures", Shape::Statement, &[], &[]),
+    // A definition is a hat whose body is its ONE statement input — the
+    // shared core's `PROC_DEF` carries the body as a reference, exactly as
+    // `control_forever` carries `SUBSTACK`. Argument reporters are leaves.
+    (
+        "procedures_definition",
+        "procedures",
+        Shape::Hat,
+        &[],
+        &["SUBSTACK"],
+    ),
+    (
+        "argument_reporter_string_number",
+        "procedures",
+        Shape::Reporter,
+        &[],
+        &[],
+    ),
+    (
+        "argument_reporter_boolean",
+        "procedures",
+        Shape::Boolean,
+        &[],
+        &[],
+    ),
     // Menu shadow blocks: reporters carrying one dropdown (see `crate::menus`).
     ("sensing_keyoptions", "sensing", Shape::Reporter, &[], &[]),
     (

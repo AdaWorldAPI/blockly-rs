@@ -193,6 +193,9 @@ pub enum RunError {
     /// A real operation this interpreter does not implement. Named rather
     /// than skipped: a silent no-op makes a broken program look correct.
     Unimplemented(u8),
+    /// A custom-block call names a procedure index no definition in the scene
+    /// carries. Refused rather than skipped, for the same reason.
+    UnknownProcedure(u8),
 }
 
 impl core::fmt::Display for RunError {
@@ -202,17 +205,55 @@ impl core::fmt::Display for RunError {
             Self::StackUnderflow(b) => write!(f, "function {b:#04x} wanted absent operands"),
             Self::DanglingReference(i) => write!(f, "body reference {i} names no function"),
             Self::Unimplemented(b) => write!(f, "function {b:#04x} is not implemented"),
+            Self::UnknownProcedure(i) => write!(f, "no definition carries procedure {i}"),
         }
     }
 }
 
 impl core::error::Error for RunError {}
 
+/// A custom block a scene can call: the procedure index its definition and
+/// its calls share (the `PROCEDURE` codebook byte), the script that defines
+/// it, and which of that script's functions is the body.
+///
+/// Recognised from the stored bytes alone: a script whose entry function
+/// begins with `PROC_DEF` is a definition — `values[0]` the body reference,
+/// `values[1]` the index (after the reference, as the cast writes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Procedure<'a> {
+    /// The `PROCEDURE` codebook index.
+    pub index: u8,
+    /// The defining script's functions.
+    pub functions: &'a [FunctionBody],
+    /// The body function within `functions`.
+    pub body: usize,
+}
+
+impl<'a> Procedure<'a> {
+    /// Read a definition off a script, if its entry begins with `PROC_DEF`.
+    #[must_use]
+    pub fn of_script(functions: &'a [FunctionBody]) -> Option<Self> {
+        let head = blockly_abi::raise_calls(functions.first()?)
+            .into_iter()
+            .next()?;
+        (head.function == FnIndex::PROC_DEF).then(|| Self {
+            index: head.values.get(1).copied().unwrap_or(0),
+            functions,
+            body: usize::from(head.values.first().copied().unwrap_or(0)),
+        })
+    }
+}
+
 /// A bounded run over stored function bodies.
 pub struct Machine<'a> {
     /// The stage the program acts on.
     pub stage: Stage,
     functions: &'a [FunctionBody],
+    /// Custom blocks callable from this run, by index.
+    procs: &'a [Procedure<'a>],
+    /// Argument frames of the custom blocks currently executing, innermost
+    /// last. `PROC_ARG` reads the innermost; outside any call it reads `0`.
+    frames: Vec<Vec<f32>>,
     budget: u32,
     /// Sampled stage snapshots — the run's TRACE, not its result.
     ///
@@ -253,11 +294,20 @@ impl<'a> Machine<'a> {
         Self {
             stage: Stage::default(),
             functions,
+            procs: &[],
+            frames: Vec::new(),
             budget,
             trace: Vec::new(),
             every: 0,
             counter: 0,
         }
+    }
+
+    /// Make these custom blocks callable from the run.
+    #[must_use]
+    pub fn with_procs(mut self, procs: &'a [Procedure<'a>]) -> Self {
+        self.procs = procs;
+        self
     }
 
     /// Record a stage snapshot every `n` calls, for rendering the motion.
@@ -288,9 +338,15 @@ impl<'a> Machine<'a> {
         self.exec(0)
     }
 
+    /// Execute a function of THIS script.
     fn exec(&mut self, index: usize) -> Result<(), RunError> {
-        let body = *self
-            .functions
+        self.exec_in(self.functions, index)
+    }
+
+    /// Execute function `index` of `functions` — this script's, or a custom
+    /// block's defining script when called through `PROC_CALL`.
+    fn exec_in(&mut self, functions: &'a [FunctionBody], index: usize) -> Result<(), RunError> {
+        let body = *functions
             .get(index)
             .ok_or(RunError::DanglingReference(index as u8))?;
         let mut stack: Vec<f32> = Vec::new();
@@ -321,19 +377,19 @@ impl<'a> Machine<'a> {
                         // same time twice and reported t = 480 s for a run of
                         // 240 frames.
                         while self.budget > 0 {
-                            self.exec(target)?;
+                            self.exec_in(functions, target)?;
                         }
                     }
                     FnIndex::IF => {
                         let c = pop(&mut stack, f)?;
                         if c != 0.0 {
-                            self.exec(target)?;
+                            self.exec_in(functions, target)?;
                         }
                     }
                     FnIndex::IF_ELSE => {
                         let c = pop(&mut stack, f)?;
                         let other = usize::from(call.values.get(1).copied().unwrap_or(0));
-                        self.exec(if c != 0.0 { target } else { other })?;
+                        self.exec_in(functions, if c != 0.0 { target } else { other })?;
                     }
                     FnIndex::REPEAT => {
                         let n = pop(&mut stack, f)?.max(0.0) as u32;
@@ -341,7 +397,7 @@ impl<'a> Machine<'a> {
                             if self.budget == 0 {
                                 break;
                             }
-                            self.exec(target)?;
+                            self.exec_in(functions, target)?;
                         }
                     }
                     FnIndex::WHILE | FnIndex::REPEAT_UNTIL => {
@@ -353,12 +409,36 @@ impl<'a> Machine<'a> {
                         let want = f == FnIndex::WHILE;
                         if (c != 0.0) == want {
                             while self.budget > 0 {
-                                self.exec(target)?;
+                                self.exec_in(functions, target)?;
                             }
                         }
                     }
+                    // A definition reached as a statement: its body runs when
+                    // CALLED, never in line. (The scene does not schedule
+                    // definition scripts at all; this covers a nested one.)
+                    FnIndex::PROC_DEF => {}
                     _ => return Err(RunError::Unimplemented(f.0)),
                 }
+                continue;
+            }
+
+            // ── a custom-block call: variadic, arity in its own bytes ──────
+            if f == FnIndex::PROC_CALL {
+                let index = call.values.first().copied().unwrap_or(0);
+                let argc = usize::from(call.values.get(1).copied().unwrap_or(0));
+                if stack.len() < argc {
+                    return Err(RunError::StackUnderflow(f.0));
+                }
+                let args: Vec<f32> = stack.split_off(stack.len() - argc);
+                let proc_ = *self
+                    .procs
+                    .iter()
+                    .find(|p| p.index == index)
+                    .ok_or(RunError::UnknownProcedure(index))?;
+                self.frames.push(args);
+                let outcome = self.exec_in(proc_.functions, proc_.body);
+                self.frames.pop();
+                outcome?;
                 continue;
             }
 
@@ -385,6 +465,13 @@ impl<'a> Machine<'a> {
     /// Apply one non-branching call. `Some(v)` means it yielded a value.
     fn apply(&mut self, f: FnIndex, ops: &[f32], imm: f32) -> Result<Option<f32>, RunError> {
         let a = |i: usize| ops.get(i).copied().unwrap_or(0.0);
+        // Read before the stage is borrowed: the innermost custom-block frame.
+        let frame_arg = self
+            .frames
+            .last()
+            .and_then(|fr| fr.get(imm as usize))
+            .copied()
+            .unwrap_or(0.0);
         let s = &mut self.stage;
         // Motion/looks act on the sprite this script is bound to.
         let me = s.current.min(s.sprites.len() - 1);
@@ -409,6 +496,10 @@ impl<'a> Machine<'a> {
             FnIndex::ROUND => Some(a(0).round()),
             // The immediate is the VARIABLE codebook byte — which variable.
             FnIndex::VAR_GET => Some(s.var(imm as u8)),
+            // The immediate is the argument's POSITION in the innermost
+            // custom-block frame; outside any call it reads 0, as an unset
+            // Scratch value does.
+            FnIndex::PROC_ARG => Some(frame_arg),
             FnIndex::VAR_SET => {
                 *s.var_mut(imm as u8) = a(0);
                 return Ok(None);
@@ -576,6 +667,9 @@ pub struct Scene<'a> {
     /// The shared stage every script acts on.
     pub stage: Stage,
     scripts: Vec<&'a [FunctionBody]>,
+    /// Custom blocks: definition scripts are NOT scheduled — a definition
+    /// runs when called — they are the scene's procedure table.
+    procs: Vec<Procedure<'a>>,
     trace: Vec<Stage>,
     /// Simulated pointer travel, in stage units per round.
     ///
@@ -597,9 +691,14 @@ impl<'a> Scene<'a> {
     /// Build a scene from one program per sprite.
     #[must_use]
     pub fn new(stage: Stage, scripts: Vec<&'a [FunctionBody]>) -> Self {
+        let (defs, scheduled): (Vec<_>, Vec<_>) = scripts
+            .into_iter()
+            .partition(|s| Procedure::of_script(s).is_some());
+        let procs = defs.into_iter().filter_map(Procedure::of_script).collect();
         Self {
             stage,
-            scripts,
+            scripts: scheduled,
+            procs,
             trace: Vec::new(),
             mouse_sweep: 0.0,
             key_period: 0,
@@ -652,9 +751,10 @@ impl<'a> Scene<'a> {
                 };
                 self.stage.key = blockly_abi::menus::encode(keys, code);
             }
+            let procs = &self.procs;
             for (i, script) in self.scripts.iter().enumerate() {
                 let stage = core::mem::take(&mut self.stage);
-                let mut m = Machine::resuming(script, slice, stage, i);
+                let mut m = Machine::resuming(script, slice, stage, i).with_procs(procs);
                 let outcome = m.run();
                 self.stage = m.stage;
                 outcome?;
@@ -663,6 +763,12 @@ impl<'a> Scene<'a> {
             self.trace.push(self.stage.clone());
         }
         Ok(())
+    }
+
+    /// The custom blocks this scene can call.
+    #[must_use]
+    pub fn procedures(&self) -> &[Procedure<'a>] {
+        &self.procs
     }
 
     /// One stage snapshot per round, oldest first.
@@ -923,6 +1029,122 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A custom block runs from its DEFINITION script when another script
+    /// calls it, with its argument read by position — and a definition is
+    /// never scheduled on its own.
+    #[test]
+    fn a_custom_block_runs_when_called_with_its_arguments_and_never_on_its_own() {
+        use blockly_abi::menus;
+        use ogar_loco::basin::BasinCodebooks;
+        let procs = menus::SCRATCH_MENUS
+            .iter()
+            .find(|m| m.name == "PROCEDURE")
+            .unwrap();
+        let mut b = menus::builder(
+            procs,
+            ogar_loco::pool::placeholder::CONST_UTF8_INLINE,
+            menus::PLACEHOLDER_DIGEST_CLASSID,
+        )
+        .unwrap();
+        let walk = b
+            .intern(ogar_loco::pool::placeholder::CONST_UTF8_INLINE, b"walk %n")
+            .unwrap();
+        let mut basin = BasinCodebooks::new();
+        basin.plug(b.seal()).unwrap();
+        let code = |c: &str| FieldValue::Code(c.into());
+
+        // define walk %n: change x by (n)
+        let arg = rec(
+            "argument_reporter_string_number",
+            vec![("VALUE".into(), FieldValue::Byte(0))],
+            vec![],
+            vec![],
+            None,
+        );
+        let body = rec(
+            "motion_changexby",
+            vec![],
+            vec![("DX".into(), arg)],
+            vec![],
+            None,
+        );
+        let def = rec(
+            "procedures_definition",
+            vec![("PROCCODE".into(), code("walk %n"))],
+            vec![],
+            vec![("SUBSTACK".into(), body)],
+            None,
+        );
+        // when flag clicked: walk(7); walk(7)
+        let call = |next: Option<BlockRecord>| {
+            rec(
+                "procedures_call",
+                vec![
+                    ("PROCCODE".into(), code("walk %n")),
+                    ("ARGC".into(), FieldValue::Byte(1)),
+                ],
+                vec![("input0".into(), num(7))],
+                vec![],
+                next,
+            )
+        };
+        let hat = rec(
+            "event_whenflagclicked",
+            vec![],
+            vec![],
+            vec![],
+            Some(call(Some(call(None)))),
+        );
+
+        let d = blockly_abi::lower_program_in(LaneShape::Triples, &def, &basin).expect("def casts");
+        let h =
+            blockly_abi::lower_program_in(LaneShape::Triples, &hat, &basin).expect("call casts");
+        let proc_ = Procedure::of_script(&d.functions).expect("a definition");
+        assert_eq!((proc_.index, proc_.body), (walk, 1));
+        assert!(Procedure::of_script(&h.functions).is_none());
+
+        // One round is enough: two calls, x = 14.
+        let mut scene = Scene::new(Stage::default(), vec![&d.functions, &h.functions]);
+        assert_eq!(scene.procedures().len(), 1);
+        scene.run(1, 100).expect("runs");
+        assert_eq!(
+            scene.stage.sprites[0].x, 14.0,
+            "walk(7) twice through the frame"
+        );
+
+        // Silence half: the definition alone does nothing — it is a table
+        // entry, not a script that runs.
+        let mut alone = Scene::new(Stage::default(), vec![&d.functions]);
+        alone.run(3, 100).expect("runs");
+        assert_eq!(alone.stage.sprites[0].x, 0.0);
+
+        // A call whose procedure is not in the scene is refused, not skipped.
+        let mut orphan = Scene::new(Stage::default(), vec![&h.functions]);
+        assert!(matches!(orphan.run(1, 100), Err(RunError::UnknownProcedure(i)) if i == walk));
+
+        // An argument read outside any call is 0, not a stale frame.
+        let loose = rec(
+            "motion_changexby",
+            vec![],
+            vec![(
+                "DX".into(),
+                rec(
+                    "argument_reporter_string_number",
+                    vec![("VALUE".into(), FieldValue::Byte(0))],
+                    vec![],
+                    vec![],
+                    None,
+                ),
+            )],
+            vec![],
+            None,
+        );
+        let l = blockly_abi::lower_program(LaneShape::Pairs, &loose).unwrap();
+        let mut m = Machine::new(&l.functions, 100);
+        m.run().unwrap();
+        assert_eq!(m.stage.sprites[0].x, 0.0);
     }
 
     /// `forever` terminates on the budget, and the budget bounds the RUN only.

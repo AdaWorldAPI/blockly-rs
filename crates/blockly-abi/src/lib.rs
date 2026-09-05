@@ -626,7 +626,15 @@ pub(crate) fn call_for(
     // chose WHICH function and is already spent; a ValueParam dropdown is an
     // ARGUMENT and becomes a byte, or the cast refuses.
     let mut values = [0u8; ogar_loco::MAX_VALUES_PER_CALL];
-    let mut n = 0usize;
+    // Immediates land AFTER the body-reference slots: `values[..refs]` is
+    // written by the program lowering with the statement bodies' function
+    // indices (the same carving `branches_of` reads), so a block that has
+    // both — `procedures_definition`, body ref + procedure index — must not
+    // have its field overwrite the reference. For every block with no body
+    // this is `n = 0`, unchanged.
+    let mut n = usize::from(ogar_loco::vocabulary::shared_core::body_refs(
+        mapping.function,
+    ));
     let mut push = |b: u8| -> Result<(), CastError> {
         // Silently dropping the overflow would emit a call that looks complete
         // and is not — the same failure the mutator guard above exists to stop.
