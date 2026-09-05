@@ -63,6 +63,7 @@
 use ogar_loco::basin::{BasinCodebook, BasinCodebookBuilder, BasinCodebooks};
 use ogar_loco::pool::{CONSTANT_BYTES, PoolError};
 use ogar_loco::vocabulary::ValueCodebook;
+use std::sync::OnceLock;
 
 /// One dropdown menu: its basin-local codebook id, its legend name, and the
 /// static option prefix harvested from the block definition.
@@ -363,6 +364,80 @@ pub const MENU_INPUTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The basin every cast and raise falls back to: the static prefixes only,
+/// under the placeholder classids. A project that interns sprite / costume
+/// names builds its own with [`builder`] and passes it to
+/// [`crate::lower_program_in`] / [`crate::raise::raise_program_in`].
+pub fn static_basin() -> &'static BasinCodebooks {
+    static BASIN: OnceLock<BasinCodebooks> = OnceLock::new();
+    BASIN.get_or_init(|| {
+        basin_codebooks(
+            ogar_loco::pool::placeholder::CONST_UTF8_INLINE,
+            PLACEHOLDER_DIGEST_CLASSID,
+        )
+    })
+}
+
+/// Read an entry back as the UTF-8 code it was interned from — the inverse
+/// of [`builder`]'s `intern(utf8_classid, code.as_bytes())`. `None` for a
+/// digest entry (its code is not recoverable from the table) or non-UTF-8.
+fn entry_code(entry: &ogar_loco::pool::Constant) -> Option<String> {
+    let end = entry
+        .bytes
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |i| i + 1);
+    let text = core::str::from_utf8(&entry.bytes[..end]).ok()?;
+    // A digest is 8 opaque bytes; it decodes as text only by accident, and
+    // the static prefix already names the code for every digest entry.
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// [`encode`], then the basin's dynamic tail: a code a project interned
+/// after the static prefix (a sprite name) resolves to its table index.
+#[must_use]
+pub fn encode_in(basin: &BasinCodebooks, menu: &Menu, code: &str) -> Option<u8> {
+    if let Some(i) = encode(menu, code) {
+        return Some(i);
+    }
+    let book = basin.get(menu.id)?;
+    let first_dynamic = menu.options.len() + 1;
+    (first_dynamic..=book.len())
+        .filter_map(|i| u8::try_from(i).ok())
+        .find(|&i| book.resolve(i).and_then(entry_code).as_deref() == Some(code))
+}
+
+/// [`decode`], then the basin's dynamic tail.
+#[must_use]
+pub fn decode_in(basin: &BasinCodebooks, menu: &Menu, byte: u8) -> Option<String> {
+    if let Some(c) = decode(menu, byte) {
+        return Some(c.to_string());
+    }
+    if usize::from(byte) <= menu.options.len() {
+        return None;
+    }
+    basin.get(menu.id)?.resolve(byte).and_then(entry_code)
+}
+
+/// Every option a menu offers in this basin, static prefix then dynamic
+/// tail, in index order — what a page lists in the dropdown.
+#[must_use]
+pub fn options_in(basin: &BasinCodebooks, menu: &Menu) -> Vec<String> {
+    let mut out: Vec<String> = menu.options.iter().map(|o| (*o).to_string()).collect();
+    if let Some(book) = basin.get(menu.id) {
+        for i in (menu.options.len() + 1)..=book.len() {
+            if let Some(code) = u8::try_from(i)
+                .ok()
+                .and_then(|i| book.resolve(i))
+                .and_then(entry_code)
+            {
+                out.push(code);
+            }
+        }
+    }
+    out
+}
+
 /// The menu with this codebook id.
 #[must_use]
 pub fn menu_by_id(id: u8) -> Option<&'static Menu> {
@@ -583,6 +658,37 @@ mod tests {
             .count();
         assert!(wide >= 1, "no wide option; the digest arm is untested");
         assert!(wide < 4, "wide options multiplied; re-check the harvest");
+    }
+
+    #[test]
+    fn a_project_basin_encodes_and_decodes_its_dynamic_tail() {
+        let goto = menu_by_id(17).unwrap();
+        let keys = menu_by_id(1).unwrap();
+        let mut basin = BasinCodebooks::new();
+        let mut g = builder(goto, CONST_UTF8_INLINE, PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        g.intern(CONST_UTF8_INLINE, b"Ball").unwrap();
+        g.intern(CONST_UTF8_INLINE, b"Paddle").unwrap();
+        basin.plug(g.seal()).unwrap();
+        let mut k = builder(keys, CONST_UTF8_INLINE, PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        k.intern(CONST_UTF8_INLINE, b"enter").unwrap();
+        basin.plug(k.seal()).unwrap();
+
+        // Dynamic entries round-trip, and their indices sit AFTER the prefix.
+        assert_eq!(encode_in(&basin, goto, "Paddle"), Some(2));
+        assert_eq!(decode_in(&basin, goto, 2).as_deref(), Some("Paddle"));
+        assert_eq!(encode_in(&basin, keys, "enter"), Some(43));
+        assert_eq!(decode_in(&basin, keys, 43).as_deref(), Some("enter"));
+        // The static prefix still answers first, from the table, unchanged.
+        assert_eq!(encode_in(&basin, keys, "space"), Some(1));
+        assert_eq!(decode_in(&basin, keys, 1).as_deref(), Some("space"));
+        // Silence: a name nobody interned, and an index past the tail.
+        assert_eq!(encode_in(&basin, goto, "Goal"), None);
+        assert_eq!(decode_in(&basin, goto, 3), None);
+        // The static basin has no tail at all.
+        assert_eq!(encode_in(static_basin(), goto, "Ball"), None);
+        assert_eq!(options_in(&basin, goto), vec!["Ball", "Paddle"]);
+        assert_eq!(options_in(&basin, keys).len(), 43);
+        assert_eq!(options_in(static_basin(), goto), Vec::<String>::new());
     }
 
     #[test]

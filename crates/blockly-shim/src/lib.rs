@@ -517,10 +517,11 @@ pub mod templates {
     /// the shared core — so one small program proves a Scratch game is not a
     /// separate machine, just a second vocabulary over the same substrate.
     ///
-    /// The touch targets are plain numbers where real Scratch would use a
-    /// dropdown menu shadow. That is honest rather than lossy: menus are
-    /// values, not operations (they mint no opcode), so a number stands in for
-    /// the sprite id a menu would resolve to.
+    /// The touch targets are `sensing_touchingobjectmenu` shadows naming
+    /// `Paddle` and `Goal` — sprite names, which scratch-blocks registers as an
+    /// EMPTY menu (the GUI fills it per project). They resolve through the
+    /// demo's [`project_basin`]: a dynamic menu is one `FnIndex` whose operand
+    /// indexes a per-project table (OGAR #295), and this is the project.
     pub const PONG: &str = include_str!("../templates/pong.json");
 
     /// Every built-in template, as `(name, workspace save)`.
@@ -557,6 +558,69 @@ pub mod templates {
 
     /// Every built-in template in stored-node form.
     pub const ALL_NODES: &[(&str, &[u8])] = &[("pong", PONG_NODES), ("pong-keys", PONG_KEYS_NODES)];
+
+    /// The demo project's basin: every static menu prefix, plus the sprite
+    /// names the built-in scenes use, interned into the dynamic menus
+    /// (`TOUCHING_OBJECT`, `DISTANCE_TO`, `POINT_TOWARDS`, `GOTO`, `GLIDE_TO`,
+    /// `OF_OBJECT`). Built once. A real project would build its own from its
+    /// own sprite list — this is what "the basin is the project" means.
+    pub fn project_basin() -> &'static ogar_loco::basin::BasinCodebooks {
+        use blockly_abi::menus;
+        use ogar_loco::basin::BasinCodebooks;
+        use std::sync::OnceLock;
+        static BASIN: OnceLock<BasinCodebooks> = OnceLock::new();
+        BASIN.get_or_init(|| {
+            const UTF8: u32 = ogar_loco::pool::placeholder::CONST_UTF8_INLINE;
+            const SPRITES: &[&str] = &["Ball", "Paddle", "Goal"];
+            let mut basin = BasinCodebooks::new();
+            for m in menus::SCRATCH_MENUS {
+                let mut b = menus::builder(m, UTF8, menus::PLACEHOLDER_DIGEST_CLASSID)
+                    .expect("prefix fits");
+                let sprite_menu = matches!(
+                    m.name,
+                    "TOUCHING_OBJECT"
+                        | "DISTANCE_TO"
+                        | "POINT_TOWARDS"
+                        | "GOTO"
+                        | "GLIDE_TO"
+                        | "OF_OBJECT"
+                );
+                if sprite_menu {
+                    // The pointer and the edge come before any sprite, as
+                    // Scratch lists them; `OF_OBJECT` offers the stage instead.
+                    let fixed: &[&str] = match m.name {
+                        "TOUCHING_OBJECT" => &["_mouse_", "_edge_"],
+                        "DISTANCE_TO" | "POINT_TOWARDS" | "GOTO" | "GLIDE_TO" => {
+                            &["_mouse_", "_random_"]
+                        }
+                        _ => &["_stage_"],
+                    };
+                    for name in fixed.iter().chain(SPRITES) {
+                        b.intern(UTF8, name.as_bytes())
+                            .expect("short names fit a facet");
+                    }
+                }
+                basin.plug(b.seal()).expect("menu ids are unique");
+            }
+            basin
+        })
+    }
+
+    /// Cast a script against the demo project's basin — [`lower_program_in`]
+    /// with [`project_basin`]. Every template test and the web demo go
+    /// through this, so a sprite-name menu casts the same way everywhere.
+    ///
+    /// # Errors
+    ///
+    /// As [`lower_program_in`].
+    ///
+    /// [`lower_program_in`]: blockly_abi::lower_program_in
+    pub fn cast(
+        shape: ogar_loco::LaneShape,
+        top: &blockly_abi::BlockRecord,
+    ) -> Result<blockly_abi::Program, blockly_abi::CastError> {
+        blockly_abi::lower_program_in(shape, top, project_basin())
+    }
 
     /// Raise stored nodes back into top-level scripts.
     ///
@@ -598,7 +662,7 @@ pub mod templates {
                     .body
                 })
                 .collect();
-            if let Some(script) = blockly_abi::raise::raise_program(&bodies)? {
+            if let Some(script) = blockly_abi::raise::raise_program_in(&bodies, project_basin())? {
                 out.push(script);
             }
         }
@@ -609,7 +673,6 @@ pub mod templates {
 #[cfg(test)]
 mod template_tests {
     use super::templates;
-    use blockly_abi::lower_program;
     use ogar_loco::LaneShape;
 
     /// Every built-in template parses AND casts — it is a program, not a doc.
@@ -624,7 +687,7 @@ mod template_tests {
                 .unwrap_or_else(|e| panic!("template `{name}` does not parse: {e}"));
             assert!(!scripts.is_empty(), "template `{name}` is empty");
             for script in &scripts {
-                lower_program(LaneShape::Pairs, script).unwrap_or_else(|e| {
+                templates::cast(LaneShape::Pairs, script).unwrap_or_else(|e| {
                     panic!(
                         "template `{name}` script `{}` refuses to cast: {e:?}",
                         script.ty
@@ -649,7 +712,7 @@ mod template_tests {
         let mut core = 0usize;
         let mut branching = 0usize;
         for script in &scripts {
-            let prog = lower_program(LaneShape::Pairs, script).unwrap();
+            let prog = templates::cast(LaneShape::Pairs, script).unwrap();
             for body in &prog.functions {
                 for call in blockly_abi::raise_calls(body) {
                     if call.function.is_domain_specific() {
@@ -698,7 +761,7 @@ mod template_tests {
 #[cfg(test)]
 mod raise_round_trip {
     use super::templates;
-    use blockly_abi::{lower_program, raise::raise_program};
+    use blockly_abi::raise::raise_program_in;
     use ogar_loco::LaneShape;
 
     /// Pong survives a full trip through the STORED BYTES and back.
@@ -718,11 +781,11 @@ mod raise_round_trip {
         assert_eq!(scripts.len(), 3);
 
         for (i, script) in scripts.iter().enumerate() {
-            let original = lower_program(LaneShape::Pairs, script).expect("casts");
-            let raised = raise_program(&original.functions)
+            let original = templates::cast(LaneShape::Pairs, script).expect("casts");
+            let raised = raise_program_in(&original.functions, templates::project_basin())
                 .expect("raises")
                 .expect("non-empty");
-            let again = lower_program(LaneShape::Pairs, &raised).expect("re-casts");
+            let again = templates::cast(LaneShape::Pairs, &raised).expect("re-casts");
 
             assert_eq!(
                 original.functions.len(),
@@ -842,7 +905,6 @@ pub mod emit {
 #[cfg(test)]
 mod baked_nodes {
     use super::templates;
-    use blockly_abi::lower_program;
     use ogar_loco::LaneShape;
 
     /// The BAKED NODES and the authoring JSON describe the same program.
@@ -868,8 +930,8 @@ mod baked_nodes {
             );
 
             for (i, (j, n)) in from_json.iter().zip(from_nodes.iter()).enumerate() {
-                let a = lower_program(LaneShape::Pairs, j).expect("json casts");
-                let b = lower_program(LaneShape::Pairs, n).expect("raised casts");
+                let a = templates::cast(LaneShape::Pairs, j).expect("json casts");
+                let b = templates::cast(LaneShape::Pairs, n).expect("raised casts");
                 assert_eq!(a.functions.len(), b.functions.len(), "{name} script {i}");
                 for (f, (x, y)) in a.functions.iter().zip(b.functions.iter()).enumerate() {
                     assert_eq!(
@@ -896,8 +958,8 @@ mod baked_nodes {
 
         assert_eq!(scripts.len(), reread.len());
         for (i, (a, b)) in scripts.iter().zip(reread.iter()).enumerate() {
-            let x = lower_program(LaneShape::Pairs, a).expect("casts");
-            let y = lower_program(LaneShape::Pairs, b).expect("casts");
+            let x = templates::cast(LaneShape::Pairs, a).expect("casts");
+            let y = templates::cast(LaneShape::Pairs, b).expect("casts");
             for (f, (p, q)) in x.functions.iter().zip(y.functions.iter()).enumerate() {
                 assert_eq!(
                     p.as_body_bytes(),
@@ -912,7 +974,6 @@ mod baked_nodes {
 #[cfg(test)]
 mod pong_runs {
     use super::templates;
-    use blockly_abi::lower_program;
     use blockly_run::Machine;
     use ogar_loco::LaneShape;
 
@@ -929,7 +990,7 @@ mod pong_runs {
         assert_eq!(scripts.len(), 3);
 
         // Script 0 — the ball moves.
-        let ball = lower_program(LaneShape::Pairs, &scripts[0]).expect("casts");
+        let ball = templates::cast(LaneShape::Pairs, &scripts[0]).expect("casts");
         let mut m = Machine::new(&ball.functions, 400);
         m.run().expect("the ball script runs");
         assert!(
@@ -940,7 +1001,7 @@ mod pong_runs {
         );
 
         // Script 1 — the paddle follows the mouse.
-        let paddle = lower_program(LaneShape::Pairs, &scripts[1]).expect("casts");
+        let paddle = templates::cast(LaneShape::Pairs, &scripts[1]).expect("casts");
         let mut p = Machine::new(&paddle.functions, 200);
         p.stage.mouse_y = 42.0;
         p.run().expect("the paddle script runs");
@@ -950,7 +1011,7 @@ mod pong_runs {
         );
 
         // Script 2 — scoring, and it must NOT score when nothing is touched.
-        let score = lower_program(LaneShape::Pairs, &scripts[2]).expect("casts");
+        let score = templates::cast(LaneShape::Pairs, &scripts[2]).expect("casts");
         let mut hit = Machine::new(&score.functions, 200);
         hit.stage.touching = true;
         hit.run().expect("the score script runs");
@@ -1016,7 +1077,6 @@ mod layout {
     /// holds, so this proves the emitted layout casts to the same program.
     #[test]
     fn the_assigned_layout_does_not_change_the_program() {
-        use blockly_abi::lower_program;
         use ogar_loco::LaneShape;
 
         let scripts = templates::raise_nodes(templates::PONG_NODES).expect("raises");
@@ -1024,8 +1084,8 @@ mod layout {
         let reread = super::from_workspace_json(&json).expect("parses");
 
         for (i, (a, b)) in scripts.iter().zip(reread.iter()).enumerate() {
-            let x = lower_program(LaneShape::Pairs, a).expect("casts");
-            let y = lower_program(LaneShape::Pairs, b).expect("casts");
+            let x = templates::cast(LaneShape::Pairs, a).expect("casts");
+            let y = templates::cast(LaneShape::Pairs, b).expect("casts");
             for (f, (p, q)) in x.functions.iter().zip(y.functions.iter()).enumerate() {
                 assert_eq!(
                     p.as_body_bytes(),
@@ -1040,7 +1100,6 @@ mod layout {
 #[cfg(test)]
 mod pong_scene {
     use super::templates;
-    use blockly_abi::lower_program;
     use blockly_run::{Scene, Stage};
     use ogar_loco::LaneShape;
 
@@ -1057,7 +1116,7 @@ mod pong_scene {
         let scripts = templates::raise_nodes(templates::PONG_NODES).expect("raises");
         let progs: Vec<_> = scripts
             .iter()
-            .map(|s| lower_program(LaneShape::Pairs, s).expect("casts"))
+            .map(|s| templates::cast(LaneShape::Pairs, s).expect("casts"))
             .collect();
         let bodies: Vec<&[ogar_loco::FunctionBody]> =
             progs.iter().map(|p| p.functions.as_slice()).collect();
@@ -1155,6 +1214,54 @@ mod pong_scene {
         );
     }
 
+    /// The touch targets are SPRITE NAMES resolved through the project basin:
+    /// the stored byte is a dynamic-tail index, the raise gives the name back,
+    /// and the static basin — which knows no sprites — refuses the same bytes.
+    #[test]
+    fn pong_touch_targets_are_project_menu_entries_not_numbers() {
+        use blockly_abi::menus;
+        let scripts = templates::raise_nodes(templates::PONG_NODES).expect("raises");
+        let touch = &scripts[0].next.as_ref().unwrap().statements[0].1; // forever body head
+        // Walk: movesteps -> bounce -> if(touching(menu))
+        let cond = &touch.next.as_ref().unwrap().next.as_ref().unwrap().inputs[0].1;
+        assert_eq!(cond.ty, "sensing_touchingobject");
+        let menu = &cond.inputs[0].1;
+        assert_eq!(menu.ty, "sensing_touchingobjectmenu");
+        assert_eq!(
+            menu.field("TOUCHINGOBJECTMENU"),
+            Some(&blockly_abi::FieldValue::Code("Paddle".into()))
+        );
+        // The byte is past the static prefix (which is empty for this menu).
+        let m = menus::menu_by_id(14).unwrap();
+        let idx = menus::encode_in(templates::project_basin(), m, "Paddle").unwrap();
+        assert!(usize::from(idx) > m.options.len());
+        assert_eq!(idx, 4, "_mouse_, _edge_, Ball, Paddle");
+        // Without the project the same nodes cannot be raised — the name is
+        // the project's, not the palette's.
+        let (_, nodes) = templates::ALL_NODES[0];
+        let strip = |b: &[u8]| -> Vec<ogar_loco::FunctionBody> {
+            use ogar_loco::node::NODE_BYTES;
+            let n = usize::from(b[0]);
+            let take = usize::from(b[1]) * NODE_BYTES;
+            b[1 + n..1 + n + take]
+                .chunks_exact(NODE_BYTES)
+                .map(|c| {
+                    blockly_abi::FunctionNode::from_le_bytes(
+                        c.try_into().unwrap(),
+                        ogar_loco::LaneShape::Pairs,
+                    )
+                    .body
+                })
+                .collect()
+        };
+        let ball = strip(nodes);
+        assert!(matches!(
+            blockly_abi::raise::raise_program(&ball),
+            Err(blockly_abi::raise::RaiseError::UnknownOption(_, 4))
+        ));
+        assert!(blockly_abi::raise::raise_program_in(&ball, templates::project_basin()).is_ok());
+    }
+
     /// Pong (keyboard edition): the paddle is driven by KEY_OPTION codebook
     /// indices — it climbs while `up arrow` is held, descends under `down
     /// arrow`, and does NOT move when no key is held. The menu shadow blocks
@@ -1164,7 +1271,7 @@ mod pong_scene {
         let scripts = templates::raise_nodes(templates::PONG_KEYS_NODES).expect("raises");
         let progs: Vec<_> = scripts
             .iter()
-            .map(|s| lower_program(LaneShape::Pairs, s).expect("casts"))
+            .map(|s| templates::cast(LaneShape::Pairs, s).expect("casts"))
             .collect();
         let bodies = || -> Vec<&[ogar_loco::FunctionBody]> {
             progs.iter().map(|p| p.functions.as_slice()).collect()

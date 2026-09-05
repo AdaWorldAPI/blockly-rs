@@ -59,10 +59,25 @@ use crate::{BlockRecord, CastError, call_for};
 /// [`CastError::ShapeTooNarrow`] when a call's body references cannot fit the
 /// shape's immediate width, and [`CastError::TooManyFunctions`] past 255.
 pub fn lower_program(shape: ogar_loco::LaneShape, top: &BlockRecord) -> Result<Program, CastError> {
+    lower_program_in(shape, top, crate::menus::static_basin())
+}
+
+/// [`lower_program`] against a project's own basin: dropdown codes a project
+/// interned after the static prefix (sprite / costume / sound names) encode
+/// to their table index instead of being refused.
+///
+/// # Errors
+///
+/// As [`lower_program`].
+pub fn lower_program_in(
+    shape: ogar_loco::LaneShape,
+    top: &BlockRecord,
+    basin: &ogar_loco::basin::BasinCodebooks,
+) -> Result<Program, CastError> {
     // The entry is reserved before the walk so that bodies discovered inside it
     // get indices 1.., and the entry keeps 0 no matter what order they appear.
     let mut functions: Vec<Option<FunctionBody>> = vec![None];
-    let entry = lower_chain_into(shape, top, &mut functions)?;
+    let entry = lower_chain_into(shape, top, &mut functions, basin)?;
     functions[0] = Some(entry);
     Ok(Program {
         functions: functions
@@ -77,11 +92,12 @@ fn lower_chain_into(
     shape: ogar_loco::LaneShape,
     block: &BlockRecord,
     functions: &mut Vec<Option<FunctionBody>>,
+    basin: &ogar_loco::basin::BasinCodebooks,
 ) -> Result<FunctionBody, CastError> {
     let mut body = FunctionBody::new(shape);
     let mut cursor = Some(block);
     while let Some(b) = cursor {
-        lower_block_into(shape, b, &mut body, functions)?;
+        lower_block_into(shape, b, &mut body, functions, basin)?;
         cursor = b.next.as_deref();
     }
     Ok(body)
@@ -95,12 +111,13 @@ fn lower_block_into(
     block: &BlockRecord,
     body: &mut FunctionBody,
     functions: &mut Vec<Option<FunctionBody>>,
+    basin: &ogar_loco::basin::BasinCodebooks,
 ) -> Result<(), CastError> {
     for (_, operand) in &block.inputs {
-        lower_block_into(shape, operand, body, functions)?;
+        lower_block_into(shape, operand, body, functions, basin)?;
     }
 
-    let mut call = call_for(block, None)?;
+    let mut call = call_for(block, None, basin)?;
 
     if !block.statements.is_empty() {
         let refs = shared_core::body_refs(call.function);
@@ -134,7 +151,7 @@ fn lower_block_into(
                 return Err(CastError::TooManyFunctions { count: idx });
             }
             functions.push(None);
-            let sub_body = lower_chain_into(shape, sub, functions)?;
+            let sub_body = lower_chain_into(shape, sub, functions, basin)?;
             functions[idx] = Some(sub_body);
             call.values[slot] = u8::try_from(idx).expect("bounded above");
         }
