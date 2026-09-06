@@ -1018,12 +1018,12 @@ mod pong_runs {
         let mut hit = Machine::new(&score.functions, 200);
         hit.stage.touching = true;
         hit.run().expect("the score script runs");
-        assert!(hit.stage.var(0) > 0.0, "touching the goal must score");
+        assert!(hit.stage.var_num(0) > 0.0, "touching the goal must score");
 
         let mut miss = Machine::new(&score.functions, 200);
         miss.stage.touching = false;
         miss.run().expect("runs");
-        assert_eq!(miss.stage.var(0), 0.0, "no goal, no score");
+        assert_eq!(miss.stage.var_num(0), 0.0, "no goal, no score");
     }
 }
 
