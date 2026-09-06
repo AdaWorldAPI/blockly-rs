@@ -281,8 +281,7 @@ mod tests {
     #[test]
     fn a_row_is_byte_identical_to_the_stored_node() {
         let prog = demo_program();
-        let rows =
-            ProgramRows::from_program(&prog, CLASSID).expect("lays out");
+        let rows = ProgramRows::from_program(&prog, CLASSID).expect("lays out");
         assert!(rows.len() > 1, "the demo must have branches to be a test");
 
         let bytes = rows.as_le_bytes();
@@ -303,8 +302,7 @@ mod tests {
     #[test]
     fn a_program_round_trips_through_rows() {
         let prog = demo_program();
-        let rows =
-            ProgramRows::from_program(&prog, CLASSID).expect("lays out");
+        let rows = ProgramRows::from_program(&prog, CLASSID).expect("lays out");
         let back: Vec<FunctionBody> = rows
             .rows()
             .iter()
@@ -323,8 +321,7 @@ mod tests {
     fn the_packet_borrows_the_rows_rather_than_materialising_them() {
         use lance_graph_contract::soa_envelope::SoaEnvelope;
         let prog = demo_program();
-        let rows =
-            ProgramRows::from_program(&prog, CLASSID).expect("lays out");
+        let rows = ProgramRows::from_program(&prog, CLASSID).expect("lays out");
         let packet = rows.packet(7);
         assert_eq!(packet.n_rows(), rows.len());
         assert_eq!(packet.cycle(), 7);
@@ -381,7 +378,10 @@ mod tests {
             ConceptDomain, classid_canon, classid_concept_domain, classid_custom, render_classid,
         };
         assert_eq!(CLASSID, 0x1717_1000);
-        assert_eq!(classid_canon(CLASSID), blockly_abi::palette::PALETTE_CONCEPT);
+        assert_eq!(
+            classid_canon(CLASSID),
+            blockly_abi::palette::PALETTE_CONCEPT
+        );
         assert_eq!(classid_custom(CLASSID), 0x1000, "the V3 generation marker");
         assert_eq!(classid_concept_domain(CLASSID), ConceptDomain::Blocks);
 
