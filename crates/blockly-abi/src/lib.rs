@@ -94,9 +94,9 @@ pub mod scratch;
 pub use codebook::{OpcodeMapping, resolve_opcode};
 pub use klickweg::{BlockAddress, address_of};
 pub use palette::{
-    BlocklyPalette, DEVICE_FAMILY_FLOOR, PALETTE_CONCEPT, plug_into, render_classid,
+    BlocklyPalette, DEVICE_FAMILY_FLOOR, PALETTE_CONCEPT, POOL_LOAD, plug_into, render_classid,
 };
-pub use program::{lower_program, lower_program_in};
+pub use program::{lower_program, lower_program_in, lower_program_with_pool};
 pub use projection::{ProjectionError, parse_text, render_text};
 pub use registry::registry;
 
@@ -341,8 +341,12 @@ pub enum CastError {
         /// The dropdown code that accompanied it, if any.
         code: Option<String>,
     },
-    /// A field value exceeds one immediate byte and needs the constant pool,
-    /// which is a named follow-up rather than a shipped surface.
+    /// A field value exceeds one immediate byte. A NUMBER needs the constant
+    /// pool — cast with [`lower_program_with_pool`] (or
+    /// [`lower_script_with_pool`]) to intern it. A non-numeric value on a
+    /// block that is not `text` is refused outright: strings live in a
+    /// codebook register only, and the one block that carries one (`text`)
+    /// goes through the `TEXT` codebook ([`menus::TEXT_MENU`]), not here.
     WideLiteral {
         /// The block whose field is too wide.
         ty: String,
@@ -512,20 +516,28 @@ pub fn lower_script(shape: LaneShape, top: &BlockRecord) -> Result<FunctionBody,
     Ok(body)
 }
 
-/// The classids under which wide literals are interned, plus the pool itself.
+/// The classid under which wide NUMERIC literals are interned, plus the pool
+/// itself.
 ///
-/// The classids are **parameters** rather than constants because minting them
+/// The pool holds numbers only. A string lives in one place in this stack —
+/// a codebook register — so a `text` block's field is an entry in the
+/// project's `TEXT` codebook ([`menus::TEXT_MENU`]) and never touches the
+/// pool; see [`CastError::WideLiteral`] for what a non-numeric wide field on
+/// any OTHER block gets.
+///
+/// The classid is a **parameter** rather than a constant because minting it
 /// is an operator decision with a ledger entry (OGAR `BLOCK-EDITOR-PLAN.md`
-/// D4). Until that mint lands, [`ogar_loco::pool::placeholder`] supplies deliberately
-/// invalid ids so a placeholder escaping into stored data is loud rather than
-/// plausible.
+/// D4). Until that mint lands, [`ogar_loco::pool::placeholder`] supplies a
+/// deliberately invalid id so a placeholder escaping into stored data is loud
+/// rather than plausible.
 #[derive(Debug, Clone)]
 pub struct LoweringContext {
-    /// The pool wide literals intern into.
+    /// The pool wide numeric literals intern into.
     pub pool: ConstantPool,
     /// Facet classid for an `f64` constant.
     pub f64_classid: u32,
-    /// Facet classid for an inline UTF-8 constant.
+    /// Facet classid for the register entries a project's TEXT codebook is
+    /// built with — kept beside the pool's so one context names both.
     pub utf8_classid: u32,
 }
 
@@ -583,6 +595,11 @@ fn lower_block(
     body: &mut FunctionBody,
     mut ctx: Option<&mut LoweringContext>,
 ) -> Result<(), CastError> {
+    // A Scratch list op names its list in a FIELD; the core pops it as an
+    // operand, so the handle is pushed first.
+    if let Some(handle) = list_handle_of(block) {
+        body.push(call_for(&handle, None, menus::static_basin())?)?;
+    }
     // Operands first — this IS the stack discipline, and it is Blockly's own
     // nesting rather than a convention imposed on it.
     for (_, operand) in &block.inputs {
@@ -591,6 +608,39 @@ fn lower_block(
     let call = call_for(block, ctx, menus::static_basin())?;
     body.push(call)?;
     Ok(())
+}
+
+/// Whether `f` is a shared-core list operation Scratch reaches through a
+/// `LIST` field — the ops whose first popped operand is the list handle.
+#[must_use]
+pub const fn is_list_op(f: FnIndex) -> bool {
+    matches!(
+        f,
+        FnIndex::LIST_LENGTH
+            | FnIndex::LIST_INDEX_OF
+            | FnIndex::LIST_GET
+            | FnIndex::LIST_SET
+            | FnIndex::LIST_INSERT
+            | FnIndex::LIST_ADD
+            | FnIndex::LIST_DELETE
+            | FnIndex::LIST_DELETE_ALL
+            | FnIndex::LIST_CONTAINS
+    )
+}
+
+/// For a Scratch list op carrying a `LIST` field: the `data_listcontents`
+/// leaf that pushes its handle — lowered BEFORE the op's operands, so the
+/// core pops the list first, exactly as its arity table counts it.
+pub(crate) fn list_handle_of(block: &BlockRecord) -> Option<BlockRecord> {
+    let mapping = scratch::resolve_scratch(&block.ty, None)?;
+    if !is_list_op(mapping.function) {
+        return None;
+    }
+    let list = block.field("LIST")?.clone();
+    Some(
+        BlockRecord::leaf("data_listcontents", format!("{}_list", block.id))
+            .with_field("LIST", list),
+    )
 }
 
 /// The single call one block lowers to — its function index plus its immediate.
@@ -615,7 +665,7 @@ pub(crate) fn call_for(
     // the SAME operation they resolve to the same byte, which is the point of
     // the shared core and is pinned by
     // `scratch::tests::blockly_and_scratch_lower_the_same_operation_to_the_same_byte`.
-    let mapping = codebook::resolve(&block.ty, code)
+    let mut mapping = codebook::resolve(&block.ty, code)
         .or_else(|| scratch::resolve_scratch(&block.ty, code))
         .ok_or_else(|| CastError::UnknownOpcode {
             ty: block.ty.clone(),
@@ -626,7 +676,15 @@ pub(crate) fn call_for(
     // chose WHICH function and is already spent; a ValueParam dropdown is an
     // ARGUMENT and becomes a byte, or the cast refuses.
     let mut values = [0u8; ogar_loco::MAX_VALUES_PER_CALL];
-    let mut n = 0usize;
+    // Immediates land AFTER the body-reference slots: `values[..refs]` is
+    // written by the program lowering with the statement bodies' function
+    // indices (the same carving `branches_of` reads), so a block that has
+    // both — `procedures_definition`, body ref + procedure index — must not
+    // have its field overwrite the reference. For every block with no body
+    // this is `n = 0`, unchanged.
+    let mut n = usize::from(ogar_loco::vocabulary::shared_core::body_refs(
+        mapping.function,
+    ));
     let mut push = |b: u8| -> Result<(), CastError> {
         // Silently dropping the overflow would emit a call that looks complete
         // and is not — the same failure the mutator guard above exists to stop.
@@ -642,6 +700,11 @@ pub(crate) fn call_for(
     };
 
     for (name, v) in &block.fields {
+        // A list op's LIST field was already spent as the pushed handle
+        // (`list_handle_of`); it is not an immediate of the op itself.
+        if name == "LIST" && is_list_op(mapping.function) {
+            continue;
+        }
         // A dropdown the menu table names is a CODEBOOK INDEX, whatever
         // shape the shim guessed for it: Scratch codes are lowercase
         // (`"up arrow"`, `"front"`) so the all-caps heuristic reads them as
@@ -681,19 +744,33 @@ pub(crate) fn call_for(
                     });
                 }
                 Some(cx) => {
-                    // A Blockly field is a string even when it denotes a
-                    // number, so the reading is decided HERE and named by the
-                    // facet classid — never by a tag byte inside the payload,
-                    // which would be a second schema under one classid.
-                    let idx = match text.parse::<f64>() {
-                        Ok(n) => cx.pool.intern_f64(cx.f64_classid, n),
-                        Err(_) => cx.pool.intern_str(cx.utf8_classid, text),
-                    }
-                    .map_err(|e| CastError::ConstantPool {
-                        ty: block.ty.clone(),
-                        value: text.clone(),
-                        source: e,
+                    // The pool is NUMBERS ONLY. A Blockly field is a string
+                    // even when it denotes a number, so the reading is
+                    // decided HERE: parses as f64 → interned under the f64
+                    // classid; anything else is a string, and strings live
+                    // in a codebook register, never in a body or a pool.
+                    // (`text` never reaches this arm — its field is a TEXT
+                    // register entry, intercepted with the menus above.)
+                    let Ok(n) = text.parse::<f64>() else {
+                        return Err(CastError::WideLiteral {
+                            ty: block.ty.clone(),
+                            value: text.clone(),
+                        });
+                    };
+                    let idx = cx.pool.intern_f64(cx.f64_classid, n).map_err(|e| {
+                        CastError::ConstantPool {
+                            ty: block.ty.clone(),
+                            value: text.clone(),
+                            source: e,
+                        }
                     })?;
+                    // A literal block becomes the POOL LOAD, not `NUMBER`
+                    // with a pool index in the value slot: `NUMBER` already
+                    // spends the slot as the value itself, so the same bytes
+                    // would read as a small literal.
+                    if mapping.function == FnIndex::NUMBER {
+                        mapping.function = palette::POOL_LOAD;
+                    }
                     push(idx)?;
                 }
             },
@@ -1345,29 +1422,51 @@ mod tests {
         assert_eq!(f(b), 1_000_000.0);
     }
 
+    /// A string is a REGISTER entry, never a pool constant: `text "hello"`
+    /// lowers to `TEXT` carrying the TEXT codebook index and leaves the pool
+    /// empty; against a basin that has not interned it, the cast refuses.
+    /// A numeric-looking `text` is still text — the block type, not the
+    /// value, chooses the register.
     #[test]
-    fn a_string_literal_takes_the_utf8_classid_not_the_f64_one() {
-        // The reading is decided at the cast and NAMED by the facet classid.
-        // A tag byte inside the payload would be a second schema under one
-        // classid, which is what "your classid defines the schema" forbids.
+    fn a_text_literal_is_a_register_entry_and_never_touches_the_pool() {
+        use ogar_loco::basin::BasinCodebooks;
         let script =
             BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide("hello".into()));
         let mut ctx = LoweringContext::placeholder();
-        let body = lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx).unwrap();
-        let idx = raise_calls(&body)[0].values[0];
-        let c = ctx.pool.resolve(idx).unwrap();
-        assert_eq!(c.classid, ogar_loco::pool::placeholder::CONST_UTF8_INLINE);
-        assert_eq!(&c.bytes[..5], b"hello");
+        // Static basin: nothing interned, refused by name.
+        assert!(matches!(
+            lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx),
+            Err(CastError::UnencodedValueParam { ref code, .. }) if code == "hello"
+        ));
+        assert!(ctx.pool.is_empty(), "a refused text must not land anywhere");
 
-        // Two-sided: a numeric-looking string still goes to the f64 side, so
-        // the classid is chosen by the VALUE and not by the block type.
-        let n = BlockRecord::leaf("text", "t2").with_field("TEXT", FieldValue::Wide("42".into()));
-        let body2 = lower_script_with_pool(LaneShape::Pairs, &n, &mut ctx).unwrap();
-        let idx2 = raise_calls(&body2)[0].values[0];
+        let mut basin = BasinCodebooks::new();
+        let m = menus::menu_by_id(menus::TEXT_MENU).unwrap();
+        let mut b = menus::builder(m, ctx.utf8_classid, menus::PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        b.intern(ctx.utf8_classid, b"hello").unwrap();
+        b.intern(ctx.utf8_classid, b"42").unwrap();
+        basin.plug(b.seal()).unwrap();
+
+        let prog =
+            program::lower_program_with_pool(LaneShape::Pairs, &script, &basin, &mut ctx).unwrap();
+        let call = raise_calls(prog.entry())[0].clone();
         assert_eq!(
-            ctx.pool.resolve(idx2).unwrap().classid,
-            ogar_loco::pool::placeholder::CONST_F64
+            call.function,
+            FnIndex::TEXT,
+            "a text is TEXT, never a pool load"
         );
+        assert_eq!(
+            call.values[0],
+            menus::encode_in(&basin, m, "hello").unwrap()
+        );
+        assert!(ctx.pool.is_empty(), "the pool holds numbers only");
+
+        // Numeric-looking text is still a register entry, not an f64.
+        let n = BlockRecord::leaf("text", "t2").with_field("TEXT", FieldValue::Wide("42".into()));
+        let prog2 =
+            program::lower_program_with_pool(LaneShape::Pairs, &n, &basin, &mut ctx).unwrap();
+        assert_eq!(raise_calls(prog2.entry())[0].function, FnIndex::TEXT);
+        assert!(ctx.pool.is_empty());
     }
 
     #[test]
@@ -1394,29 +1493,26 @@ mod tests {
         assert_eq!(calls[0].values[0], calls[1].values[0]);
     }
 
+    /// A non-numeric wide field on a block that is NOT `text` has nowhere to
+    /// go — the pool is numbers only and only `text` owns a register — so it
+    /// is refused as `WideLiteral` even with a pool, and the pool stays
+    /// empty. Numbers still intern, so the guard discriminates.
     #[test]
-    fn an_oversized_literal_is_refused_by_the_cast_too() {
-        // The refusal survives the pool: a literal wider than a facet does not
-        // silently truncate, which would be worse than today's WideLiteral
-        // error because it would look like success.
-        let long = "x".repeat(13);
-        let script = BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide(long));
+    fn a_non_numeric_wide_field_on_a_non_text_block_is_refused_even_with_a_pool() {
+        let script = BlockRecord::leaf("math_number", "n")
+            .with_field("NUM", FieldValue::Wide("twelve".into()));
         let mut ctx = LoweringContext::placeholder();
         assert!(matches!(
             lower_script_with_pool(LaneShape::Pairs, &script, &mut ctx),
-            Err(CastError::ConstantPool {
-                source: PoolError::TooWide { needed: 13 },
-                ..
-            })
+            Err(CastError::WideLiteral { ref value, .. }) if value == "twelve"
         ));
         assert!(
             ctx.pool.is_empty(),
             "the refused literal must not have landed"
         );
-        // Twelve still fits, so the guard discriminates rather than refusing
-        // every string.
-        let ok =
-            BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide("x".repeat(12)));
+        let ok = BlockRecord::leaf("math_number", "n")
+            .with_field("NUM", FieldValue::Wide("1000000".into()));
         assert!(lower_script_with_pool(LaneShape::Pairs, &ok, &mut ctx).is_ok());
+        assert_eq!(ctx.pool.len(), 1);
     }
 }

@@ -275,7 +275,50 @@ pub const SCRATCH_MENUS: &[Menu] = &[
         name: "CLONE_OF",
         options: &[],
     },
+    // Variable and list dropdowns (`field_variable` in the source): names a
+    // project declares, unique per scope, so the name is the identity.
+    Menu {
+        id: 25,
+        name: "VARIABLE",
+        options: &[],
+    },
+    Menu {
+        id: 26,
+        name: "LIST",
+        options: &[],
+    },
+    // `sensing_of`'s PROPERTY: the sprite/stage attributes plus the target's
+    // variables. scratch-blocks builds this list at runtime (GUI side), so
+    // it is registered empty here; a project interns the attribute names it
+    // uses — observed in real project files, never copied from AGPL code.
+    Menu {
+        id: 27,
+        name: "OF_PROPERTY",
+        options: &[],
+    },
+    // Custom blocks: a target's procedure signatures (`proccode`, e.g.
+    // `"walk %n steps"`). A definition and every call of it carry the SAME
+    // index, which is how a call finds its body at run time.
+    Menu {
+        id: 28,
+        name: "PROCEDURE",
+        options: &[],
+    },
+    // Text literals. A string lives in exactly ONE place in this stack: a
+    // codebook register. A `text` block's field is therefore an entry in
+    // the project's TEXT codebook, indexed like any dropdown — never a byte
+    // string in a body, never a UTF-8 constant beside one. The constant
+    // pool carries numbers only. Names wider than a facet intern as
+    // digests, the same posture as a long sprite name.
+    Menu {
+        id: TEXT_MENU,
+        name: "TEXT",
+        options: &[],
+    },
 ];
+
+/// The id of the `TEXT` literal codebook (menu 29).
+pub const TEXT_MENU: u8 = 29;
 
 /// Blocks carrying an INLINE dropdown: `(block type, field name, menu id)`.
 ///
@@ -297,6 +340,41 @@ pub const MENU_FIELDS: &[(&str, &str, u8)] = &[
     ("sensing_current", "CURRENTMENU", 10),
     ("event_whengreaterthan", "WHENGREATERTHANMENU", 11),
     ("control_stop", "STOP_OPTION", 12),
+    // Variable / list dropdowns. All shared-core bytes, so — like STOP — the
+    // substrate declares no codebook for them; the palette table is the
+    // authority, and the interpreter indexes its variable store by the byte.
+    ("data_variable", "VARIABLE", 25),
+    ("data_setvariableto", "VARIABLE", 25),
+    ("data_changevariableby", "VARIABLE", 25),
+    ("data_showvariable", "VARIABLE", 25),
+    ("data_hidevariable", "VARIABLE", 25),
+    ("data_listcontents", "LIST", 26),
+    ("data_addtolist", "LIST", 26),
+    ("data_deleteoflist", "LIST", 26),
+    ("data_deletealloflist", "LIST", 26),
+    ("data_insertatlist", "LIST", 26),
+    ("data_replaceitemoflist", "LIST", 26),
+    ("data_itemoflist", "LIST", 26),
+    ("data_itemnumoflist", "LIST", 26),
+    ("data_lengthoflist", "LIST", 26),
+    ("data_listcontainsitem", "LIST", 26),
+    ("data_showlist", "LIST", 26),
+    ("data_hidelist", "LIST", 26),
+    // Three inline dropdowns whose option sets are the PROJECT's, found by
+    // measuring cast coverage on real projects (`sb3_coverage`): a
+    // `field_variable` of broadcast type, the backdrop list, and
+    // `sensing_of`'s attribute list.
+    ("event_whenbroadcastreceived", "BROADCAST_OPTION", 23),
+    ("event_whenbackdropswitchesto", "BACKDROP", 21),
+    ("sensing_of", "PROPERTY", 27),
+    // Custom blocks. `PROC_DEF` carries its body as a reference in the first
+    // immediate, so the procedure index sits AFTER it (values[1]) — which is
+    // why a definition needs the Triples shape, as `if/else` does. A call's
+    // second field, `ARGC`, is a plain byte, not a menu.
+    ("procedures_definition", "PROCCODE", 28),
+    ("procedures_call", "PROCCODE", 28),
+    // The literal `text` block: its field is a TEXT register entry.
+    ("text", "TEXT", TEXT_MENU),
 ];
 
 /// Menu SHADOW blocks — a dropdown that arrives as a nested reporter:
@@ -397,6 +475,12 @@ fn entry_code(entry: &ogar_loco::pool::Constant) -> Option<String> {
 /// after the static prefix (a sprite name) resolves to its table index.
 #[must_use]
 pub fn encode_in(basin: &BasinCodebooks, menu: &Menu, code: &str) -> Option<u8> {
+    // An EMPTY selection is the zero-fallback, by construction: Scratch
+    // saves an unset costume / sound menu as `""`, and `0` means "no option"
+    // on every codebook. The raise gives `""` back for a `0`.
+    if code.is_empty() {
+        return Some(0);
+    }
     if let Some(i) = encode(menu, code) {
         return Some(i);
     }
@@ -404,7 +488,21 @@ pub fn encode_in(basin: &BasinCodebooks, menu: &Menu, code: &str) -> Option<u8> 
     let first_dynamic = menu.options.len() + 1;
     (first_dynamic..=book.len())
         .filter_map(|i| u8::try_from(i).ok())
-        .find(|&i| book.resolve(i).and_then(entry_code).as_deref() == Some(code))
+        .find(|&i| book.resolve(i).is_some_and(|e| entry_matches(e, code)))
+}
+
+/// Whether an entry was interned FROM this code — either as its UTF-8 bytes
+/// (a code that fits a facet) or as its FNV-1a digest (a wider one, the same
+/// rule [`builder`] applies). Matching the digest is what lets a sprite
+/// named longer than 12 bytes still cast; the raise cannot recover such a
+/// name from the table alone and refuses, which is measured, not hidden.
+fn entry_matches(entry: &ogar_loco::pool::Constant, code: &str) -> bool {
+    if code.len() <= CONSTANT_BYTES {
+        entry.bytes[..code.len()] == *code.as_bytes()
+            && entry.bytes[code.len()..].iter().all(|&b| b == 0)
+    } else {
+        entry.bytes[..8] == digest(code).to_le_bytes() && entry.bytes[8..].iter().all(|&b| b == 0)
+    }
 }
 
 /// [`decode`], then the basin's dynamic tail.
@@ -689,6 +787,29 @@ mod tests {
         assert_eq!(options_in(&basin, goto), vec!["Ball", "Paddle"]);
         assert_eq!(options_in(&basin, keys).len(), 43);
         assert_eq!(options_in(static_basin(), goto), Vec::<String>::new());
+
+        // A name wider than a facet is interned as its digest: it still
+        // ENCODES (the cast works), but the raise cannot read the name back
+        // from the table and refuses rather than inventing one.
+        let long = "Pseudorandom Cycle";
+        assert!(long.len() > CONSTANT_BYTES);
+        let mut w = builder(goto, CONST_UTF8_INLINE, PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        let idx = w
+            .intern(PLACEHOLDER_DIGEST_CLASSID, &digest(long).to_le_bytes())
+            .unwrap();
+        let mut wide = BasinCodebooks::new();
+        wide.plug(w.seal()).unwrap();
+        assert_eq!(encode_in(&wide, goto, long), Some(idx));
+        assert_eq!(decode_in(&wide, goto, idx), None, "a digest is not a name");
+        // Anti-vacuity: a different long name does not match the same digest
+        // entry, and a short prefix of the long name does not either.
+        assert_eq!(encode_in(&wide, goto, "Pseudorandom Cycles"), None);
+        assert_eq!(encode_in(&wide, goto, "Pseudorandom"), None);
+        // The empty selection is index 0 on ANY menu, static or dynamic, and
+        // is never a real entry: decoding 0 yields no option.
+        assert_eq!(encode_in(&wide, goto, ""), Some(0));
+        assert_eq!(encode_in(static_basin(), keys, ""), Some(0));
+        assert_eq!(decode_in(&wide, goto, 0), None);
     }
 
     #[test]

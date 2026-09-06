@@ -39,7 +39,7 @@ use ogar_loco::FunctionBody;
 use ogar_loco::Program;
 use ogar_loco::vocabulary::shared_core;
 
-use crate::{BlockRecord, CastError, call_for};
+use crate::{BlockRecord, CastError, LoweringContext, call_for};
 
 /// Cast a script — including its control flow — into a program.
 ///
@@ -74,10 +74,45 @@ pub fn lower_program_in(
     top: &BlockRecord,
     basin: &ogar_loco::basin::BasinCodebooks,
 ) -> Result<Program, CastError> {
+    lower_program_inner(shape, top, basin, None)
+}
+
+/// [`lower_program_in`] with a constant pool: a literal wider than one byte
+/// is interned into `ctx.pool` and the block lowers to
+/// [`POOL_LOAD`](crate::POOL_LOAD) carrying the pool index, instead of being
+/// refused as [`CastError::WideLiteral`].
+///
+/// A program with no wide literal produces **byte-identical** bodies and
+/// leaves the pool untouched, so this is a strict widening. The pool is the
+/// caller's and outlives the call: one context per sprite is the unit the
+/// runtime expects ([`Scene::with_pool`](../blockly_run/struct.Scene.html)
+/// takes ONE pool for every script it schedules), so cast a sprite's scripts
+/// against one context, not one context per script.
+///
+/// # Errors
+///
+/// As [`lower_program_in`], plus [`CastError::ConstantPool`] when a literal
+/// is wider than a facet or the pool is full (255 constants). The remedy for
+/// a full pool is a split, never a wider index.
+pub fn lower_program_with_pool(
+    shape: ogar_loco::LaneShape,
+    top: &BlockRecord,
+    basin: &ogar_loco::basin::BasinCodebooks,
+    ctx: &mut LoweringContext,
+) -> Result<Program, CastError> {
+    lower_program_inner(shape, top, basin, Some(ctx))
+}
+
+fn lower_program_inner(
+    shape: ogar_loco::LaneShape,
+    top: &BlockRecord,
+    basin: &ogar_loco::basin::BasinCodebooks,
+    ctx: Option<&mut LoweringContext>,
+) -> Result<Program, CastError> {
     // The entry is reserved before the walk so that bodies discovered inside it
     // get indices 1.., and the entry keeps 0 no matter what order they appear.
     let mut functions: Vec<Option<FunctionBody>> = vec![None];
-    let entry = lower_chain_into(shape, top, &mut functions, basin)?;
+    let entry = lower_chain_into(shape, top, &mut functions, basin, ctx)?;
     functions[0] = Some(entry);
     Ok(Program {
         functions: functions
@@ -93,11 +128,12 @@ fn lower_chain_into(
     block: &BlockRecord,
     functions: &mut Vec<Option<FunctionBody>>,
     basin: &ogar_loco::basin::BasinCodebooks,
+    mut ctx: Option<&mut LoweringContext>,
 ) -> Result<FunctionBody, CastError> {
     let mut body = FunctionBody::new(shape);
     let mut cursor = Some(block);
     while let Some(b) = cursor {
-        lower_block_into(shape, b, &mut body, functions, basin)?;
+        lower_block_into(shape, b, &mut body, functions, basin, ctx.as_deref_mut())?;
         cursor = b.next.as_deref();
     }
     Ok(body)
@@ -112,12 +148,17 @@ fn lower_block_into(
     body: &mut FunctionBody,
     functions: &mut Vec<Option<FunctionBody>>,
     basin: &ogar_loco::basin::BasinCodebooks,
+    mut ctx: Option<&mut LoweringContext>,
 ) -> Result<(), CastError> {
+    // The list handle first — see `lower_block` / `list_handle_of`.
+    if let Some(handle) = crate::list_handle_of(block) {
+        body.push(call_for(&handle, None, basin)?)?;
+    }
     for (_, operand) in &block.inputs {
-        lower_block_into(shape, operand, body, functions, basin)?;
+        lower_block_into(shape, operand, body, functions, basin, ctx.as_deref_mut())?;
     }
 
-    let mut call = call_for(block, None, basin)?;
+    let mut call = call_for(block, ctx.as_deref_mut(), basin)?;
 
     if !block.statements.is_empty() {
         let refs = shared_core::body_refs(call.function);
@@ -151,7 +192,7 @@ fn lower_block_into(
                 return Err(CastError::TooManyFunctions { count: idx });
             }
             functions.push(None);
-            let sub_body = lower_chain_into(shape, sub, functions, basin)?;
+            let sub_body = lower_chain_into(shape, sub, functions, basin, ctx.as_deref_mut())?;
             functions[idx] = Some(sub_body);
             call.values[slot] = u8::try_from(idx).expect("bounded above");
         }

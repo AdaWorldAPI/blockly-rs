@@ -151,7 +151,12 @@ async fn api_scratch_defs() -> Json<serde_json::Value> {
             // options. The page shows `[label, code]` pairs whose code is what
             // the cast turns into a codebook index; a dynamic menu whose
             // project interned nothing is offered empty.
-            if let Some((field, menu)) = blockly_abi::menus::menu_for_block(ty) {
+            // The `text` literal is a register entry too, but it is typed,
+            // not picked — the page keeps it a text field; the cast interns
+            // what was typed into the project's TEXT codebook.
+            if let Some((field, menu)) = blockly_abi::menus::menu_for_block(ty)
+                && menu.id != blockly_abi::menus::TEXT_MENU
+            {
                 // Static prefix plus the demo project's interned tail (sprite
                 // names) — the same basin the cast resolves against.
                 let options: Vec<_> =

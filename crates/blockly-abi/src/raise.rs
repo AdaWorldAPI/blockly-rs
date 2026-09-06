@@ -30,7 +30,7 @@
 
 use crate::{BlockRecord, FieldValue};
 use ogar_loco::vocabulary::shared_core;
-use ogar_loco::{FnIndex, FunctionBody};
+use ogar_loco::{ConstantPool, FnIndex, FunctionBody};
 
 /// Why a stored program could not be raised back to blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +47,10 @@ pub enum RaiseError {
     /// A menu-bearing function carries an index outside the menu's static
     /// prefix — a project-interned entry this raise has no table for.
     UnknownOption(u8, u8),
+    /// A [`POOL_LOAD`](crate::POOL_LOAD) names a constant the pool does not
+    /// hold — or no pool was supplied at all. Refused rather than raised as
+    /// the bare index: `1000000` and "constant #3" are not the same block.
+    MissingConstant(u8),
 }
 
 impl core::fmt::Display for RaiseError {
@@ -56,6 +60,7 @@ impl core::fmt::Display for RaiseError {
             Self::Uncovered(b) => write!(f, "function {b:#04x} has no covered arity"),
             Self::StackUnderflow(b) => write!(f, "function {b:#04x} wanted absent operands"),
             Self::DanglingReference(i) => write!(f, "body reference {i} names no function"),
+            Self::MissingConstant(i) => write!(f, "constant {i} is not in the pool"),
             Self::UnknownOption(b, i) => {
                 write!(
                     f,
@@ -89,6 +94,8 @@ pub fn block_for(f: FnIndex) -> Option<(&'static str, Option<&'static str>)> {
     // Literals and the few shapes Scratch reaches through a Blockly block.
     match f {
         FnIndex::NUMBER => Some(("math_number", None)),
+        // Its immediate is a TEXT register index, decoded like any dropdown.
+        FnIndex::TEXT => Some(("text", None)),
         _ => None,
     }
 }
@@ -102,6 +109,16 @@ pub fn block_for(f: FnIndex) -> Option<(&'static str, Option<&'static str>)> {
 #[must_use]
 pub fn pushes(f: FnIndex) -> bool {
     use crate::scratch::Shape;
+    // Custom blocks: an argument reporter is a leaf value; a call and a
+    // definition are statements. Stated here because the shared core marks
+    // `PROC_CALL` variadic and leaves its push answer to the vocabulary.
+    match f {
+        FnIndex::PROC_ARG => return true,
+        FnIndex::PROC_CALL | FnIndex::PROC_DEF => return false,
+        // The pool load is a leaf value, like the literal it stands for.
+        crate::POOL_LOAD => return true,
+        _ => {}
+    }
     if let Some((name, ..)) = crate::scratch::device_by_byte(f.0) {
         return crate::scratch::SCRATCH_BLOCK_DEFS
             .iter()
@@ -137,6 +154,26 @@ pub fn raise_body_in(
     index: usize,
     basin: &ogar_loco::basin::BasinCodebooks,
 ) -> Result<Option<BlockRecord>, RaiseError> {
+    raise_body_pooled(functions, index, basin, None)
+}
+
+/// [`raise_body_in`] with the program's constant pool, so a
+/// [`POOL_LOAD`](crate::POOL_LOAD) raises back to the literal block it came
+/// from: an `f64` constant to `math_number` (`NUM` as [`FieldValue::Wide`]),
+/// a UTF-8 constant to `text` (`TEXT` as `Wide`) — the same records the sb3
+/// reader and the editor produce, so the round trip re-lowers byte-identical
+/// with an identical pool.
+///
+/// # Errors
+///
+/// See [`RaiseError`]; [`RaiseError::MissingConstant`] when a load names an
+/// index the pool does not hold, or `pool` is `None` and the body has a load.
+pub fn raise_body_pooled(
+    functions: &[FunctionBody],
+    index: usize,
+    basin: &ogar_loco::basin::BasinCodebooks,
+    pool: Option<&ConstantPool>,
+) -> Result<Option<BlockRecord>, RaiseError> {
     let body = functions
         .get(index)
         .ok_or(RaiseError::DanglingReference(index as u8))?;
@@ -146,14 +183,48 @@ pub fn raise_body_in(
 
     for (ci, call) in crate::raise_calls(body).iter().enumerate() {
         let f = call.function;
+
+        // A pool load is the NUMBER it stands for — the pool holds numbers
+        // only (strings are register entries, raised through the TEXT menu
+        // like any dropdown), so any other classid is refused.
+        if f == crate::POOL_LOAD {
+            let idx = call.values.first().copied().unwrap_or(0);
+            let c = pool
+                .and_then(|p| p.resolve(idx))
+                .ok_or(RaiseError::MissingConstant(idx))?;
+            if c.classid != ogar_loco::pool::placeholder::CONST_F64 {
+                return Err(RaiseError::MissingConstant(idx));
+            }
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&c.bytes[..8]);
+            let text = f64::from_le_bytes(le).to_string();
+            stack.push(BlockRecord {
+                ty: "math_number".to_string(),
+                id: format!("r{index}_{ci}"),
+                fields: vec![("NUM".to_string(), FieldValue::Wide(text))],
+                inputs: Vec::new(),
+                statements: Vec::new(),
+                next: None,
+                extra_state: None,
+                disabled: false,
+            });
+            continue;
+        }
+
         let (ty, code) = block_for(f).ok_or(RaiseError::UnknownFunction(f.0))?;
 
         let refs = usize::from(shared_core::body_refs(f));
-        let arity = usize::from(
-            shared_core::stack_arity(f)
-                .or_else(|| crate::scratch::device_by_byte(f.0).map(|(_, a, _)| a))
-                .ok_or(RaiseError::Uncovered(f.0))?,
-        );
+        // A custom-block call is variadic: its arity is the call's OWN second
+        // immediate (`ARGC`), which is why the shared core refuses to table it.
+        let arity = if f == FnIndex::PROC_CALL {
+            usize::from(call.values.get(1).copied().unwrap_or(0))
+        } else {
+            usize::from(
+                shared_core::stack_arity(f)
+                    .or_else(|| crate::scratch::device_by_byte(f.0).map(|(_, a, _)| a))
+                    .ok_or(RaiseError::Uncovered(f.0))?,
+            )
+        };
 
         if stack.len() < arity {
             return Err(RaiseError::StackUnderflow(f.0));
@@ -166,6 +237,22 @@ pub fn raise_body_in(
             .iter()
             .find(|&&(t, ..)| t == ty)
             .map_or((&[][..], &[][..]), |&(_, _, _, v, s)| (v, s));
+
+        // A list op's first operand is the handle `data_listcontents` pushed
+        // for its LIST field; fold it back into the field so the raised block
+        // is the block the user dragged, not the core's operand shape.
+        let mut fields: Vec<(String, FieldValue)> = Vec::new();
+        let mut operands = operands;
+        if crate::is_list_op(f)
+            && operands
+                .first()
+                .is_some_and(|o| o.ty == "data_listcontents")
+        {
+            let handle = operands.remove(0);
+            if let Some(list) = handle.field("LIST") {
+                fields.push(("LIST".to_string(), list.clone()));
+            }
+        }
 
         // Value operands and statement bodies go into SEPARATE fields —
         // `BlockRecord` keeps the two-quantity split in the type itself, and
@@ -186,12 +273,11 @@ pub fn raise_body_in(
             let name = stmt_names
                 .get(r)
                 .map_or_else(|| format!("S{r}"), |n| (*n).to_string());
-            if let Some(sub) = raise_body_in(functions, target, basin)? {
+            if let Some(sub) = raise_body_pooled(functions, target, basin, pool)? {
                 statements.push((name, sub));
             }
         }
 
-        let mut fields: Vec<(String, FieldValue)> = Vec::new();
         if let Some(c) = code {
             fields.push(("OP".to_string(), FieldValue::Code(c.to_string())));
         }
@@ -200,14 +286,33 @@ pub fn raise_body_in(
             let n = call.values.get(refs).copied().unwrap_or(0);
             fields.push(("NUM".to_string(), FieldValue::Byte(n)));
         }
+        // An argument reporter's immediate is its POSITION in the enclosing
+        // definition's argument list; the name lives with the definition.
+        if f == FnIndex::PROC_ARG {
+            let n = call.values.first().copied().unwrap_or(0);
+            fields.push(("VALUE".to_string(), FieldValue::Byte(n)));
+        }
         // A dropdown rides in the same slot, as a codebook index. Decoded
         // through the static prefix; a byte past it is a project's own entry
         // (a sprite name the palette cannot know) and is refused, not guessed.
-        if let Some((field, menu)) = crate::menus::menu_for_block(ty) {
+        if let Some((field, menu)) = crate::menus::menu_for_block(ty)
+            && !crate::is_list_op(f)
+        {
             let b = call.values.get(refs).copied().unwrap_or(0);
-            let code =
-                crate::menus::decode_in(basin, menu, b).ok_or(RaiseError::UnknownOption(f.0, b))?;
+            // `0` is the empty selection (an unset menu, or a template's
+            // unnamed variable), not an unknown option: it raises as `""`,
+            // which the cast encodes back to `0`.
+            let code = if b == 0 {
+                String::new()
+            } else {
+                crate::menus::decode_in(basin, menu, b).ok_or(RaiseError::UnknownOption(f.0, b))?
+            };
             fields.push((field.to_string(), FieldValue::Code(code)));
+        }
+        // …and a call's declared argument count, the byte after its index.
+        if f == FnIndex::PROC_CALL {
+            let argc = call.values.get(1).copied().unwrap_or(0);
+            fields.push(("ARGC".to_string(), FieldValue::Byte(argc)));
         }
 
         let record = BlockRecord {
@@ -272,6 +377,20 @@ pub fn raise_program_in(
     basin: &ogar_loco::basin::BasinCodebooks,
 ) -> Result<Option<BlockRecord>, RaiseError> {
     raise_body_in(functions, 0, basin)
+}
+
+/// [`raise_program_in`] with the program's constant pool — see
+/// [`raise_body_pooled`].
+///
+/// # Errors
+///
+/// See [`RaiseError`].
+pub fn raise_program_pooled(
+    functions: &[FunctionBody],
+    basin: &ogar_loco::basin::BasinCodebooks,
+    pool: &ConstantPool,
+) -> Result<Option<BlockRecord>, RaiseError> {
+    raise_body_pooled(functions, 0, basin, Some(pool))
 }
 
 #[cfg(test)]
@@ -457,6 +576,95 @@ mod tests {
         ));
     }
 
+    /// A custom block round-trips: the definition's body is a referenced
+    /// function, its procedure index sits AFTER the reference, the call's
+    /// arity is its own second immediate, and the argument reporter is a
+    /// position. All three would silently drift under Pairs or with the
+    /// field written over the reference slot — the re-lowered bytes catch it.
+    #[test]
+    fn a_custom_block_definition_and_call_round_trip() {
+        use crate::menus;
+        use ogar_loco::basin::BasinCodebooks;
+        let procs = menus::SCRATCH_MENUS
+            .iter()
+            .find(|m| m.name == "PROCEDURE")
+            .unwrap();
+        let mut b = menus::builder(
+            procs,
+            ogar_loco::pool::placeholder::CONST_UTF8_INLINE,
+            menus::PLACEHOLDER_DIGEST_CLASSID,
+        )
+        .unwrap();
+        let walk = b
+            .intern(ogar_loco::pool::placeholder::CONST_UTF8_INLINE, b"walk %n")
+            .unwrap();
+        let mut basin = BasinCodebooks::new();
+        basin.plug(b.seal()).unwrap();
+
+        let rec = |ty: &str, id: &str| crate::BlockRecord {
+            ty: ty.into(),
+            id: id.into(),
+            fields: vec![],
+            inputs: vec![],
+            statements: vec![],
+            next: None,
+            extra_state: None,
+            disabled: false,
+        };
+        // define walk %n: change x by (n)
+        let mut arg = rec("argument_reporter_string_number", "arg");
+        arg.fields
+            .push(("VALUE".into(), crate::FieldValue::Byte(0)));
+        let mut body = rec("motion_changexby", "dx");
+        body.inputs.push(("DX".into(), arg));
+        let mut def = rec("procedures_definition", "def");
+        def.fields
+            .push(("PROCCODE".into(), crate::FieldValue::Code("walk %n".into())));
+        def.statements.push(("SUBSTACK".into(), body));
+        // call walk(7)
+        let mut seven = rec("math_number", "n7");
+        seven
+            .fields
+            .push(("NUM".into(), crate::FieldValue::Byte(7)));
+        let mut call = rec("procedures_call", "call");
+        call.fields
+            .push(("PROCCODE".into(), crate::FieldValue::Code("walk %n".into())));
+        call.fields
+            .push(("ARGC".into(), crate::FieldValue::Byte(1)));
+        call.inputs.push(("input0".into(), seven));
+        let mut hat = rec("event_whenflagclicked", "hat");
+        hat.next = Some(Box::new(call));
+
+        for script in [&def, &hat] {
+            let original =
+                crate::lower_program_in(LaneShape::Triples, script, &basin).expect("casts");
+            let raised = raise_program_in(&original.functions, &basin)
+                .expect("raises")
+                .expect("non-empty");
+            let again =
+                crate::lower_program_in(LaneShape::Triples, &raised, &basin).expect("re-casts");
+            assert_eq!(original.functions.len(), again.functions.len());
+            for (a, b) in original.functions.iter().zip(again.functions.iter()) {
+                assert_eq!(a.as_body_bytes(), b.as_body_bytes(), "{}", script.ty);
+            }
+        }
+        // The bytes mean what the design says: body ref FIRST, index second.
+        let d = crate::lower_program_in(LaneShape::Triples, &def, &basin).unwrap();
+        let head = crate::raise_calls(&d.functions[0])[0].clone();
+        assert_eq!(head.function, FnIndex::PROC_DEF);
+        assert_eq!(head.values[0], 1, "body is function 1");
+        assert_eq!(head.values[1], walk, "procedure index after the reference");
+        let c = crate::lower_program_in(LaneShape::Triples, &hat, &basin).unwrap();
+        let calls = crate::raise_calls(&c.functions[0]);
+        let pc = calls
+            .iter()
+            .find(|c| c.function == FnIndex::PROC_CALL)
+            .unwrap();
+        assert_eq!((pc.values[0], pc.values[1]), (walk, 1));
+        // Under Pairs the definition cannot carry both and is refused.
+        assert!(crate::lower_program_in(LaneShape::Pairs, &def, &basin).is_err());
+    }
+
     /// The raise refuses rather than inventing a block.
     #[test]
     fn an_unnamed_function_is_refused_not_guessed() {
@@ -477,5 +685,128 @@ mod tests {
             block_for(FnIndex(0x90)).map(|(t, _)| t),
             Some("motion_movesteps")
         );
+    }
+
+    /// A wide literal round-trips THROUGH THE POOL: raise with the pool,
+    /// re-lower against a fresh context, and both the bodies and the pool
+    /// come back identical. Without the pool the raise refuses rather than
+    /// handing back the bare index as a number.
+    #[test]
+    fn a_pooled_literal_raises_to_its_literal_and_re_lowers_identically() {
+        use crate::{LoweringContext, lower_program_with_pool};
+        let script = BlockRecord::leaf("motion_setx", "s")
+            .with_input(
+                "X",
+                BlockRecord::leaf("math_number", "n")
+                    .with_field("NUM", FieldValue::Wide("1000000".into())),
+            )
+            .with_next(BlockRecord::leaf("looks_say", "say").with_input(
+                "MESSAGE",
+                BlockRecord::leaf("text", "t").with_field("TEXT", FieldValue::Wide("hello".into())),
+            ));
+        // The number goes to the pool; the string is a TEXT REGISTER entry.
+        let mut basin = ogar_loco::basin::BasinCodebooks::new();
+        let m = crate::menus::menu_by_id(crate::menus::TEXT_MENU).unwrap();
+        let utf8 = ogar_loco::pool::placeholder::CONST_UTF8_INLINE;
+        let mut b =
+            crate::menus::builder(m, utf8, crate::menus::PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        b.intern(utf8, b"hello").unwrap();
+        basin.plug(b.seal()).unwrap();
+        let basin = &basin;
+        let mut ctx = LoweringContext::placeholder();
+        let prog = lower_program_with_pool(LaneShape::Pairs, &script, basin, &mut ctx).unwrap();
+        assert_eq!(ctx.pool.len(), 1, "numbers only in the pool");
+        let calls = crate::raise_calls(prog.entry());
+        assert_eq!(calls[0].function, crate::POOL_LOAD);
+        assert_eq!(
+            calls[2].function,
+            ogar_loco::FnIndex::TEXT,
+            "text is a register index, not a load"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.function != ogar_loco::FnIndex::NUMBER)
+        );
+
+        // No pool: refused, with the index named.
+        assert_eq!(
+            raise_program_in(&prog.functions, basin),
+            Err(RaiseError::MissingConstant(calls[0].values[0]))
+        );
+
+        let raised = raise_program_pooled(&prog.functions, basin, &ctx.pool)
+            .unwrap()
+            .unwrap();
+        // The number is back as the wide field it was; the text is back by
+        // name from the register.
+        let n = &raised.inputs[0].1;
+        assert_eq!(n.ty, "math_number");
+        assert_eq!(n.field("NUM"), Some(&FieldValue::Wide("1000000".into())));
+        let t = &raised.next.as_ref().unwrap().inputs[0].1;
+        assert_eq!(t.ty, "text");
+        assert_eq!(t.field("TEXT"), Some(&FieldValue::Code("hello".into())));
+
+        // …and re-lowering reproduces the SAME bytes and the SAME pool.
+        let mut again = LoweringContext::placeholder();
+        let prog2 = lower_program_with_pool(LaneShape::Pairs, &raised, basin, &mut again).unwrap();
+        assert_eq!(prog2.functions, prog.functions);
+        assert_eq!(again.pool, ctx.pool);
+    }
+
+    /// A Scratch list op lowers to the HANDLE PUSH then the core op (the
+    /// core pops the list as an operand), raises back to the block with its
+    /// LIST field (the handle folded away), and re-lowers byte-identical.
+    #[test]
+    fn a_list_op_pushes_its_handle_first_and_round_trips_through_the_field() {
+        use ogar_loco::basin::BasinCodebooks;
+        let utf8 = ogar_loco::pool::placeholder::CONST_UTF8_INLINE;
+        let mut basin = BasinCodebooks::new();
+        let m = crate::menus::menu_by_id(26).unwrap();
+        let mut b =
+            crate::menus::builder(m, utf8, crate::menus::PLACEHOLDER_DIGEST_CLASSID).unwrap();
+        b.intern(utf8, b"scores").unwrap();
+        basin.plug(b.seal()).unwrap();
+        let num =
+            |v: u8| BlockRecord::leaf("math_number", "n").with_field("NUM", FieldValue::Byte(v));
+        // add 5 to [scores]; replace item 1 of [scores] with 9
+        let script = BlockRecord::leaf("data_addtolist", "a")
+            .with_field("LIST", FieldValue::Code("scores".into()))
+            .with_input("ITEM", num(5))
+            .with_next(
+                BlockRecord::leaf("data_replaceitemoflist", "r")
+                    .with_field("LIST", FieldValue::Code("scores".into()))
+                    .with_input("INDEX", num(1))
+                    .with_input("ITEM", num(9)),
+            );
+        let prog = crate::lower_program_in(LaneShape::Pairs, &script, &basin).unwrap();
+        let calls = crate::raise_calls(prog.entry());
+        let handle = crate::scratch::device("data_listcontents").unwrap().0;
+        let list_idx = crate::menus::encode_in(&basin, m, "scores").unwrap();
+        // handle, 5, ADD, handle, 1, 9, SET
+        assert_eq!(calls[0].function.0, handle);
+        assert_eq!(calls[0].values[0], list_idx);
+        assert_eq!(calls[2].function, FnIndex::LIST_ADD);
+        assert_eq!(calls[2].values[0], 0, "the op itself carries no list byte");
+        assert_eq!(calls[3].function.0, handle);
+        assert_eq!(calls[6].function, FnIndex::LIST_SET);
+
+        let raised = raise_program_in(&prog.functions, &basin).unwrap().unwrap();
+        assert_eq!(raised.ty, "data_addtolist");
+        assert_eq!(
+            raised.field("LIST"),
+            Some(&FieldValue::Code("scores".into()))
+        );
+        assert_eq!(
+            raised.inputs.len(),
+            1,
+            "the handle is folded into the field, not an input"
+        );
+        let second = raised.next.as_ref().unwrap();
+        assert_eq!(second.ty, "data_replaceitemoflist");
+        assert_eq!(second.inputs.len(), 2);
+
+        let again = crate::lower_program_in(LaneShape::Pairs, &raised, &basin).unwrap();
+        assert_eq!(again.functions, prog.functions);
     }
 }
