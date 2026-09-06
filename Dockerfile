@@ -42,7 +42,7 @@
 # Railway: binds 0.0.0.0:$PORT — PORT is injected by the platform, and 8080
 # below is only the local-run fallback, never a pin.
 
-FROM rust:1.97.1-bookworm AS builder
+FROM rust:1.98.1-bookworm AS builder
 WORKDIR /build
 
 # Cache-buster: re-fetched every build, invalidates the clone layer below

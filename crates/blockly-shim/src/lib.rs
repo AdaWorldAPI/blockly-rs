@@ -656,13 +656,11 @@ pub mod templates {
             let (mine, tail) = nodes.split_at(take);
             nodes = tail;
             let bodies: Vec<ogar_loco::FunctionBody> = mine
-                .chunks_exact(NODE_BYTES)
+                .as_chunks::<NODE_BYTES>()
+                .0
+                .iter()
                 .map(|c| {
-                    blockly_abi::FunctionNode::from_le_bytes(
-                        c.try_into().expect("chunks_exact yields NODE_BYTES"),
-                        ogar_loco::LaneShape::Pairs,
-                    )
-                    .body
+                    blockly_abi::FunctionNode::from_le_bytes(c, ogar_loco::LaneShape::Pairs).body
                 })
                 .collect();
             if let Some(script) = blockly_abi::raise::raise_program_in(&bodies, project_basin())? {
@@ -1247,13 +1245,11 @@ mod pong_scene {
             let n = usize::from(b[0]);
             let take = usize::from(b[1]) * NODE_BYTES;
             b[1 + n..1 + n + take]
-                .chunks_exact(NODE_BYTES)
+                .as_chunks::<NODE_BYTES>()
+                .0
+                .iter()
                 .map(|c| {
-                    blockly_abi::FunctionNode::from_le_bytes(
-                        c.try_into().unwrap(),
-                        ogar_loco::LaneShape::Pairs,
-                    )
-                    .body
+                    blockly_abi::FunctionNode::from_le_bytes(c, ogar_loco::LaneShape::Pairs).body
                 })
                 .collect()
         };
