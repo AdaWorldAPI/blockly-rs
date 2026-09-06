@@ -33,6 +33,14 @@ jobs:
         with:
           repository: AdaWorldAPI/OGAR
           path: OGAR
+      # Same reason as OGAR: `blockly-store` path-deps
+      # `lance-graph-contract` (zero-dep, BBB-allow-listed), and a path dep
+      # is resolved at WORKSPACE LOAD time — a missing sibling breaks every
+      # cargo invocation here, not just the crate that names it.
+      - uses: actions/checkout@v4
+        with:
+          repository: AdaWorldAPI/lance-graph
+          path: lance-graph
       - name: Install Rust toolchain (per rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
         with:
@@ -49,7 +57,7 @@ jobs:
       # workspace"). Each new member is added here explicitly.
       - name: cargo fmt --check (scoped — never --all across path deps)
         working-directory: blockly-rs
-        run: cargo fmt -p blockly-abi -p blockly-run -p blockly-shim -p blockly-web --check
+        run: cargo fmt -p blockly-abi -p blockly-run -p blockly-shim -p blockly-store -p blockly-web --check
       - name: cargo clippy -D warnings
         working-directory: blockly-rs
         run: cargo clippy --workspace --all-targets -- -D warnings

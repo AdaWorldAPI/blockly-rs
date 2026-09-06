@@ -35,9 +35,6 @@ use blockly_abi::{FunctionNode, Program};
 use ogar_a2ui_frame::{Frame, NodeDelta};
 use ogar_render_askama::field_view::{ActionRef, FieldView, render_field_view};
 
-/// The demo's app prefix — a placeholder until the real mint (M1).
-const APP_PREFIX: u16 = 0xFF00;
-
 /// Build the `NodeDelta` for one cast function node.
 ///
 /// `mask_words` marks every field the node carries as changed, because a fresh
@@ -128,10 +125,20 @@ pub fn render_surface(key: [u8; 16], prog: &Program, shape: &str) -> Result<Stri
     )
 }
 
-/// This demo's render classid — canon-high `(palette concept << 16) | prefix`.
+/// The classid this surface renders for — the SAME address the stored key
+/// carries, never a second spelling of it.
+///
+/// It is the substrate's registered `CLASSID_BLOCKS_V3`: canon `0x1717` in
+/// the high half, the V3 generation marker `0x1000` in the custom half. It
+/// used to compose over a local `0xFF00` app-prefix placeholder, which was
+/// harmless only for as long as nothing compared the rendered address to
+/// the minted one. A real app prefix is still the unminted operator
+/// decision M1 — `0x1000` is not one, and cannot become one: `ogar-vocab`
+/// reserves it for the V3-adoption monitor with a test asserting it "must
+/// never be allocatable as a port's `APP_PREFIX`".
 #[must_use]
 pub const fn render_classid() -> u32 {
-    blockly_abi::palette::render_classid(APP_PREFIX)
+    blockly_store::CLASSID
 }
 
 #[cfg(test)]

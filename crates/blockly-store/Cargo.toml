@@ -1,0 +1,45 @@
+[package]
+name = "blockly-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "The storage layer: a cast program's function nodes ARE lance-graph V3 SoA rows. Mints their keys through the substrate's own minter and hands the array to Lance as a zero-copy envelope — no serialization, no second layout."
+
+[dependencies]
+blockly-abi = { path = "../blockly-abi" }
+ogar-loco = { workspace = true }
+# The V3 substrate contract — zero-dep, BBB-allow-listed, and the owner of
+# both halves this crate needs: `NodeGuid::mint_for` (minting is the
+# substrate's, never a consumer's byte math) and `NodeRow`/`NodeRowPacket`
+# (the locked row and the zero-copy envelope Lance reads).
+lance-graph-contract = { workspace = true }
+
+# The Lance write path. OFF by default: the mapping above is the load-bearing
+# half and costs nothing, while lance + lancedb + datafusion is a large tree
+# that no lean consumer of this crate should pay for to learn what a row is.
+lance = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+[features]
+# Persist to a real Lance dataset. Pulls lance 11 (the major lancedb 0.38
+# fixes), arrow 58 and — transitively — datafusion 54, each floating on its
+# major rather than pinned: nothing this workspace links demands exact-equals.
+#
+# `lance` DIRECT, not `lancedb`, for two reasons. The wanted operation is
+# `Dataset::write` of a fixed schema into a file-backed dataset — a table
+# client's index/embedding/remote machinery is not on the way to it, and the
+# one other consumer writing V3 rows in this fleet uses `Dataset::write` too.
+# And lancedb 0.38.0 does not currently compile at all without its `remote`
+# feature: `src/job.rs:66` constructs `Error::Http`, a variant its own
+# `src/error.rs:111` gates behind `#[cfg(feature = "remote")]`, while
+# `default = []`. Taking `lance` avoids pulling reqwest into a local writer
+# to work around someone else's cfg.
+lance = ["dep:lance", "dep:arrow-array", "dep:arrow-schema", "dep:tokio"]
+
+[dev-dependencies]
+blockly-shim = { path = "../blockly-shim" }

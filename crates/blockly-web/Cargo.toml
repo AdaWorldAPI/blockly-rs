@@ -18,6 +18,9 @@ ogar-a2ui-frame = { workspace = true }
 ogar-render-askama = { workspace = true }
 blockly-shim = { path = "../blockly-shim" }
 blockly-run = { path = "../blockly-run" }
+# The storage layer — for `mint_key`, so the demo key is minted through the
+# substrate rather than spelled out byte by byte here.
+blockly-store = { path = "../blockly-store" }
 
 askama = "0.12"
 # Required alongside askama: `ogar-render-askama` now declares `askama_axum`,

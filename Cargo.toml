@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/blockly-abi", "crates/blockly-run", "crates/blockly-shim", "crates/blockly-web"]
+members = ["crates/blockly-abi", "crates/blockly-run", "crates/blockly-shim", "crates/blockly-store", "crates/blockly-web"]
 
 [workspace.package]
 version = "0.1.0"
@@ -48,3 +48,53 @@ ogar-loco = { path = "../OGAR/crates/ogar-loco" }
 # of them -- charter T3, and the whole point of an ABI-shaped SoA.
 ogar-a2ui-frame = { path = "../OGAR/crates/ogar-a2ui-frame" }
 ogar-render-askama = { path = "../OGAR/crates/ogar-render-askama" }
+
+# ── The storage substrate ───────────────────────────────────────────
+#
+# `lance-graph-contract` is the V3 SoA contract: `NodeGuid` (the minter),
+# `NodeRow` (the locked 16|16|480 = 512-byte row) and `NodeRowPacket`
+# (the zero-copy `SoaEnvelope` over `&[NodeRow]`). A PATH dep to the
+# sibling for the same reason OGAR is one -- pins are forbidden here.
+#
+# It is ZERO-dependency by its own design rule, so taking it costs this
+# workspace nothing but the sibling checkout, and it is on the BBB
+# allow-list: the contract crate compiles types, it is not the engine.
+# `lance-graph-planner` and the rest of the engine stay out.
+#
+# The convergence that makes this a binding rather than a port:
+# `ogar_loco::node::NODE_BYTES` is 512, key at 0..16, a zeroed reserved
+# slot at 16..32, value at 32..512 -- byte-for-byte the contract's
+# `NodeRow`. A stored blockly function already IS a V3 row; what was
+# missing was a minted key and an envelope over the array.
+lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract" }
+
+# ── The lance family: ONE version set, floating on the major ────────
+#
+# Registry versions, not git revs -- the pins-are-forbidden rule is about
+# a `git`+`branch` dep freezing this repo at a resolved commit while
+# looking unpinned. A crates.io requirement is the opposite: it is the
+# thing cargo is allowed to resolve, and these are written so it can.
+#
+# EVERY requirement here is the MAJOR, never `=X.Y.Z`. An exact pin is
+# owed only where an upstream crate itself demands exact-equals, and
+# nothing here does: lancedb is the crate that requires `lance =11.0.0`,
+# and this workspace does not link lancedb (see below). So `lance = "11"`
+# floats to the newest 11.x, and arrow/datafusion float likewise -- an
+# exact `=58.4.0` on our side would be strictly NARROWER than the `^58.0.0`
+# the family asks for, and being narrower than the graph is what makes a
+# graph unsatisfiable in the first place.
+#
+# Which major, and how it was fixed: lancedb 0.38.0's own manifest requires
+# `lance = "=11.0.0"` (and lance-io / lance-table / lance-index / ... all
+# `=11.0.0`), with `arrow ^58.0.0` and `datafusion ^54.0.0` -- read from
+# crates.io rather than assumed. The family moves in lockstep, so a bump is
+# one deliberate, measured change to these four lines, never a drift.
+lance = "11"
+# DECLARED, not linked. No member takes it, so it never enters the lock --
+# it is here as the PAIRING REFERENCE: lancedb 0.38 is what fixes lance at
+# major 11 above. `blockly-store` writes through `lance::Dataset` directly
+# (see its manifest for both reasons, one of which is that lancedb 0.38.0
+# does not compile without its `remote` feature).
+lancedb = { version = "0.38", default-features = false }
+arrow-array = "58"
+arrow-schema = "58"

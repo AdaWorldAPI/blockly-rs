@@ -49,9 +49,18 @@ WORKDIR /build
 # exactly when OGAR's main tip has actually moved. See the note above.
 ADD https://api.github.com/repos/AdaWorldAPI/OGAR/commits/main /tmp/ogar-head.json
 
-# The sibling first, so an OGAR-only change does not invalidate the layer
+# The siblings first, so a sibling-only change does not invalidate the layer
 # holding this repo's sources.
 RUN git clone --depth 1 https://github.com/AdaWorldAPI/OGAR.git /build/OGAR
+
+# The second sibling: `blockly-store` path-deps `lance-graph-contract`, and a
+# path dep is resolved at WORKSPACE LOAD time, so its absence fails the build
+# before a single crate compiles -- even though `blockly-web` never calls into
+# it. The contract crate is zero-dependency by design, so this clone costs the
+# checkout and nothing else: the `lance` feature is OFF by default and the
+# lance/lancedb/datafusion tree is never fetched for this image.
+ADD https://api.github.com/repos/AdaWorldAPI/lance-graph/commits/main /tmp/lance-graph-head.json
+RUN git clone --depth 1 https://github.com/AdaWorldAPI/lance-graph.git /build/lance-graph
 
 WORKDIR /build/blockly-rs
 COPY . .
