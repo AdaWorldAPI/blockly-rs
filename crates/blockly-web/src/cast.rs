@@ -27,10 +27,14 @@ use serde::Serialize;
 
 /// The demo key the entry node is stored under.
 ///
-/// `blockly_store::CLASSID` is the substrate's registered Blocks-V3 address
-/// (`0x1717_1000`): canon `0x1717` HIGH — the palette concept naming WHICH
-/// vocabulary reads the call bytes, not the node's shape, which is
-/// `ogar-loco`'s `0x1701` — and the V3 generation marker in the custom half.
+/// `blockly_store::CLASSID` is this consumer's own Blocks-V3 address
+/// (`0x1717_1000`), composed by the crate that declares the seat
+/// (`blockly_abi::palette::render_classid`): canon `0x1717` HIGH — the
+/// palette concept naming WHICH vocabulary reads the call bytes, not the
+/// node's shape, which is `ogar-loco`'s `0x1701` — and the V3 generation
+/// marker in the custom half. NOT a substrate registration: `0x17XX` carries
+/// zero canon codebook rows, which is what makes the palette plug-and-play
+/// (D-BLOCKS-HOTPLUG-1).
 /// A real app prefix for this frontend is still the unminted operator
 /// decision M1; the marker is the canon's own convention for that state.
 ///
@@ -40,7 +44,8 @@ use serde::Serialize;
 /// Writing the tail as `[0, 0, 0, 0, 0, 1]` put the `1` in the MOST
 /// significant byte of the 24-bit identity, so the entry node's identity was
 /// `0x010000` rather than `1`; and the whole tail was the V1 u24 shape the
-/// canon closed to new mints, which only the registry could change.
+/// canon closed to new mints, which `blockly_store::READ_MODE` now settles
+/// at the seat rather than by asking the canon registry.
 #[must_use]
 pub fn demo_key() -> [u8; 16] {
     *blockly_store::mint_key(blockly_store::CLASSID, 0).as_bytes()
@@ -420,7 +425,7 @@ mod tests {
         assert!(s.resolved, "the palette must actually be plugged");
         assert_eq!(s.plugged, 1);
         assert_eq!(s.palette_concept, "0x1717");
-        // The registered Blocks-V3 address: canon `0x1717` in the high half,
+        // The consumer-composed Blocks-V3 address: canon `0x1717` high,
         // the V3 generation marker `0x1000` in the custom half. It resolves
         // because the CANON half is what the registry routes on, so the
         // marker never perturbs the plug.

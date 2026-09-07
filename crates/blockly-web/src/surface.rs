@@ -196,12 +196,27 @@ mod tests {
         assert!(!wire.is_empty());
         assert_ne!(wire[0], b'{', "the program path must not carry JSON");
         assert_ne!(wire[0], b'[', "the program path must not carry JSON");
-        // The key's classid rides as raw LE bytes — 0x1717_FF00 little-endian
-        // is 00 FF 17 17, a sequence no JSON encoding of the same value has.
-        let windows_have_classid = wire.windows(4).any(|w| w == [0x00, 0xFF, 0x17, 0x17]);
+        // The key's classid rides as raw LE bytes. Derived from the address
+        // itself rather than spelled as a literal: an earlier cut hardcoded
+        // the retired `0xFF00` placeholder here and kept asserting it after
+        // `render_classid` was unified onto the minted address, so the test
+        // pinned a prefix the key had stopped carrying.
+        let le = blockly_store::CLASSID.to_le_bytes();
+        assert_eq!(
+            le,
+            [0x00, 0x10, 0x17, 0x17],
+            "canon-high 0x1717 over 0x1000"
+        );
         assert!(
-            windows_have_classid,
+            wire.windows(4).any(|w| w == le),
             "the canon-high classid must appear as raw LE bytes on the wire"
+        );
+        // Silence twin: the retired placeholder must NOT be on the wire. A
+        // window check that matched anything four bytes long would pass the
+        // half above; this proves it discriminates.
+        assert!(
+            !wire.windows(4).any(|w| w == [0x00, 0xFF, 0x17, 0x17]),
+            "the retired 0xFF00 render placeholder must not ride the wire"
         );
     }
 
@@ -228,7 +243,14 @@ mod tests {
         assert!(html.contains(r#"data-action-ordinal="0""#), "{html}");
         // The projected value made it through.
         assert!(html.contains("ADD"), "the rail must render: {html}");
-        assert_eq!(render_classid(), 0x1717_FF00);
+        // The rendered address IS the minted one — the unification
+        // `render_classid`'s own doc describes. Asserted two-sided: it must
+        // equal the stored classid AND must no longer be the local `0xFF00`
+        // placeholder it used to compose, or "never a second spelling of it"
+        // would be prose with nothing behind it.
+        assert_eq!(render_classid(), blockly_store::CLASSID);
+        assert_eq!(render_classid(), 0x1717_1000);
+        assert_ne!(render_classid(), 0x1717_FF00);
 
         // Silence twin: the surface must NOT carry behaviour. If a handler
         // attribute ever appears here, T2 has been violated and the address

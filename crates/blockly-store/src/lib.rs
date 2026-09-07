@@ -27,29 +27,46 @@
 //!    serialized on the way to storage; `to_le_bytes` IS the wire format
 //!    and the stored format at once.
 //!
-//! # The V3 tail is reached through the registry, not asked for
+//! # The V3 tail comes from the seat's owner, never from the canon registry
 //!
-//! An earlier cut of this crate composed its own classid over a
-//! placeholder app prefix. That classid was in no registry, so
-//! [`classid_read_mode`] fell through to its conservative default and
-//! every key minted a **V1** `family:identity` u24 tail — the shape the
-//! canon calls forbidden for new units. The mechanism was right and the
-//! address was wrong, which is the failure mode that looks like success:
-//! keys appeared, were distinct, round-tripped, and were legacy.
+//! An earlier cut of this crate composed its own classid over an invented
+//! placeholder prefix. That classid was in no registry, so
+//! `classid_read_mode` fell through to its conservative default and every
+//! key minted a **V1** `family:identity` u24 tail — the shape the canon
+//! calls forbidden for new units. The mechanism was right and the address
+//! was wrong, which is the failure mode that looks like success: keys
+//! appeared, were distinct, round-tripped, and were legacy.
 //!
-//! The contract is explicit that there is no way around this — *"there is
-//! NO public `new_v3` dispatch — the `tail_variant` registry field IS the
-//! mechanism"*. So a consumer reaches V3 only by its classid being
-//! registered, which `NodeGuid::CLASSID_BLOCKS_V3` (`0x1717_1000`) now is:
-//! canon `0x1717` HIGH — the Blocks domain's per-frontend palette seat,
-//! already reserved — and the V3 generation marker `0x1000` in the custom
-//! LOW half. The marker replaces the invented placeholder outright: the
-//! canon has a convention for "V3, no app prefix minted yet", and using it
-//! is strictly less invention than a made-up value.
+//! The cut after that fixed the address the wrong way — by registering
+//! `CLASSID_BLOCKS_V3` in the substrate's `BUILTIN_READ_MODES`. Operator
+//! ruling **D-BLOCKS-HOTPLUG-1** withdrew it (lance-graph #1207):
+//! *"Blockly is a hot-plugged consumer, not a canon builtin. `0x1717` is
+//! authority-owned. `BUILTIN_READ_MODES` must remain unchanged by
+//! Blockly."* Registering a per-frontend seat there would make adding a
+//! frontend an edit to the substrate plus a recompile — central lockstep,
+//! rebuilt one layer up.
 //!
-//! [`mint_key`] is unchanged — it always passed
-//! `classid_read_mode(classid).tail_variant` through. Registering the
-//! class is what made that answer V3.
+//! `blockly-abi` had already reached that ruling from this side, months
+//! earlier and in its own words: *"`0x17XX` keeps **zero** codebook rows —
+//! that is precisely what makes the palette plug-and-play rather than
+//! canon"* (`registry.rs`). So the two halves are:
+//!
+//! - **The address is `blockly-abi`'s.** [`CLASSID`] is
+//!   [`render_classid`](blockly_abi::palette::render_classid)`(0x1000)` —
+//!   the palette that declares `0x1717` composes its own address. Reaching
+//!   upstream for a canon constant was the second spelling, not this one.
+//! - **The reading is inherited with the persistence.** A cast program's
+//!   nodes ARE lance-graph V3 rows, so the moment this crate persists them
+//!   it is on lance-graph and the V3 substrate comes with it. [`READ_MODE`]
+//!   states this seat's reading once; [`mint_key`] passes its
+//!   `tail_variant` to the substrate's own minter.
+//!
+//! What must NOT happen is asking `classid_read_mode` — the **canon**
+//! registry, which by the ruling does not know `0x1717` and answers
+//! `DEFAULT` (V1). That call compiles and silently mints legacy keys: the
+//! tail is not recorded in the key ([`NodeGuid`] has no tail-variant
+//! accessor; `decode` versus `decode_v2` is chosen by classid alone), so
+//! V3 bytes would read back as V1 with no error anywhere.
 //!
 //! # The lance feature
 //!
@@ -70,24 +87,56 @@
 
 use blockly_abi::FunctionNode;
 use lance_graph_contract::canonical_node::{
-    EdgeBlock, NodeGuid, NodeRow, NodeRowPacket, classid_read_mode,
+    EdgeBlock, EdgeCodecFlavor, NodeGuid, NodeRow, NodeRowPacket, ReadMode, TailVariant,
+    ValueSchema,
 };
 use ogar_loco::node::NODE_BYTES;
 use ogar_loco::{FunctionBody, LaneShape, Program};
 
+/// The V3 generation marker used as this seat's app prefix.
+///
+/// The canon's convention for "V3, no app prefix minted yet". Minting a
+/// real prefix for this frontend is still the operator decision this
+/// workspace calls M1; when it lands the class gets a sibling classid and
+/// this constant moves — the rows do not, because the tail is a reading of
+/// the same 16 key bytes either way.
+pub const V3_GENERATION_MARKER: u16 = 0x1000;
+
 /// The classid every stored blockly function is minted under.
 ///
-/// Not composed here. It is [`NodeGuid::CLASSID_BLOCKS_V3`] — the registry
-/// entry is the whole point (see the module docs), and a locally composed
-/// equivalent would be a second spelling of an address the canon owns, one
-/// that resolves to a V3 read mode only by coincidence.
+/// Composed by the crate that owns the seat:
+/// [`blockly_abi::palette::render_classid`] over [`V3_GENERATION_MARKER`],
+/// giving canon-high `0x1717` (the palette concept `blockly-abi` declares
+/// "here and nowhere else") over the custom-low marker.
 ///
-/// The custom half is the `0x1000` V3 generation marker rather than an app
-/// prefix. Minting a real prefix for this frontend is still the operator
-/// decision this workspace calls M1; when it lands, the class gets a
-/// sibling classid and this constant moves — the rows do not, because the
-/// tail is a reading of the same 16 key bytes either way.
-pub const CLASSID: u32 = NodeGuid::CLASSID_BLOCKS_V3;
+/// Not a canon constant, deliberately. `0x1717` is a per-frontend consumer
+/// seat in the substrate's `0x17` domain; the substrate must never learn
+/// that Blockly exists (see the module docs and `blockly-abi`'s
+/// `registry.rs`). Composing it here is the FIRST spelling, not a second
+/// one — the canon has no entry to drift from.
+pub const CLASSID: u32 = blockly_abi::palette::render_classid(V3_GENERATION_MARKER);
+
+/// How a row addressed under [`CLASSID`] is read.
+///
+/// This seat's own reading, stated once, because the canon registry must
+/// not carry it. It is the same descriptor the hot-plug authority hands
+/// back for `0x1717` in [`Activation::read_modes`], which exists precisely
+/// so a consumer's reading rides the activation instead of a registry row
+/// (lance-graph #1207, D-BLOCKS-HOTPLUG-1).
+///
+/// - `V3` — the content-blind 4+12 facet. The V1 `family:identity` u24
+///   tail is closed to new mints, and a flat u24 carries no rail.
+/// - `Bootstrap` — key + edges only. This crate stores a function body in
+///   `ogar-loco`'s own value slab; it materialises no cognitive tenants.
+/// - `CoarseOnly` — the canon zero-fallback edge carving. Nothing here
+///   reads the edge block yet; it is reserved and zeroed.
+///
+/// [`Activation::read_modes`]: lance_graph_contract::hotplug::Activation::read_modes
+pub const READ_MODE: ReadMode = ReadMode {
+    tail_variant: TailVariant::V3,
+    value_schema: ValueSchema::Bootstrap,
+    edge_codec: EdgeCodecFlavor::CoarseOnly,
+};
 
 /// Mint the key for function `index` of a program under `classid`.
 ///
@@ -102,7 +151,7 @@ pub const CLASSID: u32 = NodeGuid::CLASSID_BLOCKS_V3;
 #[must_use]
 pub fn mint_key(classid: u32, index: u16) -> NodeGuid {
     NodeGuid::mint_for(
-        classid_read_mode(classid).tail_variant,
+        READ_MODE.tail_variant,
         classid,
         0,
         0,
@@ -346,17 +395,49 @@ mod tests {
     /// be the SAME for every row (they are one program, one class) — an
     /// implementation that varied the classid would pass a bare
     /// all-different check.
+    ///
+    /// # Read the tail you minted
+    ///
+    /// The accessors here are the `_v2` family, because a V3 key stores
+    /// `leaf(u16)·family(u16)·identity(u16)` at bytes 10..12/12..14/14..16 —
+    /// the same bytes V2 mints, read through the V3 lens. The V1
+    /// [`NodeGuid::identity`] reads bytes 13..15 instead, so on a V3 key it
+    /// straddles the family/identity boundary and returns a SHIFTED value:
+    /// minting identity 1 reads back as 256. This is not a contract bug —
+    /// it is I-LEGACY-API-FEATURE-GATED working as designed, and the
+    /// contract says so at the accessor: *"different name, different bytes —
+    /// no silent semantic swap."*
+    ///
+    /// It is worth a comment because this test asserted the V1 accessor and
+    /// passed for as long as this crate minted V1 keys. It went red the
+    /// moment the mint became genuinely V3 — which is the whole point of
+    /// the change, and the assertion is what proved the tail actually moved.
     #[test]
     fn every_function_gets_its_own_identity_under_one_classid() {
         let cid = CLASSID;
         let keys: Vec<NodeGuid> = (0..8).map(|i| mint_key(cid, i)).collect();
         for (i, k) in keys.iter().enumerate() {
+            let i16 = u16::try_from(i).expect("bounded");
             assert_eq!(k.classid(), cid, "row {i} drifted to another class");
-            assert_eq!(k.identity(), u32::from(u16::try_from(i).expect("bounded")));
-            assert!(
-                k.is_unbasined(),
+            assert_eq!(k.identity_v2(), i16, "row {i} lost its V3 identity");
+            assert_eq!(
+                k.family_v2(),
+                0,
                 "family is dormant until an operator mints one"
             );
+            assert_eq!(k.leaf(), 0, "the 4th HHTL tier is dormant too");
+
+            // The V1 accessor on a V3 key is the trap this crate must not
+            // fall into again: it reads bytes 13..15 and shifts. Pinned so a
+            // future edit cannot quietly reintroduce it and look correct on
+            // row 0, where both readings happen to agree.
+            if i > 0 {
+                assert_ne!(
+                    k.identity(),
+                    u32::from(i16),
+                    "row {i}: the V1 u24 accessor must NOT agree with the V3 tail"
+                );
+            }
         }
         let mut seen: Vec<[u8; 16]> = keys.iter().map(|k| *k.as_bytes()).collect();
         seen.sort_unstable();
@@ -364,16 +445,16 @@ mod tests {
         assert_eq!(seen.len(), keys.len(), "two functions minted the same key");
     }
 
-    /// The classid is the canon's own registered address, and the palette's
-    /// dep-free composition still agrees with the canon's composer.
+    /// The classid is the seat owner's composition, and it still agrees
+    /// with the canon's own composer for the canon-high/custom-low split.
     ///
-    /// Two separate facts, both load-bearing. The first is why the tail is
-    /// V3 at all. The second checks the sanctioned hand-copy
-    /// (`blockly-abi` is dep-free by design and spells canon-high itself)
-    /// against `render_classid` — with prefixes whose halves are NOT
+    /// Two separate facts, both load-bearing. The first is the address
+    /// itself. The second checks `blockly-abi`'s own composer (it is
+    /// dep-free by design and spells canon-high itself) against the
+    /// contract's `render_classid` — with prefixes whose halves are NOT
     /// symmetric, so a canon/custom swap cannot pass.
     #[test]
-    fn the_classid_is_the_registered_blocks_v3_address() {
+    fn the_classid_is_composed_by_the_seats_owner() {
         use lance_graph_contract::ogar_codebook::{
             ConceptDomain, classid_canon, classid_concept_domain, classid_custom, render_classid,
         };
@@ -395,31 +476,64 @@ mod tests {
             assert_eq!(classid_canon(ours), blockly_abi::palette::PALETTE_CONCEPT);
             assert_eq!(classid_custom(ours), prefix);
         }
-        // ...and composing the palette over the V3 marker reproduces the
-        // registered address exactly, so the two spellings cannot drift.
+        // ...and composing the palette over the V3 marker reproduces
+        // CLASSID exactly, so the two spellings cannot drift.
         assert_eq!(blockly_abi::palette::render_classid(0x1000), CLASSID);
     }
 
-    /// Keys mint on the **V3** tail — the point of the whole exercise.
+    /// Keys mint on the **V3** tail — and the canon registry is NOT what
+    /// says so.
     ///
-    /// This test replaced one that pinned `TailVariant::V1` and called it
-    /// "the substrate's answer". It was: for an unregistered classid the
-    /// registry answers V1, and every key this crate minted carried the
-    /// legacy u24 tail. Registering `CLASSID_BLOCKS_V3` upstream is what
-    /// changed the answer; `mint_key` never changed at all.
+    /// Two-sided on the exact thing D-BLOCKS-HOTPLUG-1 changed. The first
+    /// half is the point of the whole exercise: a minted key carries the V3
+    /// facet, not the legacy u24 tail. The second is the anti-vacuity half
+    /// and the more important one — the **canon** registry must still answer
+    /// `DEFAULT` for this seat, because `0x1717` is a hot-plugged consumer
+    /// slot the substrate does not know.
     ///
-    /// Anti-vacuity: the default classid is asserted to still answer V1 in
-    /// the same test, so this cannot pass by the registry having been
-    /// flattened to V3 everywhere.
+    /// Without that half the test would pass equally well if the class were
+    /// re-registered upstream, which is precisely the regression the ruling
+    /// forbids. With it, a passing run proves the V3 reading came from
+    /// [`READ_MODE`] — this seat's owner — and could not have come from the
+    /// registry.
+    ///
+    /// This replaced a version that asserted
+    /// `classid_read_mode(CLASSID).tail_variant == V3` and read as success
+    /// while depending on a registry row that has since been withdrawn.
     #[test]
-    fn keys_mint_on_the_v3_tail_because_the_class_is_registered() {
-        use lance_graph_contract::canonical_node::TailVariant;
-        assert_eq!(classid_read_mode(CLASSID).tail_variant, TailVariant::V3);
+    fn keys_mint_on_the_v3_tail_and_the_canon_registry_does_not_know_the_seat() {
+        use lance_graph_contract::canonical_node::classid_read_mode;
+
+        assert_eq!(READ_MODE.tail_variant, TailVariant::V3);
+
+        // The canon registry does NOT carry this seat — same classid, and
+        // it falls through to the conservative default.
+        let canon = classid_read_mode(CLASSID);
         assert_eq!(
-            classid_read_mode(NodeGuid::CLASSID_DEFAULT).tail_variant,
-            TailVariant::V1,
-            "an UNregistered class must still fall through to the legacy tail, \
-             or this test proves nothing about registration"
+            canon,
+            ReadMode::DEFAULT,
+            "0x1717 is a hot-plugged consumer seat; registering it in \
+             BUILTIN_READ_MODES is what D-BLOCKS-HOTPLUG-1 withdrew"
+        );
+        assert_ne!(
+            canon.tail_variant, READ_MODE.tail_variant,
+            "if the canon answered V3 too, this test could not tell where \
+             the reading came from"
+        );
+
+        // ...and mint_key really USES it. Without this the test above is a
+        // tautology on a `const`: it would pass with `mint_key` still asking
+        // the canon registry, which is exactly the defect. Verified by a
+        // disable run — reverting `mint_key` to `classid_read_mode` turns
+        // this red.
+        let key = mint_key(CLASSID, 7);
+        assert_eq!(key.classid(), CLASSID);
+        assert_eq!(key.identity_v2(), 7, "the V3 tail carries the identity");
+        assert_ne!(
+            key.identity(),
+            7,
+            "a V1-tailed mint would put 7 where the u24 accessor finds it; \
+             that it does not is what proves the tail came from READ_MODE"
         );
     }
 
