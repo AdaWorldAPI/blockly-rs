@@ -66,7 +66,11 @@ ogar-render-askama = { path = "../OGAR/crates/ogar-render-askama" }
 # slot at 16..32, value at 32..512 -- byte-for-byte the contract's
 # `NodeRow`. A stored blockly function already IS a V3 row; what was
 # missing was a minted key and an envelope over the array.
-lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract" }
+# `guid-v3-tail` named explicitly rather than inherited from the contract's
+# own default: this workspace MINTS V3 keys, so the feature is a hard
+# requirement here, not a convenience someone else happens to switch on.
+# Additive, so it cannot affect a consumer that wants a different set.
+lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract", features = ["guid-v3-tail"] }
 
 # ── The lance family: ONE version set, floating on the major ────────
 #

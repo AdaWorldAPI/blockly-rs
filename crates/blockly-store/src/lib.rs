@@ -138,6 +138,36 @@ pub const READ_MODE: ReadMode = ReadMode {
     edge_codec: EdgeCodecFlavor::CoarseOnly,
 };
 
+/// A V3 mint may never degrade to a V1 tail — checked at COMPILE time.
+///
+/// [`NodeGuid::mint_for`] is a `const fn`, so minting here in a `const`
+/// block runs the substrate's real dispatch during const evaluation and any
+/// failure is a build error, not a runtime surprise. Two things are proven
+/// before this crate can link:
+///
+/// 1. The V3 arm exists. Without `guid-v2-tail` (implied by the default-on
+///    `guid-v3-tail`) `mint_for` panics rather than falling back to `new`,
+///    so a build that would have silently minted legacy keys fails here.
+/// 2. The bytes really are the V3 tail. Identity 1 must land at bytes
+///    14..16 (`leaf·family·identity`, 3×u16). A V1 mint would put it in the
+///    u24 field at 13..16 instead, which byte 13 catches.
+///
+/// The second half matters on its own: the feature could be on and the
+/// dispatch still wrong. Asserting the layout rather than the feature means
+/// this guard tests the outcome, not the configuration.
+const _: () = {
+    let g = NodeGuid::mint_for(READ_MODE.tail_variant, CLASSID, 0, 0, 0, 0, 0, 1);
+    let b = g.as_bytes();
+    assert!(
+        b[14] == 1 && b[15] == 0,
+        "V3 identity must sit at bytes 14..16"
+    );
+    assert!(
+        b[13] == 0,
+        "byte 13 carries identity only on the V1 u24 tail — this mint degraded"
+    );
+};
+
 /// Mint the key for function `index` of a program under `classid`.
 ///
 /// Bootstrap-addressed: the three cascade tiers, the leaf and the family
