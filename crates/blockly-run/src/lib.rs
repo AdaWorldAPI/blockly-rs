@@ -61,10 +61,127 @@ pub enum Look {
 pub enum Value {
     /// A number.
     Num(f32),
-    /// A TEXT register index (menu 29); 0 is the empty string.
+    /// An index into the PROJECT's TEXT register (menu 29) — a literal the
+    /// intake interned once, sealed. `0` is the empty string.
     Text(u8),
+    /// An index into the RUN's text register ([`TextRegister`]) — a string
+    /// some operator MADE while running (`join`, `letter of`). A separate
+    /// variant, not a second index range, so the compiler forces every site
+    /// that reads a text to say which register it means.
+    RunText(u8),
     /// A LIST register handle (menu 26).
     List(u8),
+}
+
+/// The two text registers a run reads from: the project's sealed one and the
+/// run's own. Passed as one `Copy` pair so every text reading has ONE
+/// signature and no site can accidentally consult only half of it.
+#[derive(Debug, Clone, Copy)]
+pub struct Regs<'a> {
+    /// The project basin — its TEXT codebook is [`Value::Text`]'s register.
+    pub basin: Option<&'a ogar_loco::basin::BasinCodebooks>,
+    /// The run's register — [`Value::RunText`]'s.
+    pub texts: &'a TextRegister,
+}
+
+/// Strings a RUN made, indexed by a byte exactly as the project's sealed
+/// register is.
+///
+/// **Why this exists, and why it is not a second string store.** A string in
+/// this stack lives in a codebook register and is referred to by index —
+/// never inline in a node, a call, or a constant pool. `join` and `letter of`
+/// produce a string that did not exist at intake, so it cannot be in the
+/// sealed register (intake is one-time; the codebook is sealed). It goes in a
+/// register with the same shape, minted at run time, living on the [`Stage`]
+/// with the rest of the run's working state. It never persists, never reaches
+/// a node, and never crosses the intake boundary.
+///
+/// Unlike the sealed register it stores its entries EXACTLY: a project name
+/// wider than a facet interns there as a digest (a label, lossy by ruling),
+/// but a string this register hands back must be the string that was made.
+///
+/// Index `0` is the empty string, the same zero-fallback the sealed register
+/// uses. Interning is deduped, so a loop that joins the same two values every
+/// round mints ONE entry. The index is a byte, so the register holds 255
+/// distinct strings and then refuses ([`RunError::TextRegisterFull`]) rather
+/// than recycling an index — two different strings sharing one index is the
+/// register-loss this whole discipline exists to prevent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextRegister {
+    entries: Vec<Box<str>>,
+}
+
+impl TextRegister {
+    /// An empty register.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many strings are interned (the empty string at `0` is implicit).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing has been interned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The string at an index; `0` is the empty string.
+    #[must_use]
+    pub fn get(&self, idx: u8) -> Option<&str> {
+        if idx == 0 {
+            return Some("");
+        }
+        self.entries.get(usize::from(idx) - 1).map(AsRef::as_ref)
+    }
+
+    /// Intern a string, returning its index. `None` when the register is
+    /// full — never a recycled index.
+    pub fn intern(&mut self, s: &str) -> Option<u8> {
+        if s.is_empty() {
+            return Some(0);
+        }
+        if let Some(pos) = self.entries.iter().position(|e| &**e == s) {
+            return u8::try_from(pos + 1).ok();
+        }
+        let idx = u8::try_from(self.entries.len() + 1).ok()?;
+        self.entries.push(s.into());
+        Some(idx)
+    }
+}
+
+/// The text a value reads as. A number formats the way Scratch prints it
+/// (an integer without a decimal point); a list handle reads as empty.
+#[must_use]
+pub fn text_of<'a>(v: Value, regs: Regs<'a>) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    match v {
+        Value::Num(n) => Cow::Owned(format!("{n}")),
+        Value::Text(idx) => Cow::Borrowed(project_text(idx, regs.basin).unwrap_or("")),
+        Value::RunText(idx) => Cow::Borrowed(regs.texts.get(idx).unwrap_or("")),
+        Value::List(_) => Cow::Borrowed(""),
+    }
+}
+
+/// One entry of the project's sealed TEXT register, as a `str`.
+fn project_text(idx: u8, basin: Option<&ogar_loco::basin::BasinCodebooks>) -> Option<&str> {
+    if idx == 0 {
+        return Some("");
+    }
+    let e = basin?
+        .get(blockly_abi::menus::TEXT_MENU)?
+        .resolve(idx)
+        .filter(|e| e.classid == ogar_loco::pool::placeholder::CONST_UTF8_INLINE)?;
+    let end = e
+        .bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(e.bytes.len());
+    core::str::from_utf8(&e.bytes[..end]).ok()
 }
 
 impl Default for Value {
@@ -76,28 +193,15 @@ impl Default for Value {
 impl Value {
     /// The numeric reading. A text reads as its numeric value if it has one,
     /// else 0 — Scratch's own rule for text in a numeric slot; a list handle
-    /// reads as 0. `basin` supplies the TEXT register; without it every text
-    /// reads 0.
+    /// reads as 0.
     #[must_use]
-    pub fn num(self, basin: Option<&ogar_loco::basin::BasinCodebooks>) -> f32 {
+    pub fn num(self, regs: Regs<'_>) -> f32 {
         match self {
             Self::Num(n) => n,
-            Self::Text(0) | Self::List(_) => 0.0,
-            Self::Text(idx) => basin
-                .and_then(|b| b.get(blockly_abi::menus::TEXT_MENU))
-                .and_then(|book| book.resolve(idx))
-                .filter(|e| e.classid == ogar_loco::pool::placeholder::CONST_UTF8_INLINE)
-                .and_then(|e| {
-                    let end = e
-                        .bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(e.bytes.len());
-                    core::str::from_utf8(&e.bytes[..end])
-                        .ok()
-                        .and_then(|t| t.trim().parse::<f32>().ok())
-                })
-                .unwrap_or(0.0),
+            Self::List(_) => 0.0,
+            Self::Text(_) | Self::RunText(_) => {
+                text_of(self, regs).trim().parse::<f32>().unwrap_or(0.0)
+            }
         }
     }
 }
@@ -170,7 +274,7 @@ pub struct Stage {
     /// `data_*variable*` call carries (`blockly_abi::menus`, menu 25). Index
     /// `0` is the zero-fallback slot — a variable block with no declared name
     /// (the built-in templates) reads and writes it. Grown on demand.
-    pub vars: Vec<f32>,
+    pub vars: Vec<Value>,
     /// Mouse position the sensing reporters return.
     pub mouse_x: f32,
     /// Mouse position.
@@ -207,6 +311,9 @@ pub struct Stage {
     /// Clones created this round, as sprite indices — the scene runs their
     /// `when I start as a clone` scripts once and clears this.
     pub pending_clones: Vec<usize>,
+    /// Strings this run MADE — see [`TextRegister`]. Run-scoped: it lives and
+    /// dies with the stage, and nothing in it ever reaches a stored node.
+    pub texts: TextRegister,
 }
 
 impl Default for Stage {
@@ -214,7 +321,7 @@ impl Default for Stage {
         Self {
             sprites: vec![Sprite::default()],
             current: 0,
-            vars: vec![0.0],
+            vars: vec![Value::Num(0.0)],
             mouse_x: 0.0,
             mouse_y: 0.0,
             timer: 0.0,
@@ -228,6 +335,7 @@ impl Default for Stage {
             last_sound: None,
             rng: 0x9E37_79B9_7F4A_7C15,
             pending_clones: Vec::new(),
+            texts: TextRegister::new(),
         }
     }
 }
@@ -235,15 +343,26 @@ impl Default for Stage {
 impl Stage {
     /// A variable by its codebook index; unset reads as `0`, as in Scratch.
     #[must_use]
-    pub fn var(&self, idx: u8) -> f32 {
-        self.vars.get(usize::from(idx)).copied().unwrap_or(0.0)
+    pub fn var(&self, idx: u8) -> Value {
+        self.vars.get(usize::from(idx)).copied().unwrap_or_default()
+    }
+
+    /// A variable's NUMERIC reading, against this stage's own run register.
+    /// A variable holding a PROJECT text reads 0 here — supply the basin
+    /// through [`Value::num`] when that matters.
+    #[must_use]
+    pub fn var_num(&self, idx: u8) -> f32 {
+        self.var(idx).num(Regs {
+            basin: None,
+            texts: &self.texts,
+        })
     }
 
     /// The variable slot for a codebook index, growing the store to reach it.
-    pub fn var_mut(&mut self, idx: u8) -> &mut f32 {
+    pub fn var_mut(&mut self, idx: u8) -> &mut Value {
         let i = usize::from(idx);
         if self.vars.len() <= i {
-            self.vars.resize(i + 1, 0.0);
+            self.vars.resize(i + 1, Value::Num(0.0));
         }
         &mut self.vars[i]
     }
@@ -331,6 +450,9 @@ pub enum RunError {
     /// A list op's first operand was not a list handle: the body is
     /// malformed (the handle push is missing or out of order).
     NotAList(u8),
+    /// The run's text register is full (255 distinct made strings). Refused
+    /// rather than recycling an index, which would alias two strings.
+    TextRegisterFull,
 }
 
 impl core::fmt::Display for RunError {
@@ -344,6 +466,7 @@ impl core::fmt::Display for RunError {
             Self::MissingConstant(i) => write!(f, "constant {i} is not in the pool"),
             Self::UnknownText(i) => write!(f, "text {i} is not in the TEXT register"),
             Self::NotAList(b) => write!(f, "function {b:#04x} did not receive a list handle"),
+            Self::TextRegisterFull => write!(f, "the run's text register is full (255)"),
         }
     }
 }
@@ -795,6 +918,15 @@ impl<'a> Machine<'a> {
         self
     }
 
+    /// The two text registers this run reads from — the project's sealed
+    /// basin and the stage's own. One place builds the pair.
+    fn regs(&self) -> Regs<'_> {
+        Regs {
+            basin: self.basin,
+            texts: &self.stage.texts,
+        }
+    }
+
     /// Record a stage snapshot every `n` calls, for rendering the motion.
     ///
     /// Off by default: tracing is a property of the OBSERVATION, not of the
@@ -840,7 +972,6 @@ impl<'a> Machine<'a> {
         // This body's frame on the shared operand stack.
         let base = self.stack.len();
         let plan = plan();
-        let basin = self.basin;
 
         for call in body.calls() {
             if self.budget == 0 {
@@ -873,18 +1004,18 @@ impl<'a> Machine<'a> {
                         }
                     }
                     FnIndex::IF => {
-                        let c = self.pop(base, f)?.num(basin);
-                        if c != 0.0 {
+                        let c = self.pop(base, f)?;
+                        if c.num(self.regs()) != 0.0 {
                             self.exec_in(functions, target)?;
                         }
                     }
                     FnIndex::IF_ELSE => {
-                        let c = self.pop(base, f)?.num(basin);
+                        let c = self.pop(base, f)?.num(self.regs());
                         let other = usize::from(call.values.get(1).copied().unwrap_or(0));
                         self.exec_in(functions, if c != 0.0 { target } else { other })?;
                     }
                     FnIndex::REPEAT => {
-                        let n = self.pop(base, f)?.num(basin).max(0.0) as u32;
+                        let n = self.pop(base, f)?.num(self.regs()).max(0.0) as u32;
                         for _ in 0..n {
                             if self.budget == 0 {
                                 break;
@@ -897,7 +1028,7 @@ impl<'a> Machine<'a> {
                         // re-evaluating it would need the operand's own calls,
                         // which live in this body. Bounded and honest: run the
                         // body while the budget lasts if the condition held.
-                        let c = self.pop(base, f)?.num(basin);
+                        let c = self.pop(base, f)?.num(self.regs());
                         let want = f == FnIndex::WHILE;
                         if (c != 0.0) == want {
                             while self.budget > 0 {
@@ -988,8 +1119,53 @@ impl<'a> Machine<'a> {
         imm: f32,
     ) -> Option<Result<Option<Value>, RunError>> {
         let basin = self.basin;
-        let a = |i: usize| ops.get(i).map_or(0.0, |v| v.num(basin));
         let raw = |i: usize| ops.get(i).copied().unwrap_or_default();
+        // The operands' NUMERIC readings, taken once and up front: reading a
+        // text borrows the stage's run register, and everything below this
+        // line may borrow the stage mutably.
+        let nums: [f32; ogar_loco::MAX_VALUES_PER_CALL] = {
+            let regs = self.regs();
+            core::array::from_fn(|i| ops.get(i).map_or(0.0, |v| v.num(regs)))
+        };
+        let a = |i: usize| nums.get(i).copied().unwrap_or(0.0);
+        // The text family. `length` and `contains` only READ, so they answer
+        // from a borrowed reading; `join` and `letter of` MAKE a string, so
+        // they own their readings first, then intern into the run register.
+        if f == FnIndex::LENGTH || f == FnIndex::CONTAINS {
+            let regs = self.regs();
+            let s0 = text_of(raw(0), regs);
+            return Some(match f {
+                // Characters, not bytes: `length of "aä"` is 2.
+                FnIndex::LENGTH => num(s0.chars().count() as f32),
+                _ => num(f32::from(s0.contains(&*text_of(raw(1), regs)))),
+            });
+        }
+        if f == FnIndex::JOIN || f == FnIndex::CHAR_AT {
+            let made = {
+                let regs = self.regs();
+                if f == FnIndex::JOIN {
+                    let mut s = text_of(raw(0), regs).into_owned();
+                    s.push_str(&text_of(raw(1), regs));
+                    s
+                } else {
+                    // `letter (n) of (s)`: 1-based, by character; out of
+                    // range is the empty string, as in Scratch.
+                    let n = nums[0];
+                    let s = text_of(raw(1), regs);
+                    if n < 1.0 || n.fract() != 0.0 {
+                        String::new()
+                    } else {
+                        s.chars()
+                            .nth(n as usize - 1)
+                            .map_or_else(String::new, |c| c.to_string())
+                    }
+                }
+            };
+            return Some(match self.stage.texts.intern(&made) {
+                Some(idx) => Ok(Some(Value::RunText(idx))),
+                None => Err(RunError::TextRegisterFull),
+            });
+        }
         // A `text` literal yields its TEXT register index — the register
         // keeps the string; `Value::num` reads it as a number when a numeric
         // slot asks. A non-zero index must exist in the basin.
@@ -1039,15 +1215,14 @@ impl<'a> Machine<'a> {
             return Some(match f {
                 FnIndex::LIST_LENGTH => num(len as f32),
                 FnIndex::LIST_GET => Ok(Some(
-                    list_slot(raw(1), len, basin)
-                        .map_or(Value::Num(0.0), |i| self.stage.list(h)[i]),
+                    list_slot(a(1), len).map_or(Value::Num(0.0), |i| self.stage.list(h)[i]),
                 )),
                 FnIndex::LIST_ADD => {
                     self.stage.list_mut(h).push(raw(1));
                     Ok(None)
                 }
                 FnIndex::LIST_DELETE => {
-                    if let Some(i) = list_slot(raw(1), len, basin) {
+                    if let Some(i) = list_slot(a(1), len) {
                         self.stage.list_mut(h).remove(i);
                     }
                     Ok(None)
@@ -1058,31 +1233,27 @@ impl<'a> Machine<'a> {
                 }
                 // `replace item INDEX of list with ITEM`
                 FnIndex::LIST_SET => {
-                    if let Some(i) = list_slot(raw(1), len, basin) {
+                    if let Some(i) = list_slot(a(1), len) {
                         self.stage.list_mut(h)[i] = raw(2);
                     }
                     Ok(None)
                 }
                 // `insert ITEM at INDEX of list` — `length + 1` appends.
                 FnIndex::LIST_INSERT => {
-                    if let Some(i) = list_slot(raw(2), len + 1, basin) {
+                    if let Some(i) = list_slot(a(2), len + 1) {
                         self.stage.list_mut(h).insert(i, raw(1));
                     }
                     Ok(None)
                 }
                 FnIndex::LIST_INDEX_OF => {
-                    let want = raw(1);
-                    let pos = self
-                        .stage
-                        .list(h)
-                        .iter()
-                        .position(|v| same(*v, want, basin));
+                    let (want, regs) = (raw(1), self.regs());
+                    let pos = self.stage.list(h).iter().position(|v| same(*v, want, regs));
                     num(pos.map_or(0.0, |p| (p + 1) as f32))
                 }
                 FnIndex::LIST_CONTAINS => {
-                    let want = raw(1);
+                    let (want, regs) = (raw(1), self.regs());
                     num(f32::from(
-                        self.stage.list(h).iter().any(|v| same(*v, want, basin)),
+                        self.stage.list(h).iter().any(|v| same(*v, want, regs)),
                     ))
                 }
                 _ => Err(RunError::Unimplemented(f.0)),
@@ -1095,8 +1266,20 @@ impl<'a> Machine<'a> {
     /// Apply one non-branching call. `Some(v)` means it yielded a value.
     fn apply(&mut self, f: FnIndex, ops: &[Value], imm: f32) -> Result<Option<Value>, RunError> {
         let basin = self.basin;
-        let a = |i: usize| ops.get(i).map_or(0.0, |v| v.num(basin));
         let raw = |i: usize| ops.get(i).copied().unwrap_or_default();
+        // Read BEFORE the stage is borrowed mutably: an operand's numeric
+        // reading consults the stage's own run text register.
+        let nums: [f32; ogar_loco::MAX_VALUES_PER_CALL] = {
+            let regs = self.regs();
+            core::array::from_fn(|i| ops.get(i).map_or(0.0, |v| v.num(regs)))
+        };
+        let a = |i: usize| nums.get(i).copied().unwrap_or(0.0);
+        // …and, for `change x by`, the variable's own current number.
+        let var_cur = if f == FnIndex::VAR_CHANGE {
+            self.stage.var(imm as u8).num(self.regs())
+        } else {
+            0.0
+        };
         // Read before the stage is borrowed: the innermost custom-block frame.
         let frame_arg = self
             .frames
@@ -1150,17 +1333,19 @@ impl<'a> Machine<'a> {
             FnIndex::EXP_E => Some(a(0).exp()),
             FnIndex::EXP_10 => Some(10f32.powf(a(0))),
             // The immediate is the VARIABLE codebook byte — which variable.
-            FnIndex::VAR_GET => Some(s.var(imm as u8)),
+            // A variable holds a VALUE — a number, or a text by register
+            // index — so `say (my message)` keeps its string.
+            FnIndex::VAR_GET => return Ok(Some(s.var(imm as u8))),
             // The immediate is the argument's POSITION in the innermost
             // custom-block frame; outside any call it reads 0, as an unset
             // Scratch value does.
             FnIndex::PROC_ARG => return Ok(Some(frame_arg)),
             FnIndex::VAR_SET => {
-                *s.var_mut(imm as u8) = a(0);
+                *s.var_mut(imm as u8) = raw(0);
                 return Ok(None);
             }
             FnIndex::VAR_CHANGE => {
-                *s.var_mut(imm as u8) += a(0);
+                *s.var_mut(imm as u8) = Value::Num(var_cur + a(0));
                 return Ok(None);
             }
             _ => None,
@@ -1378,7 +1563,9 @@ impl<'a> Machine<'a> {
                                 let name = core::str::from_utf8(&entry.bytes[..end]).ok()?;
                                 blockly_abi::menus::encode_in(basin?, m, name)
                             });
-                        var.map_or(0.0, |idx| s.var(idx))
+                        // The sprite's variable, read as a number (a text
+                        // variable read through `of` reads as Scratch reads it).
+                        var.map_or(0.0, |idx| s.var_num(idx))
                     }
                     _ => 0.0,
                 };
@@ -1465,20 +1652,21 @@ fn num(x: f32) -> Result<Option<Value>, RunError> {
 
 /// Scratch equality for list search: two texts match by register index,
 /// anything else by numeric reading.
-fn same(a: Value, b: Value, basin: Option<&ogar_loco::basin::BasinCodebooks>) -> bool {
-    match (a, b) {
-        (Value::Text(x), Value::Text(y)) => x == y,
-        _ => (a.num(basin) - b.num(basin)).abs() < f32::EPSILON,
+fn same(a: Value, b: Value, regs: Regs<'_>) -> bool {
+    let textual = |v: Value| matches!(v, Value::Text(_) | Value::RunText(_));
+    if textual(a) || textual(b) {
+        // By CONTENT, never by index: a project literal "go" and a `join`-made
+        // "go" are the same string in two registers, and Scratch's list search
+        // finds either.
+        return text_of(a, regs) == text_of(b, regs);
     }
+    (a.num(regs) - b.num(regs)).abs() < f32::EPSILON
 }
 
-/// Scratch's 1-based list index from a value; `None` when out of range.
-fn list_slot(
-    v: Value,
-    len: usize,
-    basin: Option<&ogar_loco::basin::BasinCodebooks>,
-) -> Option<usize> {
-    let i = v.num(basin);
+/// Scratch's 1-based list index from an already-read number; `None` when out
+/// of range. Takes the NUMBER rather than the value so a caller can read its
+/// operands before borrowing the list store mutably.
+fn list_slot(i: f32, len: usize) -> Option<usize> {
     if i < 1.0 || i.fract() != 0.0 {
         return None;
     }
@@ -2036,9 +2224,13 @@ mod tests {
         .expect("named variables cast against the project basin");
         let mut m = Machine::new(&prog.functions, 1000);
         m.run().unwrap();
-        assert_eq!(m.stage.var(score), 7.0);
-        assert_eq!(m.stage.var(lives), 3.0);
-        assert_eq!(m.stage.var(0), 0.0, "the zero-fallback slot is untouched");
+        assert_eq!(m.stage.var_num(score), 7.0);
+        assert_eq!(m.stage.var_num(lives), 3.0);
+        assert_eq!(
+            m.stage.var_num(0),
+            0.0,
+            "the zero-fallback slot is untouched"
+        );
         // Silence half: the static basin knows no variable names, so the
         // same program is refused rather than silently written to slot 0.
         assert!(
@@ -2240,13 +2432,17 @@ mod tests {
         let mut hit = Machine::new(&prog.functions, 100);
         hit.stage.touching = true;
         hit.run().expect("runs");
-        assert_eq!(hit.stage.var(0), 5.0, "the branch must fire when touching");
+        assert_eq!(
+            hit.stage.var_num(0),
+            5.0,
+            "the branch must fire when touching"
+        );
 
         let mut miss = Machine::new(&prog.functions, 100);
         miss.stage.touching = false;
         miss.run().expect("runs");
         assert_eq!(
-            miss.stage.var(0),
+            miss.stage.var_num(0),
             0.0,
             "the branch must NOT fire when not touching"
         );
@@ -2944,7 +3140,7 @@ mod tests {
             },
         ];
         let score = menus::encode_in(&basin, menus::menu_by_id(25).unwrap(), "score").unwrap();
-        *m.stage.var_mut(score) = 42.0;
+        *m.stage.var_mut(score) = Value::Num(42.0);
         m.run().unwrap();
         assert_eq!(
             m.stage.sprites[0].x, 123.0,
@@ -3013,6 +3209,304 @@ mod tests {
         assert_eq!(
             scene.stage.sprites[1].x, 100.0,
             "sprite 1's call reached ITS +100 definition"
+        );
+    }
+
+    /// The run's register is content-keyed, deduping, and REFUSES rather than
+    /// recycling an index — two strings sharing one index is exactly the
+    /// register loss the whole discipline exists to prevent.
+    #[test]
+    fn the_run_text_register_dedups_and_refuses_when_full() {
+        let mut r = TextRegister::new();
+        assert_eq!(r.intern(""), Some(0), "the empty string is the fallback");
+        assert_eq!(r.len(), 0, "…and occupies no slot");
+        assert_eq!(r.intern("go"), Some(1));
+        assert_eq!(r.intern("go"), Some(1), "the same string is the same index");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.intern("stop"), Some(2), "a different string, a new index");
+        assert_eq!(r.get(1), Some("go"));
+        assert_eq!(r.get(2), Some("stop"));
+        assert_eq!(r.get(3), None);
+        // Fill to the byte's limit, then refuse.
+        for i in 3..=255u16 {
+            assert_eq!(r.intern(&format!("s{i}")), u8::try_from(i).ok());
+        }
+        assert_eq!(r.len(), 255);
+        assert_eq!(r.intern("one too many"), None);
+        assert_eq!(
+            r.get(255).map(str::to_string),
+            Some("s255".to_string()),
+            "the refusal did not overwrite the last entry"
+        );
+    }
+
+    /// `join` MAKES a string: it lands in the run register, a variable keeps
+    /// it (a variable holds a value, not an f32), and `length` reads the made
+    /// string back — not the literal it started from, and not zero.
+    #[test]
+    fn join_makes_a_string_a_variable_keeps_and_length_reads_it_back() {
+        let basin = basin_with(&[(29, &["score: "]), (25, &["msg"])]);
+        let text = |t: &str| {
+            rec(
+                "text",
+                vec![("TEXT".into(), FieldValue::Wide(t.into()))],
+                vec![],
+                vec![],
+                None,
+            )
+        };
+        let var_get = rec(
+            "data_variable",
+            vec![("VARIABLE".into(), FieldValue::Code("msg".into()))],
+            vec![],
+            vec![],
+            None,
+        );
+        let script = rec(
+            "data_setvariableto",
+            vec![("VARIABLE".into(), FieldValue::Code("msg".into()))],
+            vec![(
+                "VALUE".into(),
+                rec(
+                    "operator_join",
+                    vec![],
+                    vec![
+                        ("STRING1".into(), text("score: ")),
+                        ("STRING2".into(), num(5)),
+                    ],
+                    vec![],
+                    None,
+                ),
+            )],
+            vec![],
+            Some(rec(
+                "motion_setx",
+                vec![],
+                vec![(
+                    "X".into(),
+                    rec(
+                        "operator_length",
+                        vec![],
+                        vec![("STRING".into(), var_get)],
+                        vec![],
+                        None,
+                    ),
+                )],
+                vec![],
+                None,
+            )),
+        );
+        let prog = blockly_abi::lower_program_in(LaneShape::Pairs, &script, &basin).unwrap();
+        let mut m = Machine::new(&prog.functions, 200).with_basin(&basin);
+        m.run().unwrap();
+
+        let msg = blockly_abi::menus::encode_in(
+            &basin,
+            blockly_abi::menus::menu_by_id(25).unwrap(),
+            "msg",
+        )
+        .unwrap();
+        let Value::RunText(idx) = m.stage.var(msg) else {
+            panic!(
+                "the variable must hold a made text, got {:?}",
+                m.stage.var(msg)
+            );
+        };
+        assert_ne!(idx, 0, "a non-empty join is not the empty-string fallback");
+        assert_eq!(m.stage.texts.get(idx), Some("score: 5"));
+        // "score: 5" is 8 characters. Two-sided: NOT 7 (the literal alone,
+        // which is what a dropped second operand would give) and NOT 0 (an
+        // unreadable text, which is what a register the reader cannot see
+        // would give).
+        assert_eq!(m.stage.me().x, 8.0);
+        assert_ne!(m.stage.me().x, 7.0);
+        assert_ne!(m.stage.me().x, 0.0);
+    }
+
+    /// `letter of` is 1-based and by CHARACTER; out of range is the empty
+    /// string, as in Scratch. `contains` fires and stays silent.
+    #[test]
+    fn letter_of_is_one_based_by_character_and_contains_discriminates() {
+        let basin = basin_with(&[(29, &["wörld"])]);
+        let text = || {
+            rec(
+                "text",
+                vec![("TEXT".into(), FieldValue::Wide("wörld".into()))],
+                vec![],
+                vec![],
+                None,
+            )
+        };
+        let letter = |n: u8| {
+            rec(
+                "operator_letter_of",
+                vec![],
+                vec![("LETTER".into(), num(n)), ("STRING".into(), text())],
+                vec![],
+                None,
+            )
+        };
+        let run_text = |r: BlockRecord| {
+            let script = rec(
+                "looks_say",
+                vec![],
+                vec![("MESSAGE".into(), r)],
+                vec![],
+                None,
+            );
+            let prog = blockly_abi::lower_program_in(LaneShape::Pairs, &script, &basin).unwrap();
+            let mut m = Machine::new(&prog.functions, 200).with_basin(&basin);
+            m.run().unwrap();
+            let (v, _) = m.stage.me().say.expect("said something");
+            text_of(
+                v,
+                Regs {
+                    basin: Some(&basin),
+                    texts: &m.stage.texts,
+                },
+            )
+            .into_owned()
+        };
+        // The 2nd character of "wörld" is "ö" — a CHARACTER, not a byte (a
+        // byte reading would split the two-byte ö and never produce it).
+        assert_eq!(run_text(letter(2)), "ö");
+        assert_eq!(run_text(letter(5)), "d");
+        assert_eq!(run_text(letter(6)), "", "past the end is empty");
+        assert_eq!(run_text(letter(0)), "", "there is no letter 0");
+
+        let contains = |needle: &str| {
+            let n = needle.to_string();
+            let script = rec(
+                "motion_setx",
+                vec![],
+                vec![(
+                    "X".into(),
+                    rec(
+                        "operator_contains",
+                        vec![],
+                        vec![
+                            ("STRING1".into(), text()),
+                            (
+                                "STRING2".into(),
+                                rec(
+                                    "text",
+                                    vec![("TEXT".into(), FieldValue::Wide(n))],
+                                    vec![],
+                                    vec![],
+                                    None,
+                                ),
+                            ),
+                        ],
+                        vec![],
+                        None,
+                    ),
+                )],
+                vec![],
+                None,
+            );
+            let b = basin_with(&[(29, &["wörld", needle])]);
+            let prog = blockly_abi::lower_program_in(LaneShape::Pairs, &script, &b).unwrap();
+            let mut m = Machine::new(&prog.functions, 200).with_basin(&b);
+            m.run().unwrap();
+            m.stage.me().x
+        };
+        assert_eq!(contains("rld"), 1.0, "can fire");
+        assert_eq!(contains("xyz"), 0.0, "…and can stay silent");
+    }
+
+    /// A list search matches a made string against a project literal by
+    /// CONTENT, across the two registers — never by index, which would be a
+    /// coincidence when the indices happen to agree and wrong when they do
+    /// not.
+    #[test]
+    fn a_list_finds_a_made_string_equal_to_a_project_literal() {
+        // "go" is index 2 in the project register and will be index 1 in the
+        // run register, so an index comparison gives the wrong answer.
+        let basin = basin_with(&[(29, &["other", "go", "g", "o"]), (26, &["seen"])]);
+        let text = |t: &str| {
+            rec(
+                "text",
+                vec![("TEXT".into(), FieldValue::Wide(t.into()))],
+                vec![],
+                vec![],
+                None,
+            )
+        };
+        let add = |t: &str, next: Option<BlockRecord>| {
+            let mut r = rec(
+                "data_addtolist",
+                vec![("LIST".into(), FieldValue::Code("seen".into()))],
+                vec![("ITEM".into(), text(t))],
+                vec![],
+                None,
+            );
+            r.next = next.map(Box::new);
+            r
+        };
+        // TWO non-numeric items, and the wanted one is SECOND. A numeric
+        // comparison reads every non-numeric text as 0 and would match the
+        // first item; an index comparison would match neither. Only a content
+        // comparison answers 2.
+        let script = add(
+            "other",
+            Some(add(
+                "go",
+                Some(rec(
+                    "motion_setx",
+                    vec![],
+                    vec![(
+                        "X".into(),
+                        rec(
+                            "data_itemnumoflist",
+                            vec![("LIST".into(), FieldValue::Code("seen".into()))],
+                            vec![(
+                                "ITEM".into(),
+                                rec(
+                                    "operator_join",
+                                    vec![],
+                                    vec![
+                                        ("STRING1".into(), text("g")),
+                                        ("STRING2".into(), text("o")),
+                                    ],
+                                    vec![],
+                                    None,
+                                ),
+                            )],
+                            vec![],
+                            None,
+                        ),
+                    )],
+                    vec![],
+                    None,
+                )),
+            )),
+        );
+        let prog = blockly_abi::lower_program_in(LaneShape::Pairs, &script, &basin).unwrap();
+        let mut m = Machine::new(&prog.functions, 200).with_basin(&basin);
+        m.run().unwrap();
+        // The indices really do differ, so this is not a coincidence.
+        let project = blockly_abi::menus::encode_in(
+            &basin,
+            blockly_abi::menus::menu_by_id(29).unwrap(),
+            "go",
+        )
+        .unwrap();
+        assert_eq!(project, 2);
+        assert_eq!(m.stage.texts.get(1), Some("go"), "the made one is index 1");
+        assert_eq!(
+            m.stage.me().x,
+            2.0,
+            "found at position 2, past a non-numeric decoy"
+        );
+        assert_ne!(
+            m.stage.me().x,
+            1.0,
+            "a numeric comparison would have said 1"
+        );
+        assert_ne!(
+            m.stage.me().x,
+            0.0,
+            "an index comparison would have found nothing"
         );
     }
 }

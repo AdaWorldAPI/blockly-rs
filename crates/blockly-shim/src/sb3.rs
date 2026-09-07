@@ -824,15 +824,23 @@ pub fn target_basin(project: &Sb3Project, target: &Sb3Target) -> BasinCodebooks 
                 v.extend(sprites.iter().map(|s| s.name.clone()));
                 v
             }
-            "COSTUME" => target.costumes.clone(),
+            // The asset lists PLUS any name the target's own scripts still
+            // name. A real project outlives its assets: `switch costume to
+            // [Legs4]` survives the deletion of Legs4, and Scratch keeps the
+            // stale name in the dropdown and makes the switch a no-op. The
+            // register is the names the project USES, so a stale one belongs
+            // in it — otherwise the whole script refuses to cast over a
+            // costume nobody has (measured: 11 scripts on one real project).
+            // Appended after the real assets, so live names keep their index.
+            "COSTUME" => with_referenced(target, target.costumes.clone(), m.id),
             "BACKDROP" => {
                 let mut v = stage.map(|s| s.costumes.clone()).unwrap_or_default();
                 v.push("next backdrop".to_string());
                 v.push("previous backdrop".to_string());
                 v.push("random backdrop".to_string());
-                v
+                with_referenced(target, v, m.id)
             }
-            "SOUND" => target.sounds.clone(),
+            "SOUND" => with_referenced(target, target.sounds.clone(), m.id),
             // These menus do not exist in `SCRATCH_MENUS` yet — matched here
             // so this arm activates the moment they land, with no further
             // change needed. Stage (globals) first, then this target's own.
@@ -924,6 +932,38 @@ pub fn target_basin(project: &Sb3Project, target: &Sb3Target) -> BasinCodebooks 
         let _ = basin.plug(b.seal());
     }
     basin
+}
+
+/// `names` plus every code this target's scripts give to menu `menu_id`
+/// that `names` does not already carry — a reference to a deleted asset.
+fn with_referenced(target: &Sb3Target, mut names: Vec<String>, menu_id: u8) -> Vec<String> {
+    for s in &target.scripts {
+        collect_menu_codes(s, menu_id, &mut names);
+    }
+    names
+}
+
+/// Walk a subtree collecting the codes its blocks give to menu `menu_id`,
+/// appending any that `out` does not already hold. The empty code is the
+/// zero-fallback and is never a register entry.
+fn collect_menu_codes(block: &BlockRecord, menu_id: u8, out: &mut Vec<String>) {
+    if let Some((field, m)) = blockly_abi::menus::menu_for_block(&block.ty)
+        && m.id == menu_id
+        && let Some(FieldValue::Code(c) | FieldValue::Wide(c)) = block.field(field)
+        && !c.is_empty()
+        && !out.contains(c)
+    {
+        out.push(c.clone());
+    }
+    for (_, b) in &block.inputs {
+        collect_menu_codes(b, menu_id, out);
+    }
+    for (_, b) in &block.statements {
+        collect_menu_codes(b, menu_id, out);
+    }
+    if let Some(n) = &block.next {
+        collect_menu_codes(n, menu_id, out);
+    }
 }
 
 /// Every distinct non-empty `text` literal under `block`, in first-seen
@@ -1703,6 +1743,53 @@ mod tests {
             call_result.is_ok(),
             "procedures_call failed to cast: {:?}",
             call_result.err()
+        );
+    }
+
+    /// A project outlives its assets: a script that still switches to a
+    /// DELETED costume casts, because the register holds the names the
+    /// project uses, not only the ones its asset list still declares.
+    #[test]
+    fn a_costume_name_no_asset_carries_is_still_a_register_entry() {
+        let json = r#"{"targets":[
+          {"isStage":true,"name":"Stage","variables":{},"lists":{},"broadcasts":{},
+           "blocks":{},"costumes":[{"name":"backdrop1"}],"sounds":[]},
+          {"isStage":false,"name":"Cat","variables":{},"lists":{},"broadcasts":{},
+           "costumes":[{"name":"alive"}],"sounds":[],
+           "blocks":{
+             "hat":{"opcode":"event_whenflagclicked","next":"sw","parent":null,
+                    "inputs":{},"fields":{},"topLevel":true},
+             "sw":{"opcode":"looks_switchcostumeto","next":null,"parent":"hat",
+                   "inputs":{"COSTUME":[1,"menu"]},"fields":{},"topLevel":false},
+             "menu":{"opcode":"looks_costume","next":null,"parent":"sw",
+                     "inputs":{},"fields":{"COSTUME":["deleted",null]},
+                     "shadow":true,"topLevel":false}
+           }}
+        ]}"#;
+        let p = from_project_json(json).unwrap();
+        let cat = p.targets.iter().find(|t| t.name == "Cat").unwrap();
+        assert_eq!(
+            cat.costumes,
+            vec!["alive".to_string()],
+            "the asset list has ONE costume"
+        );
+        let basin = target_basin(&p, cat);
+        let m = blockly_abi::menus::menu_by_id(20).expect("COSTUME is menu 20");
+        let live = blockly_abi::menus::encode_in(&basin, m, "alive").expect("a live costume");
+        let stale = blockly_abi::menus::encode_in(&basin, m, "deleted")
+            .expect("a name the scripts still use is a register entry");
+        assert_eq!(live, 1, "the live asset keeps the first index");
+        assert_eq!(stale, 2, "the stale name is appended after it");
+        // …and the script therefore CASTS rather than refusing over a costume
+        // nobody has.
+        let script = cat.scripts.first().expect("one script");
+        blockly_abi::lower_program_in(ogar_loco::LaneShape::Triples, script, &basin)
+            .expect("casts against the target's own basin");
+        // Two-sided: a name NOTHING references is not invented into the
+        // register just because it looks like a costume.
+        assert_eq!(
+            blockly_abi::menus::encode_in(&basin, m, "never mentioned"),
+            None
         );
     }
 }

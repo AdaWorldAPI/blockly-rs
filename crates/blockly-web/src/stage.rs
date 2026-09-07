@@ -136,7 +136,7 @@ pub fn stats(last: &Stage, frames: usize) -> String {
         ball.y,
         ball.direction,
         last.sprites.get(1).map_or(0.0, |p| p.y),
-        last.var(0),
+        last.var_num(0),
         last.timer
     )
 }
