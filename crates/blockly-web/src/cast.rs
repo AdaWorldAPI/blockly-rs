@@ -27,17 +27,28 @@ use serde::Serialize;
 
 /// The demo key the entry node is stored under.
 ///
-/// The classid half is real (`palette::PALETTE_CONCEPT` = `0x1717`, canon-high
-/// over an app prefix — the concept naming WHICH vocabulary reads the call
-/// bytes, not the node's shape, which is `ogar-loco`'s `0x1701`). The prefix
-/// `0xFF00` is a PLACEHOLDER — the real `blockly-rs` prefix is the unminted
-/// operator decision M1, and the page labels it so.
+/// `blockly_store::CLASSID` is this consumer's own Blocks-V3 address
+/// (`0x1717_1000`), composed by the crate that declares the seat
+/// (`blockly_abi::palette::render_classid`): canon `0x1717` HIGH — the
+/// palette concept naming WHICH vocabulary reads the call bytes, not the
+/// node's shape, which is `ogar-loco`'s `0x1701` — and the V3 generation
+/// marker in the custom half. NOT a substrate registration: `0x17XX` carries
+/// zero canon codebook rows, which is what makes the palette plug-and-play
+/// (D-BLOCKS-HOTPLUG-1).
+/// A real app prefix for this frontend is still the unminted operator
+/// decision M1; the marker is the canon's own convention for that state.
+///
+/// Minted through [`blockly_store::mint_key`], never spelled out. This used
+/// to be four lines of byte math (`k[0..4] = classid`, `k[10..16] = tail`),
+/// which is exactly what the LE contract forbids — and it showed twice.
+/// Writing the tail as `[0, 0, 0, 0, 0, 1]` put the `1` in the MOST
+/// significant byte of the 24-bit identity, so the entry node's identity was
+/// `0x010000` rather than `1`; and the whole tail was the V1 u24 shape the
+/// canon closed to new mints, which `blockly_store::READ_MODE` now settles
+/// at the seat rather than by asking the canon registry.
 #[must_use]
 pub fn demo_key() -> [u8; 16] {
-    let mut k = [0u8; 16];
-    k[0..4].copy_from_slice(&0x1717_FF00_u32.to_le_bytes());
-    k[10..16].copy_from_slice(&[0, 0, 0, 0, 0, 1]);
-    k
+    *blockly_store::mint_key(blockly_store::CLASSID, 0).as_bytes()
 }
 
 /// One function of one cast script, panel-ready.
@@ -414,7 +425,11 @@ mod tests {
         assert!(s.resolved, "the palette must actually be plugged");
         assert_eq!(s.plugged, 1);
         assert_eq!(s.palette_concept, "0x1717");
-        assert_eq!(s.classid, "0x1717ff00");
+        // The consumer-composed Blocks-V3 address: canon `0x1717` high,
+        // the V3 generation marker `0x1000` in the custom half. It resolves
+        // because the CANON half is what the registry routes on, so the
+        // marker never perturbs the plug.
+        assert_eq!(s.classid, "0x17171000");
 
         // The shared core answered THROUGH the plugged vocabulary — the
         // sharing discipline, measured. REPEAT takes one operand.

@@ -34,6 +34,7 @@ fn err_key(e: &blockly_run::RunError) -> String {
         E::UnknownProcedure(i) => format!("UnknownProcedure {i}"),
         E::MissingConstant(i) => format!("MissingConstant {i}"),
         E::UnknownText(i) => format!("UnknownText {i}"),
+        E::TextRegisterFull => "TextRegisterFull".to_string(),
     }
 }
 
