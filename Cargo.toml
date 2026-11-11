@@ -93,12 +93,14 @@ lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract", fe
 # `=11.0.0`), with `arrow ^58.0.0` and `datafusion ^54.0.0` -- read from
 # crates.io rather than assumed. The family moves in lockstep, so a bump is
 # one deliberate, measured change to these four lines, never a drift.
-lance = "11"
+# 2026-11-11: bumped to lance 14 / lancedb 0.41 (lancedb 0.41.0 requires
+# `lance = "=14.0.2"`; arrow 58 / datafusion 54 unchanged).
+lance = "14"
 # DECLARED, not linked. No member takes it, so it never enters the lock --
 # it is here as the PAIRING REFERENCE: lancedb 0.38 is what fixes lance at
 # major 11 above. `blockly-store` writes through `lance::Dataset` directly
 # (see its manifest for both reasons, one of which is that lancedb 0.38.0
 # does not compile without its `remote` feature).
-lancedb = { version = "0.38", default-features = false }
+lancedb = { version = "0.41", default-features = false }
 arrow-array = "58"
 arrow-schema = "58"
