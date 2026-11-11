@@ -285,7 +285,7 @@ impl ProgramRows {
     pub fn as_le_bytes(&self) -> &[u8] {
         // SAFETY: `NodeRow` is `#[repr(C, align(64))]` with a `const _`
         // size assert at exactly 512 and three plain byte-array fields
-        // (`NodeGuid([u8; 16])`, `EdgeBlock` of `[u8; 12]` + `[u8; 4]`,
+        // (`NodeGuid([u8; 16])`, `EdgeBlock` = `EdgeFacet([u8; 16])`,
         // `[u8; 480]`), so it has no padding and no invalid bit pattern:
         // every byte of every row is initialized and readable as `u8`. The
         // slice keeps the borrow, so the view cannot outlive the rows. This
@@ -320,10 +320,7 @@ fn row_of(key: NodeGuid, body: &FunctionBody) -> NodeRow {
         // Zeroed, exactly as `ogar-loco` writes slot 1: "reserve, don't
         // reclaim". A blockly function has no adjacency yet; when it does,
         // the block is already here at its canon offset.
-        edges: EdgeBlock {
-            in_family: [0; 12],
-            out_family: [0; 4],
-        },
+        edges: EdgeBlock::default(),
         value,
     }
 }
